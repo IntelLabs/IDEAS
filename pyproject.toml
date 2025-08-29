@@ -1,0 +1,48 @@
+[project]
+name = "ideas"
+dynamic = ["version"]
+description = "Improved Decoding and Equivalence Automated testing at Scale"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = "~=3.11"
+
+dependencies = [
+    "accelerate==1.6.0",
+    "clang==14.0",
+    "dspy==2.6.27",
+    "hydra-core==1.3.2",
+    "transformers==4.55.0",
+    "tree-sitter==0.24.0",
+    "tree-sitter-c==0.23.4",
+    "tree-sitter-rust==0.23.2",
+    "vllm==0.10.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "basedpyright==1.29.4",
+    "pre-commit==4.2.0",
+    "pytest==8.4.0",
+    "ruff==0.11.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/ideas/__init__.py"
+
+[tool.basedpyright]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"
+deprecateTypingAliases = true
+reportDeprecated = true
+reportPrivateImportUsage = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 96
