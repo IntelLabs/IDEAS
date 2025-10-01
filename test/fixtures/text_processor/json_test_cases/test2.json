@@ -1,0 +1,7 @@
+{
+    "argv": [],
+    "stdin": "Hello World!\n",
+    "rc": 1,
+    "stdout": {"pattern": ""},
+    "stderr": {"pattern": "Error: Missing required arguments\nModes: upper, lower, reverse, count\n"}
+}

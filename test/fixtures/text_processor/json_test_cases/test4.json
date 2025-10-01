@@ -1,0 +1,7 @@
+{
+    "argv": ["upper"],
+    "stdin": "line1\nline2\nline3\n",
+    "rc": 0,
+    "stdout": {"pattern": "LINE1\nLINE2\nLINE3\n"},
+    "stderr": {"pattern": ""}
+}

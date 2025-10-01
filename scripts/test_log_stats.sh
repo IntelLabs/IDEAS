@@ -1,8 +1,8 @@
 #!/bin/sh
 
-# Count number of PASS/FAIL inside specified file
-PASS=`grep -E "^PASS" $1 | wc -l`
-FAIL=`grep -E "^FAIL" $1 | wc -l`
+# Count number of ok/FAILED inside specified file
+PASS=`grep -aE "^test \S+ ... ok" $1 | wc -l`
+FAIL=`grep -aE "^test \S+ ... FAILED" $1 | wc -l`
 
 # If no PASS nor FAIL, then tests are missing
 if [ $PASS -eq 0 ] && [ $FAIL -eq 0 ]; then

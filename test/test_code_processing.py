@@ -31,11 +31,9 @@ def test_system_filter(input_code: str, expected_code: str):
     c_full_code = input_code
     tu = TranslationUnit.from_source("file.c", unsaved_files=[("file.c", c_full_code)])
 
-    preprocessor = agents.PreProcessing(
-        agents.AlgorithmConfig(preproc_strategy="clang-sys-filter")
-    )
+    preprocessor = agents.PreProcessing(preproc_strategy="clang-sys-filter")
     c_translation_inputs = preprocessor(c_code, c_full_code, tu)
 
-    assert "c_code" in c_translation_inputs
-    assert len(c_translation_inputs["c_code"]) == 1
-    assert c_translation_inputs["c_code"][0].strip() == expected_code.strip()
+    assert "input_code" in c_translation_inputs
+    assert len(c_translation_inputs["input_code"]) == 1
+    assert c_translation_inputs["input_code"][0].strip() == expected_code.strip()

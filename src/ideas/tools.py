@@ -13,12 +13,29 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 
 
+TestCase = dict[str, None | str | int | float | list[int] | list[str] | list[float]]
+
 logger = logging.getLogger("ideas.tools")
 
+DEFAULT_TEST_TIMEOUT = 10.0  # seconds
 
-def run_subprocess(cmd: list[str], input: str | None = None) -> tuple[bool, str]:
+
+def run_subprocess(
+    cmd: list[str],
+    input: str | None = None,
+    timeout: float | None = None,
+    **kwargs,
+) -> tuple[bool, str]:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, input=input)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            input=input,
+            timeout=timeout,
+            **kwargs,
+        )
         return True, result.stdout
     except subprocess.CalledProcessError as e:
         return False, e.stderr
@@ -60,8 +77,8 @@ def check_c(
 
 
 def compile_rust(
-    source_file: str,
-    output_file: str,
+    code: str,
+    output_file: Path,
     *,
     flags: list[str] | None = None,
     structured_output: bool = False,
@@ -74,10 +91,10 @@ def compile_rust(
     if structured_output:
         cmd.append("--error-format=json")
 
-    cmd.append(source_file)
-    cmd.extend(["-o", output_file])
+    cmd.append("-")
+    cmd.extend(["-o", str(output_file)])
 
-    return run_subprocess(cmd)
+    return run_subprocess(cmd, input=code)
 
 
 def check_rust(
@@ -201,9 +218,11 @@ def structured_to_rendered(js_dict: list[dict[str, Any]]) -> str:
     return rendered
 
 
-def run_test(executable: str, json_test_case: str) -> bool:
-    test_case = js_loads(json_test_case)
-
+def run_test(
+    executable: Path | str,
+    test_case: TestCase,
+    timeout: float | None = DEFAULT_TEST_TIMEOUT,
+) -> tuple[bool, str]:
     # Turn args into list[str]
     args = test_case.get("args", []) or []
     if not isinstance(args, list):
@@ -217,6 +236,14 @@ def run_test(executable: str, json_test_case: str) -> bool:
     stdin = [str(s) for s in stdin]
     stdin = "\n".join(stdin)
 
+    # Run test and right-strip output of whitespace
+    return run_subprocess([str(executable), *args], stdin, timeout=timeout)
+
+
+def check_test(
+    test_case: TestCase,
+    stdout: str,
+) -> bool:
     # Turn out into list[str] then join on newlines
     out = test_case["out"]
     if not isinstance(out, list):
@@ -225,17 +252,25 @@ def run_test(executable: str, json_test_case: str) -> bool:
     if isinstance(out, list):
         out = "\n".join(out)
 
-    # Run test and right-strip output of whitespace
-    ret, stdout = run_subprocess([executable, *args], stdin)
-    stdout = stdout.rstrip()
-
     # Make sure test returned and matches
-    return ret and (out == stdout)
+    return out.rstrip() == stdout.rstrip()
 
 
-def run_tests(executable: str, test_case_dir: Path) -> bool:
-    assert test_case_dir.is_dir()
-    for test_case in test_case_dir.glob("*.json"):
-        if not run_test(executable, test_case.read_text()):
-            return False
-    return True
+def run_and_check_test(
+    executable: Path | str,
+    test_case: TestCase,
+    timeout: float | None = DEFAULT_TEST_TIMEOUT,
+):
+    _, stdout = run_test(executable, test_case, timeout=timeout)
+    return check_test(test_case, stdout)
+
+
+def run_and_check_tests(
+    executable: Path | str,
+    test_cases: list[TestCase],
+    timeout: float | None = DEFAULT_TEST_TIMEOUT,
+) -> int:
+    success = 0
+    for test_case in test_cases:
+        success += 1 if run_and_check_test(executable, test_case, timeout=timeout) else 0
+    return success

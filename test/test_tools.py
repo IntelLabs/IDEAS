@@ -7,7 +7,6 @@
 from contextlib import nullcontext as does_not_raise
 from pathlib import Path
 
-import json
 import pytest
 
 from ideas import tools
@@ -69,12 +68,12 @@ def test_check_c(c_paths: tuple[Path, ...]):
 
 def test_compile_rust(rust_files: tuple[str, str], tmpdir: Path):
     # Compilation should succeed
-    success1, out1 = tools.compile_rust(rust_files[0], str(tmpdir / "out"))
+    success1, out1 = tools.compile_rust(Path(rust_files[0]).read_text(), tmpdir / "out")
     assert success1
     assert out1 == ""
 
     # Compilation should fail
-    success2, out2 = tools.compile_rust(rust_files[1], str(tmpdir / "out"))
+    success2, out2 = tools.compile_rust(Path(rust_files[1]).read_text(), tmpdir / "out")
     assert not success2
     assert out2 != ""
 
@@ -90,14 +89,14 @@ def test_clippy(clippy_files: str):
 def test_structured(rust_files: tuple[str, str], clippy_files: str, tmpdir: Path):
     # JSON dict construction should succeed
     _, structured_output = tools.compile_rust(
-        rust_files[1], str(tmpdir / "out"), structured_output=True
+        Path(rust_files[1]).read_text(), tmpdir / "out", structured_output=True
     )
 
     with does_not_raise():
         as_json = tools.tool_output_to_js_dict(structured_output)
 
     # Message rendered from the JSON dict should be identical to the original render
-    _, rendered_og_all = tools.compile_rust(rust_files[1], str(tmpdir / "out"))
+    _, rendered_og_all = tools.compile_rust(Path(rust_files[1]).read_text(), tmpdir / "out")
     rendered_reconstructed = tools.structured_to_rendered(as_json)
     # FIXME: strip at the call sites vs somewhere in tools.py
     assert rendered_reconstructed.rstrip() == rendered_og_all.rstrip()
@@ -145,42 +144,42 @@ def echo_123(fixtures_dir: Path) -> Path:
     return fixtures_dir / "echo_123"
 
 
-def test_run_test_args_in(echo_123):
-    assert tools.run_test(str(echo_123), json.dumps({"args": None, "in": None, "out": "1 2 3"}))
-    assert tools.run_test(str(echo_123), json.dumps({"args": [], "in": [], "out": "1 2 3"}))
-    assert tools.run_test(str(echo_123), json.dumps({"args": "", "in": "", "out": "1 2 3"}))
+def test_run_and_check_test_args_in(echo_123):
+    assert tools.run_and_check_test(echo_123, {"args": None, "in": None, "out": "1 2 3"})
+    assert tools.run_and_check_test(echo_123, {"args": [], "in": [], "out": "1 2 3"})
+    assert tools.run_and_check_test(echo_123, {"args": "", "in": "", "out": "1 2 3"})
 
 
-def test_run_test_in_only(echo_123):
-    assert tools.run_test(str(echo_123), json.dumps({"in": None, "out": "1 2 3"}))
-    assert tools.run_test(str(echo_123), json.dumps({"in": [], "out": "1 2 3"}))
-    assert tools.run_test(str(echo_123), json.dumps({"in": "", "out": "1 2 3"}))
+def test_run_and_check_test_in_only(echo_123):
+    assert tools.run_and_check_test(echo_123, {"in": None, "out": "1 2 3"})
+    assert tools.run_and_check_test(echo_123, {"in": [], "out": "1 2 3"})
+    assert tools.run_and_check_test(echo_123, {"in": "", "out": "1 2 3"})
 
 
-def test_run_test_args_only(echo_123):
-    assert tools.run_test(str(echo_123), json.dumps({"args": None, "out": "1 2 3"}))
-    assert tools.run_test(str(echo_123), json.dumps({"args": [], "out": "1 2 3"}))
-    assert tools.run_test(str(echo_123), json.dumps({"args": "", "out": "1 2 3"}))
+def test_run_and_check_test_args_only(echo_123):
+    assert tools.run_and_check_test(echo_123, {"args": None, "out": "1 2 3"})
+    assert tools.run_and_check_test(echo_123, {"args": [], "out": "1 2 3"})
+    assert tools.run_and_check_test(echo_123, {"args": "", "out": "1 2 3"})
 
 
-def test_run_test(echo_123):
-    assert tools.run_test(str(echo_123), json.dumps({"out": "1 2 3"}))
-    assert tools.run_test(str(echo_123), json.dumps({"out": ["1 2 3"]}))
+def test_run_and_check_test(echo_123):
+    assert tools.run_and_check_test(echo_123, {"out": "1 2 3"})
+    assert tools.run_and_check_test(echo_123, {"out": ["1 2 3"]})
 
 
-def test_run_test_echo_args():
-    assert tools.run_test("echo", json.dumps({"args": ["1", "2", "3"], "out": "1 2 3"}))
-    assert tools.run_test("echo", json.dumps({"args": "1 2 3", "out": "1 2 3"}))
+def test_run_and_check_test_echo_args():
+    assert tools.run_and_check_test("echo", {"args": ["1", "2", "3"], "out": "1 2 3"})
+    assert tools.run_and_check_test("echo", {"args": "1 2 3", "out": "1 2 3"})
 
 
-def test_run_test_echo_args_number():
-    assert tools.run_test("echo", json.dumps({"args": [1, 2, 3], "out": "1 2 3"}))
-    assert tools.run_test("echo", json.dumps({"args": [1.0, 2.0, 3.0], "out": "1.0 2.0 3.0"}))
+def test_run_and_check_test_echo_args_number():
+    assert tools.run_and_check_test("echo", {"args": [1, 2, 3], "out": "1 2 3"})
+    assert tools.run_and_check_test("echo", {"args": [1.0, 2.0, 3.0], "out": "1.0 2.0 3.0"})
 
 
-def test_run_test_missing_out():
+def test_run_and_check_test_missing_out():
     with pytest.raises(Exception):
-        tools.run_test("echo", json.dumps({"args": "", "in": ""}))
+        tools.run_and_check_test("echo", {"args": "", "in": ""})
 
 
 @pytest.fixture
@@ -188,29 +187,25 @@ def echo_stdin(fixtures_dir: Path) -> Path:
     return fixtures_dir / "echo_stdin"
 
 
-def test_run_test_echo_stdin_str(echo_stdin):
-    assert tools.run_test(echo_stdin, json.dumps({"in": "1 2 3", "out": "1 2 3"}))
-    assert tools.run_test(echo_stdin, json.dumps({"in": "1 2 3\n", "out": "1 2 3"}))
+def test_run_and_check_test_echo_stdin_str(echo_stdin):
+    assert tools.run_and_check_test(echo_stdin, {"in": "1 2 3", "out": "1 2 3"})
+    assert tools.run_and_check_test(echo_stdin, {"in": "1 2 3\n", "out": "1 2 3"})
 
 
-def test_run_test_echo_stdin_str_newlines(echo_stdin):
-    assert tools.run_test(echo_stdin, json.dumps({"in": "1\n2\n3", "out": "1\n2\n3"}))
-    assert tools.run_test(echo_stdin, json.dumps({"in": "1\n2\n3\n", "out": "1\n2\n3"}))
-    assert tools.run_test(echo_stdin, json.dumps({"in": "1\n2\n3\n", "out": [1, 2, 3]}))
-    assert tools.run_test(echo_stdin, json.dumps({"in": "1\n2\n3\n", "out": ["1", "2", "3"]}))
+def test_run_and_check_test_echo_stdin_str_newlines(echo_stdin):
+    assert tools.run_and_check_test(echo_stdin, {"in": "1\n2\n3", "out": "1\n2\n3"})
+    assert tools.run_and_check_test(echo_stdin, {"in": "1\n2\n3\n", "out": "1\n2\n3"})
+    assert tools.run_and_check_test(echo_stdin, {"in": "1\n2\n3\n", "out": [1, 2, 3]})
+    assert tools.run_and_check_test(echo_stdin, {"in": "1\n2\n3\n", "out": ["1", "2", "3"]})
 
 
-def test_run_test_echo_stdin_list(echo_stdin):
-    assert tools.run_test(echo_stdin, json.dumps({"in": ["1 2 3"], "out": "1 2 3"}))
-    assert tools.run_test(echo_stdin, json.dumps({"in": ["1 2 3\n"], "out": "1 2 3"}))
+def test_run_and_check_test_echo_stdin_list(echo_stdin):
+    assert tools.run_and_check_test(echo_stdin, {"in": ["1 2 3"], "out": "1 2 3"})
+    assert tools.run_and_check_test(echo_stdin, {"in": ["1 2 3\n"], "out": "1 2 3"})
 
 
-def test_run_test_echo_stdin_list_newlines(echo_stdin):
-    assert tools.run_test(echo_stdin, json.dumps({"in": ["1", "2", "3"], "out": "1\n2\n3"}))
-    assert tools.run_test(
-        echo_stdin, json.dumps({"in": ["1", "2", "3", "\n"], "out": "1\n2\n3"})
-    )
-    assert tools.run_test(echo_stdin, json.dumps({"in": ["1", "2", "3"], "out": [1, 2, 3]}))
-    assert tools.run_test(
-        echo_stdin, json.dumps({"in": ["1", "2", "3"], "out": ["1", "2", "3"]})
-    )
+def test_run_and_check_test_echo_stdin_list_newlines(echo_stdin):
+    assert tools.run_and_check_test(echo_stdin, {"in": ["1", "2", "3"], "out": "1\n2\n3"})
+    assert tools.run_and_check_test(echo_stdin, {"in": ["1", "2", "3", "\n"], "out": "1\n2\n3"})
+    assert tools.run_and_check_test(echo_stdin, {"in": ["1", "2", "3"], "out": [1, 2, 3]})
+    assert tools.run_and_check_test(echo_stdin, {"in": ["1", "2", "3"], "out": ["1", "2", "3"]})

@@ -1,0 +1,15 @@
+[package]
+name = "text_processor"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "text_processor"
+path = "src/main.rs"
+
+[dependencies]
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.0"
+ntest = "0.9.3"

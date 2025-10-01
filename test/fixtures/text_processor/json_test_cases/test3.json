@@ -1,0 +1,7 @@
+{
+    "argv": ["upper", " | ", "extra"],
+    "stdin": "hello\n",
+    "rc": 1,
+    "stdout": {"pattern": ""},
+    "stderr": {"pattern": "Error: Too many arguments (expected 1-2, got 3)\n"}
+}
