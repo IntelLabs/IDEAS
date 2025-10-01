@@ -4,121 +4,153 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-import dspy
+import os
 import logging
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from contextlib import chdir
 
+import dspy
+import hydra
+from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
+from hydra.core.hydra_config import HydraConfig
 from clang.cindex import CompilationDatabase, TranslationUnit
 
-from ideas import agents
-from .agents import AlgorithmConfig
+from ideas import model, ModelConfig, GenerateConfig
+from ideas import TranslateAgent, tools
 
 
 @dataclass
-class ModelConfig:
-    name: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
-    cache: bool = False
-    revision: str | None = None
-    base_url: str | None = None
-    api_key: str | None = None
+class TranslateConfig:
+    filename: Path = MISSING
+    model: ModelConfig = field(default_factory=ModelConfig)
+    generate: GenerateConfig = field(default_factory=GenerateConfig)
 
+    preproc_strategy: str = "clang"
+    max_iters: int = 5
 
-@dataclass
-class GenerateConfig:
-    max_new_tokens: int = 10000
-    do_sample: bool = False
-    temperature: float = 1.0
-    top_p: float = 1.0
-    top_k: int | None = None
+    translator: str = "ReAct"
+    use_raw_fixer_output: bool = False
+
+    batched: bool = False
 
 
 cs = ConfigStore.instance()
-cs.store(name="model", node=ModelConfig)
-cs.store(name="generate", node=GenerateConfig)
+cs.store(name="translate", node=TranslateConfig)
 
 
-def translate_file(
-    path: Path,
-    model_cfg: ModelConfig,
-    generate_cfg: GenerateConfig,
-    algorithm_cfg: AlgorithmConfig,
-) -> None:
+@hydra.main(version_base=None, config_name="translate")
+def translate(cfg: TranslateConfig) -> None:
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
     logger = logging.getLogger("ideas.translate")
-    logger.info(f"Translating: {path} ...")
+    logger.info(f"Saving results to {output_dir}")
 
-    lm = dspy.LM(
-        model=model_cfg.name,
-        cache=model_cfg.cache,
-        api_key=model_cfg.api_key,
-        api_base=model_cfg.base_url,
-        temperature=generate_cfg.temperature,
-        max_tokens=generate_cfg.max_new_tokens,
-    )
+    model.configure(cfg.model, cfg.generate)
 
-    # Add OpenRouter-specific provider routing: https://openrouter.ai/docs/features/provider-routing
-    if model_cfg.name.startswith("openrouter/"):
-        provider: dict[str, Any] = {}
+    if cfg.filename.name == "compile_commands.json":
+        logger.info(f"Parsing {cfg.filename} ...")
 
-        # Deny data collection
-        provider["data_collection"] = "deny"
-
-        # Require fp8 and limit prices for qwen3-coder
-        if model_cfg.name.lower().endswith("qwen/qwen3-coder"):
-            provider["quantizations"] = ["fp8"]
-            provider["max_price"] = {"prompt": 0.5, "completion": 2}
-
-        lm.kwargs["provider"] = provider  # type: ignore[reportArgumentType]
-
-    dspy.configure(lm=lm)
-
-    if path.is_dir():
         # Create TranslationUnit from original .c filename in compile commands database
-        db = CompilationDatabase.fromDirectory(path)
+        db = CompilationDatabase.fromDirectory(cfg.filename.parent)
         cmds = db.getAllCompileCommands()
-        if len(cmds) != 1:
-            raise ValueError(
-                f"Only 1 compile command is currently supported. Found {len(cmds)}!"
-            )
-        tu = TranslationUnit.from_source(None, args=list(cmds[0].arguments))
+        tus = [TranslationUnit.from_source(None, args=list(cmd.arguments)) for cmd in cmds]
 
         # Construct intermediate .c.i filename
-        orig_filename = Path(cmds[0].filename)
-        filename = (path / "src" / orig_filename.name).with_suffix(".c.i")
-    else:
+        c_paths = [Path(cmd.filename) for cmd in cmds]
+        c_i_paths = [c_path.with_suffix(".c.i") for c_path in c_paths]
+
+        # Read C code from disk and generate intermediate files using cmd
+        c_codes = [path.read_text() for path in c_paths]
+        c_i_codes = [generate_intermediate_file(list(cmd.arguments)) for cmd in cmds]
+
+    elif cfg.filename.suffix == ".i":
         # Create TranslationUnit from intermediate .c.i filename
-        tu = TranslationUnit.from_source(path)
+        tus = [TranslationUnit.from_source(cfg.filename)]
 
         # Construct original .c filename
-        orig_filename = path.parent / path.stem
-        filename = path
+        c_paths = [cfg.filename.parent / cfg.filename.stem]
+        c_i_paths = [cfg.filename]
 
-    if not filename.exists():
-        raise ValueError(f"Intermediate .c.i file {filename} does not exist.")
-    if not orig_filename.exists():
-        raise ValueError(f"Original .c file {orig_filename} does not exist.")
+        # Read code from disk
+        c_codes = [path.read_text() for path in c_paths]
+        c_i_codes = [path.read_text() for path in c_i_paths]
 
-    # Check for symlinks
-    if filename.is_symlink():
-        raise ValueError(f"Input file {filename} is a symlink.")
-    if orig_filename.is_symlink():
-        raise ValueError(f"Original file {orig_filename} is a symlink.")
+    else:
+        raise ValueError(
+            "filename must be a pre-processed C source file with .i extension or compile_commands.json"
+        )
 
-    agent: dspy.Module = agents.from_config(algorithm_cfg)
-    translation: dict[str, str] = agent(orig_filename.read_text(), filename.read_text(), tu)
+    # Find common path amongst input paths and construct examples to pass to agent
+    common_dir = Path(os.path.commonpath(c_paths))
+    if not common_dir.is_dir():
+        common_dir = common_dir.parent
+    examples = [
+        dspy.Example(
+            input_code_path=c_path.relative_to(common_dir),
+            input_code=c_code,
+            full_code_path=c_i_path.relative_to(common_dir),
+            full_code=c_i_code,
+            tu=tu,
+        ).with_inputs("input_code_path", "input_code", "full_code_path", "full_code", "tu")
+        for c_path, c_code, c_i_path, c_i_code, tu in zip(
+            c_paths, c_codes, c_i_paths, c_i_codes, tus
+        )
+    ]
 
-    logger.info(
-        f"Translated {filename}",
-        extra={"c": translation["c_code"], "rust": translation["rust_code"]},
+    # Execute agent in parallel by changing cwd to common dir first
+    agent = TranslateAgent(
+        cfg.preproc_strategy,
+        cfg.translator,
+        cfg.max_iters,
+        cfg.use_raw_fixer_output,
     )
+    with chdir(common_dir):
+        if cfg.batched:
+            translations = agent.batch(
+                examples,
+                num_threads=len(examples),
+                disable_progress_bar=len(examples) == 1,
+                provide_traceback=True,
+            )
+        else:
+            translations = [agent(**example.inputs()) for example in examples]
 
-    src_dir = filename.parent
-    prompt_path = (src_dir / orig_filename.name).with_suffix(".prompt")
-    with prompt_path.open("w") as f:
-        f.write(translation["c_code"])
+    if len(translations) != len(c_paths):
+        logger.warning("A translation is missing!")
 
-    rs_translation_path = (src_dir / orig_filename.name).with_suffix(".rs")
-    with rs_translation_path.open("w") as f:
-        f.write(translation["rust_code"])
+    for translation in translations:
+        assert isinstance(translation, dspy.Prediction)
+        filename = translation["input_code_path"]
+        logger.info(f"Translated {filename} ...")
+
+        # Write rust translation to disk
+        rs_translation_path = output_dir / "src" / filename.with_suffix(".rs")
+        rs_translation_path.parent.mkdir(parents=True, exist_ok=True)
+        rs_translation_path.write_text(translation["output_code"])
+
+        prompt_path = output_dir / "src" / filename.with_suffix(".translate_prompt")
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(translation["input_code"])
+
+        history_path = output_dir / "src" / filename.with_suffix(".translate_history")
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_path.write_text(translation["history"])
+
+    logger.info(f"Saved results to {output_dir}")
+
+
+def generate_intermediate_file(cmd: list[str]):
+    if "-o" in cmd:
+        o_idx = cmd.index("-o")
+        cmd.pop(o_idx)  # -o
+        cmd.pop(o_idx)  # filename
+    cmd += ["-E"]
+    ret, out = tools.run_subprocess(cmd)
+    if not ret:
+        raise ValueError("Failed to produce intermediate file using: {' '.join(cmd)}\n{out}")
+    return out
+
+
+if __name__ == "__main__":
+    translate()

@@ -4,15 +4,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import io
 import re
-import dspy
+import sys
 import logging
-from dataclasses import dataclass
+from pathlib import Path
 
+import dspy
 from clang.cindex import TranslationUnit, CursorKind
-from hydra.core.config_store import ConfigStore
-from dspy.adapters import Tool
-from dspy.predict import Predict, ReAct
 
 from .ast import extract_info_c, get_cursor_prettyprinted
 from .tools import extract_rust, check_rust
@@ -22,58 +21,20 @@ from .cover import CoVeR
 logger = logging.getLogger("ideas.agent")
 
 
-@dataclass
-class AlgorithmConfig:
-    preproc_strategy: str = "clang"
-    request_fenced_code: bool = True
-    max_iters: int = 5
-
-    translator: str = "ReAct"
-    use_raw_fixer_output: bool = False
-
-    def __post_init__(self):
-        if self.preproc_strategy not in [
-            "clang",
-            "clang-directive-filter",
-            "clang-sys-filter",
-            "tu",
-            "tu-sys-filter",
-            "c",
-            "ltu-max",
-            "ltu-min",
-        ]:
-            raise ValueError(f"Invalid C preprocessor strategy: {self.preproc_strategy}")
-
-        if self.translator not in ["Predict", "ReAct", "CoVeR"]:
-            raise ValueError(f"Invalid translator: {self.translator}")
-
-
-cs = ConfigStore.instance()
-cs.store(name="algorithm", node=AlgorithmConfig)
-
-
 class Translation(dspy.Signature):
     """Translate the C code to idiomatic, memory-safe Rust."""
 
-    c_code: str = dspy.InputField(desc="The C code to translate")
-    rust_code: str = dspy.OutputField(
-        desc="Idiomatic, memory-safe Rust code that is functionally equivalent to the original C code"
-    )
-
-
-class FencedTranslation(Translation):
-    """Translate the C code to idiomatic, memory-safe Rust and output a single fenced code block."""
-
-    rust_code: str = dspy.OutputField(
-        desc="A single fenced code block of idiomatic, memory-safe Rust code that is functionally equivalent to the original C code"
+    input_code: dspy.Code["C"] = dspy.InputField(desc="The input source code")  # noqa: F821
+    output_code: dspy.Code["Rust"] = dspy.OutputField(  # noqa: F821
+        desc="The idiomatic and memory-safe source code that is functionally equivalent to the input source code"
     )
 
 
 class PreProcessing(dspy.Module):
-    def __init__(self, cfg: AlgorithmConfig):
+    def __init__(self, preproc_strategy: str):
         super().__init__()
 
-        self.cfg = cfg
+        self.preproc_strategy = preproc_strategy
 
     def forward(
         self, c_code: str, c_full_code: str, tu: TranslationUnit
@@ -82,7 +43,7 @@ class PreProcessing(dspy.Module):
         # Use Clang to analyze the pre-processed C code
         ast_info = extract_info_c(tu)
 
-        match self.cfg.preproc_strategy:
+        match self.preproc_strategy:
             case "clang":
                 output_code = [c_full_code]
 
@@ -159,81 +120,94 @@ class PreProcessing(dspy.Module):
                 output_units = build_unit(ast_info, type="functional_minimal")
                 output_code = [str(unit) for unit in output_units]
 
-        return {"c_code": output_code}
+        return {"input_code": output_code}
 
 
-class Agent(dspy.Module):
-    def __init__(self, cfg: AlgorithmConfig):
+class TranslateAgent(dspy.Module):
+    def __init__(
+        self,
+        preproc_strategy: str,
+        translator: str,
+        max_iters: int,
+        use_raw_fixer_output: bool,
+    ):
         super().__init__()
 
-        self.cfg = cfg
-        self.preprocessor = PreProcessing(self.cfg)
-        self.translate_signature = FencedTranslation if cfg.request_fenced_code else Translation
-        self.translator = Predict(self.translate_signature)
+        self.preprocessor = PreProcessing(preproc_strategy)
+        self.translate_signature = Translation
 
-    def forward(self, c_code: str, c_full_code: str, tu: TranslationUnit) -> dict[str, str]:
-        c_translation_inputs: dict[str, list[str]] = self.preprocessor(c_code, c_full_code, tu)
-
-        rust_code = []
-        for c_input in c_translation_inputs["c_code"]:
-            translation: dspy.Prediction = self.translator(c_code=c_input)
-            # FIXME: There has to be a way to get dspy to parse rust_code
-            snippet = extract_rust(translation.rust_code)
-
-            rust_code.append(snippet)
-
-        # Concatenate C inputs and Rust outputs
-        c_code = "\n\n// next input\n".join(c_translation_inputs["c_code"])
-        rust_code = "\n\n// next output\n".join(rust_code)
-
-        return {
-            "c_code": c_code,
-            "rust_code": rust_code,
-        }
-
-
-class AgentWithFeedback(Agent):
-    def __init__(self, cfg: AlgorithmConfig):
-        super().__init__(cfg)
-
-        success_message: str = "Success!"
+        success_message: str = "Completed!"
 
         def compile_rust(rust_code: str) -> str:
             rust_code = extract_rust(rust_code)
-            success, compile_messages = check_rust(rust_code)
+            success, compile_messages = check_rust(
+                rust_code, flags=["-A", "dead_code", "--crate-type", "lib"]
+            )
             if success:
                 compile_messages = success_message
             return compile_messages
 
-        self.compile_tool = Tool(
+        self.compile_tool = dspy.Tool(
             func=compile_rust,
             name="compile_rust",
             desc=f'Compiles the Rust code standalone and checks for errors. Returns "{success_message}" when compilation succeeds.',
         )
 
-        match cfg.translator:
+        match translator:
             case "ReAct":
-                self.translator = ReAct(
-                    self.translate_signature, tools=[self.compile_tool], max_iters=cfg.max_iters
+                self.translator = dspy.ReAct(
+                    self.translate_signature, tools=[self.compile_tool], max_iters=max_iters
                 )
 
             case "CoVeR":
                 self.translator = CoVeR(
                     self.translate_signature,
                     tools=[self.compile_tool],
-                    max_iters=cfg.max_iters,
-                    use_raw_fixer_output=cfg.use_raw_fixer_output,
+                    success=success_message,
+                    max_iters=max_iters,
+                    use_raw_fixer_output=use_raw_fixer_output,
                 )
 
+            case "Predict":
+                self.translator = dspy.Predict(self.translate_signature)
+
             case _:
-                raise ValueError(f"Invalid translator: {cfg.translator}")
+                raise ValueError(f"Invalid translator: {translator}")
 
+    def forward(
+        self,
+        input_code_path: Path,
+        input_code: str,
+        full_code_path: Path,
+        full_code: str,
+        tu: TranslationUnit,
+    ) -> dspy.Prediction:
+        logger.info(f"Translating {input_code_path} ...")
 
-def from_config(cfg: AlgorithmConfig) -> dspy.Module:
-    if cfg.translator == "Predict":
-        return Predict(cfg)
+        translation_inputs: dspy.Prediction = self.preprocessor(input_code, full_code, tu)
 
-    if cfg.translator in ["ReAct", "CoVeR"]:
-        return AgentWithFeedback(cfg)
+        output_code = []
+        for input_code in translation_inputs["input_code"]:
+            translation: dspy.Prediction = self.translator(input_code=input_code)
+            # dspy.Code.code gets the code str.
+            snippet = translation.output_code.code
 
-    raise ValueError(f"Invalid translator: {cfg.translator}.")
+            output_code.append(snippet)
+
+        # Concatenate inputs and outputs
+        input_code = "\n\n// next input\n".join(translation_inputs["input_code"])
+        output_code = "\n\n// next output\n".join(output_code)
+
+        # Save dspy history to string
+        history = io.StringIO()
+        sys.stdout = history
+        dspy.inspect_history(100)
+        sys.stdout = sys.__stdout__
+
+        return dspy.Prediction(
+            input_code_path=input_code_path,
+            full_code_path=full_code_path,
+            input_code=input_code,
+            output_code=output_code,
+            history=history.getvalue(),
+        )

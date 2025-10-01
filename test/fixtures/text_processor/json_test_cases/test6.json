@@ -1,0 +1,7 @@
+{
+    "argv": ["count"],
+    "stdin": "",
+    "stdout": {"pattern": "Words: 0, Characters: 0\n"},
+    "stderr": {"pattern": ""},
+    "has_ub": "This test should be completely skipped"
+}

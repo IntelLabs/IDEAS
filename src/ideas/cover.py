@@ -8,28 +8,25 @@
 import logging
 from typing import Any
 
-from litellm import ContextWindowExceededError
+from litellm.exceptions import ContextWindowExceededError
 
 import dspy
-from dspy.adapters.types.tool import Tool
-from dspy.primitives.program import Module
-from dspy.signatures.signature import ensure_signature
 from dspy.predict.react import _fmt_exc
 
 logger = logging.getLogger(__name__)
 
 
-class CoVeR(Module):
+class CoVeR(dspy.Module):
     def __init__(
         self,
         signature: dspy.SignatureMeta,
-        tools: list[Tool],
+        tools: list[dspy.Tool],
         success: str = "Success!",
         max_iters: int = 5,
         use_raw_fixer_output: bool = True,
     ):
         super().__init__()
-        self.signature = signature = ensure_signature(signature)  # type: ignore
+        self.signature = signature = dspy.ensure_signature(signature)  # type: ignore
         self.success = success
         self.max_iters = max_iters
         self.use_raw_fixer_output = use_raw_fixer_output

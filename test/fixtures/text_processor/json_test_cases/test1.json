@@ -1,0 +1,6 @@
+{
+    "argv": ["upper"],
+    "stdin": "Hello World!\n",
+    "stdout": {"pattern": "HELLO WORLD!\n"},
+    "stderr": {"pattern": ""}
+}
