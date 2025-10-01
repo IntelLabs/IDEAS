@@ -1,0 +1,7 @@
+{
+  "argv": [],
+  "stdin": "",
+  "stdout": {
+    "pattern": "*****\nHello World!\n*****"
+  }
+}

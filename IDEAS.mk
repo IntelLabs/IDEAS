@@ -13,12 +13,13 @@ IDEAS_MAKEFILE := $(MAKEFILE_DIR)/IDEAS.mk
 
 PROVIDER ?= hosted_vllm
 MODEL ?= Qwen/Qwen3-Coder-30B-A3B-Instruct
+HOST ?= localhost
 PORT ?= 8000
-BASE_URL ?= http://localhost:${PORT}/v1
+BASE_URL ?= http://${HOST}:${PORT}/v1
 TRANSLATION_DIR ?= translation.$(shell git --git-dir=${MAKEFILE_DIR}/.git rev-parse HEAD)
 ifeq (${PROVIDER},hosted_vllm)
-TRANSLATE_ARGS = model.base_url=${BASE_URL}
-REPAIR_ARGS = model.base_url=${BASE_URL}
+override TRANSLATE_ARGS += model.base_url=${BASE_URL}
+override REPAIR_ARGS += model.base_url=${BASE_URL}
 endif
 RUSTFLAGS ?= -Awarnings## Ignore Rust compiler warnings
 CFLAGS ?= -w## Ignore C compiler warnings
@@ -134,11 +135,10 @@ extract: $(patsubst afl/out/default/queue/%,test_vectors/%.json,${FUZZING_TEST_V
 	@echo "--- Added $(words $^) test vectors in ---"
 	@echo "--- $(CURDIR)/test_vectors/ ---"
 
-# FIXME: This needs to be updated to the new JSON schemas
 test_vectors/%.json: afl/out/default/queue/%
 	@mkdir -p $(@D)
 	@./afl/executable < $< \
-	| jq -n --rawfile input $< --rawfile output /dev/stdin "{args: [], in: (\$$input | rtrimstr(\"\n\") | split(\"\n\")), out: (\$$output | rtrimstr(\"\n\") | split(\"\n\")) }" > $@
+	| jq -n --rawfile input $< --rawfile output /dev/stdin "{argv: [], stdin: \$$input, stdout: {"pattern": \$$output} }" > $@
 
 
 # c2rust
