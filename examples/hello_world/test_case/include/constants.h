@@ -7,8 +7,8 @@
 #ifndef CONSTANTS_H
 #define CONSTANTS_H
 
-#define GREETING "Hello, Fancy World!"
+#define GREETING "Hello World!"
 #define BORDER_CHAR '*'
-#define BORDER_LENGTH 25
+#define BORDER_LENGTH 5
 
 #endif
