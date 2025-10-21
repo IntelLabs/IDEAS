@@ -6,8 +6,6 @@
 
 MAKEFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
 MAKEFILE_DIR := $(realpath $(dir $(MAKEFILE_PATH)))
-PIPELINE_DIR := lib/pipeline_automation
-PIPELINE_TAG := ideas/$(shell git rev-list -1 HEAD -- ${PIPELINE_DIR})
 EXAMPLES_DIR := examples
 IDEAS_MAKEFILE := $(MAKEFILE_DIR)/IDEAS.mk
 
@@ -33,36 +31,12 @@ ifeq ($(EXAMPLES),)
 $(warning No projects found in ${EXAMPLES_DIR}. You may need to re-run commands!)
 endif
 
+EXAMPLES_WITH_RUNNERS := $(filter-out $(foreach ex,$(EXAMPLES),$(if $(wildcard $(ex)/../runner $(ex)/../test_vectors),,$(ex))),$(EXAMPLES))
+ifeq ($(EXAMPLES_WITH_RUNNERS),)
+$(warning No projects with runners found in ${EXAMPLES_DIR}. You may need to re-run commands!)
+endif
+
 all: help ;
-
-# FIXME: We are using a hotfix to run `carge generate_lockfile` on the host.
-.PHONY: build
-build:## Build unsafety, idiomaticity, and c2rust Docker images
-build: ${PIPELINE_DIR}/evaluate_unsafe_usage/unsafety.Dockerfile \
-       ${PIPELINE_DIR}/idiomaticity/idiomaticity_measurements.Dockerfile \
-       ${PIPELINE_DIR}/c2rust/install_c2rust_generate_lockfile_on_host.Dockerfile
-	docker build -t ${PIPELINE_TAG}/unsafety \
-                 -f ${PIPELINE_DIR}/evaluate_unsafe_usage/unsafety.Dockerfile \
-                 ${PIPELINE_DIR}/evaluate_unsafe_usage/
-	docker build -t ${PIPELINE_TAG}/idiomaticity \
-                 -f ${PIPELINE_DIR}/idiomaticity/idiomaticity_measurements.Dockerfile \
-                 ${PIPELINE_DIR}/idiomaticity/
-	docker build -t ${PIPELINE_TAG}/c2rust \
-                 -f ${PIPELINE_DIR}/c2rust/install_c2rust_generate_lockfile_on_host.Dockerfile \
-                 ${PIPELINE_DIR}/c2rust/
-	docker pull ${AFL_TAG}
-
-# Comment out cargo generate-lockfile in the Docker image.
-lib/pipeline_automation/c2rust/c2rust_commands_generate_lockfile_on_host.sh: lib/pipeline_automation/c2rust/c2rust_commands.sh
-	sed 's/cargo generate-lockfile/#cargo generate-lockfile/g' $< > $@
-
-# Copy the modified script to the Docker image.
-lib/pipeline_automation/c2rust/install_c2rust_generate_lockfile_on_host.Dockerfile: lib/pipeline_automation/c2rust/install_c2rust.Dockerfile lib/pipeline_automation/c2rust/c2rust_commands_generate_lockfile_on_host.sh lib/pipeline_automation/c2rust/invoke_c2rust_generate_lockfile_on_host.py
-	sed 's/c2rust_commands\.sh/c2rust_commands_generate_lockfile_on_host\.sh/g' $< > $@
-
-# Run cargo generate-lockfile on the host after the Docker container exits.
-lib/pipeline_automation/c2rust/invoke_c2rust_generate_lockfile_on_host.py: lib/pipeline_automation/c2rust/invoke_c2rust.py
-	sed '$$a\  subprocess.check_call(["cargo", "generate-lockfile"], cwd=args.out)' $< > $@
 
 .PHONY: install
 install: install-uv install-rust## Install uv and Rust
@@ -72,8 +46,8 @@ install-uv:## Install uv@0.7.12
 	curl -LsSf https://astral.sh/uv/0.7.12/install.sh | sh
 
 .PHONY: install-rust
-install-rust:## Install Rust@1.87.0
-	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain 1.87.0
+install-rust:## Install Rust@1.88.0
+	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain 1.88.0
 
 .PHONY: test
 test:## Run pytest
@@ -96,6 +70,19 @@ examples/init: $(subst /test_case,/init,${EXAMPLES}) ;
 examples/%/init:## Initialize specific example
 examples/%/init: FORCE
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) init
+
+
+.PHONY: examples/cmake
+examples/cmake:## CMake generate and build all examples
+examples/cmake: $(subst /test_case,/cmake,${EXAMPLES}) ;
+	@echo "# cmake"
+	@echo "\`\`\`"
+	@find ${EXAMPLES_DIR} -path "*/build-ninja/build.log" -size 0 -exec echo SUCCEEDED \; | uniq -c
+	@find ${EXAMPLES_DIR} -path "*/build-ninja/build.log" -size +0 -exec echo FAILED \; | uniq -c
+	@echo "\`\`\`"
+examples/%/cmake:## CMake generate and build specific example
+examples/%/cmake: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 
 
 .PHONY: examples/translate
@@ -164,6 +151,20 @@ examples/%/test:## Test specific translated example
 examples/%/test: FORCE
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) test
 
+.PHONY: examples/test_libc
+examples/test_libc:## Run tests using runners on all C library examples
+examples/test_libc: $(subst /test_case,/test_libc,${EXAMPLES_WITH_RUNNERS}) ;
+examples/%/test_libc:## Run tests using runners on specific C library example
+examples/%/test_libc: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) test_libc
+
+.PHONY: examples/test_librs
+examples/test_librs:## Run tests using runners on all translated Rust library examples
+examples/test_librs: $(subst /test_case,/test_librs,${EXAMPLES_WITH_RUNNERS}) ;
+examples/%/test_librs:## Run tests using runners on specific translated Rust library example
+examples/%/test_librs: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) test_librs
+
 .PHONY: examples/repair
 examples/repair:## Repair all examples
 examples/repair: $(subst /test_case,/repair,${EXAMPLES})
@@ -203,8 +204,8 @@ examples/%/update_tests: FORCE
 
 # clean
 clean:
-	rm -rf ${PIPELINE_DIR} examples
-	git checkout HEAD ${PIPELINE_DIR} examples
+	rm -rf examples
+	git checkout HEAD examples
 
 # help
 RESET := \033[0;0m
@@ -226,5 +227,4 @@ help:
           { printf "  ${YELLOW_COL}%-30s${RESET}%s ${GREY_COL}(default: %s)${RESET}\n", $$1, $$3, $$2}'
 	@echo ""
 	@echo "Examples:"
-	@echo "  make examples/test TRANSLATION_DIR=c2rust ${GREY_COL}# Translate, build, and run tests on c2rust translated examples${RESET}"
 	@echo "  make examples/test TRANSLATION_DIR=test_case ${GREY_COL}# Build and run tests on C examples ${RESET}"

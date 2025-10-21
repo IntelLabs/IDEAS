@@ -28,7 +28,7 @@ def test_all_code_from_tu(i_code: str):
 
     # Check for exact formatting
     assert (
-        result.fn_definitions["foo"]
+        result.fn_definitions["c:@F@foo"]
         == r"""void foo() {
       int x = 10; int y = 20;
     // A comment
@@ -49,4 +49,6 @@ def test_newline():
     tu = ast.create_translation_unit(code)
     result = ast.extract_info_c(tu)
 
-    assert result.fn_definitions["main"] == "int main(int argc, char **argv) { return 0;\r\n}"
+    assert (
+        result.fn_definitions["c:@F@main"] == "int main(int argc, char **argv) { return 0;\r\n}"
+    )

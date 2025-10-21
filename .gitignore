@@ -2,6 +2,7 @@
 examples/
 
 .DS_Store
+*.*~
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -39,3 +40,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Rust tools
+target/

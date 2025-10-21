@@ -5,7 +5,6 @@
 #
 
 from json import loads as js_loads
-import re
 import logging
 import subprocess
 from typing import Any
@@ -115,51 +114,6 @@ def check_rust(
         cmd.extend(["-", "--out-dir", dirname])
 
     return run_subprocess(cmd, input=code)
-
-
-def extract_rust(response: str) -> str:
-    block_pattern = r"```([^\n]*)\n(.*?)\n?```"
-    open_ended_pattern = r"```([^\n]*)\n(.*?)$"
-
-    snippets, languages = [], []
-    last_closed_end_idx = 0  # Keeps track of where the last codeblock ends
-
-    # Match all closed code blocks
-    for match in re.finditer(block_pattern, response, re.DOTALL):
-        language = match.group(1).lower().strip() if match.group(1) else None
-        content = match.group(2).strip()
-
-        last_closed_end_idx = match.end()
-        snippets.append(content)
-        languages.append(language)
-
-    # Look for an open-ended code block after the last closed block
-    if last_match := re.search(open_ended_pattern, response[last_closed_end_idx:], re.DOTALL):
-        language = last_match.group(1).lower().strip() if last_match.group(1) else None
-        content = last_match.group(2).strip()
-
-        snippets.append(content)
-        languages.append(language)
-
-    # Filter only Rust and generic (non-language-specific) non-empty code blocks
-    snippets = [
-        content.strip()
-        for content, language in zip(snippets, languages)
-        if len(content) > 0 and language in ["rust", None]
-    ]
-
-    # Accept the entire response as-is if no pattern matches
-    if len(snippets) == 0:
-        logger.warning(
-            "No valid code blocks found in translation! Using the entire response as-is."
-        )
-        return response
-
-    # Warn if multiple snippets were output by the model
-    if len(snippets) > 1:
-        logger.warning("Multiple valid code blocks found in translation! Using the last one.")
-
-    return snippets[-1]
 
 
 def run_clippy(

@@ -1,0 +1,11 @@
+[package]
+name = "ideas_crateify"
+description = "A little tool for creating the base structure for a Rust crate from a C source project"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Marcela Melara <marcela.melara@intel.com>"]
+
+[[bin]]
+name = "crateify"
+path = "src/main.rs"

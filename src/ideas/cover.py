@@ -41,20 +41,15 @@ class CoVeR(dspy.Module):
         instr = [f"{signature.instructions}\n"] if signature.instructions else []
         instr.extend(
             [
-                f"You are an Agent. You are given the input fields {inputs} and you can see your past trajectory.",
-                f"You must ensure that a set of tools execute successfully on the output fields {outputs}.\n",
+                f"You are an Agent. In each episode, you will be given the fields {inputs} as input. And you can see your past trajectory so far.",
+                f"Your goal is to use the supplied tools to collect any necessary information for producing {outputs}.\n",
+                "After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n",
+                "When writing next_thought, you may reason about the current situation and plan for future steps.",
                 "The tools are:\n",
             ]
         )
         for idx, tool in enumerate(tool_dict.values()):
             instr.append(f"({idx + 1}) {tool}")
-        instr.append("\n")
-        instr.extend(
-            [
-                "After each tool call, you receive a resulting observation based on the latest outputs.",
-                "If there are errors in the tool call, you may reason about the current situation and plan for future steps.\n",
-            ]
-        )
 
         # Extract all task (non-wrapper) output names
         self.task_outputs: list[str] = list(signature.output_fields.keys())
@@ -115,22 +110,29 @@ class CoVeR(dspy.Module):
 
             assert pred is not None, "Prediction should not be None!"
             trajectory[f"thought_{idx}"] = pred.next_thought  # type: ignore
-            trajectory[f"observation_{idx}"] = ""
+            tool_names, tool_args, observations = [], [], []
             for name in self.tools.keys():
+                local_args = {arg: getattr(pred, arg) for arg in self.tool_args[name]}  # type: ignore
+                tool_names.append(name)
+                tool_args.append(str(local_args))
                 try:
-                    tool_args = {arg: getattr(pred, arg) for arg in self.tool_args[name]}  # type: ignore
-                    feedback = self.tools[name](**tool_args)
+                    feedback = self.tools[name].func(**local_args)
                 except Exception as err:
                     feedback = f"Execution error in {name}: {_fmt_exc(err)}"
 
-                trajectory[f"observation_{idx}"] += feedback
+                observations.append(feedback)
 
-            if trajectory[f"observation_{idx}"] == self.success:
+            if self.success in observations:
                 if self.use_raw_fixer_output:
                     # Return exactly the output that sucessfully satisfies the tools
                     prediction = dspy.Prediction(trajectory=trajectory, **pred)
                     return prediction
                 break
+
+            # Concatenate all tool calls, args used, and feedback in this step
+            trajectory[f"tool_name_{idx}"] = "\n\n".join(tool_names)
+            trajectory[f"tool_args_{idx}"] = "\n\n".join(tool_args)
+            trajectory[f"observation_{idx}"] = "\n\n".join(observations)
 
         extract = self._call_with_potential_trajectory_truncation(
             self.extract, trajectory, **input_args

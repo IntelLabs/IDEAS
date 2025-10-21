@@ -46,10 +46,10 @@ def get_all_symbols_for_name_by_kind(tr: TreeResult, name: str, kind: CursorKind
 
 def test_declarations_and_definitions(c_code: str):
     expected_names = [
-        "add_without_definition",
-        "print_message",
-        "add",
-        "helper",
+        "c:@F@add_without_definition",
+        "c:@F@print_message",
+        "c:@F@add",
+        "c:file.c@F@helper",
     ]
 
     expected_declarations = [
@@ -59,22 +59,22 @@ def test_declarations_and_definitions(c_code: str):
         "static int helper(int x)",
     ]
 
-    expected_definitions = {
-        "add_without_definition": None,
-        "add": r"""
+    expected_definitions = [
+        None,
+        r"""
+void print_message(const char* msg) {
+    printf("%s\\n", msg);
+}""".strip(),
+        r"""
 int add(int a, int b) {
     // This is a helpful comment that should not be stripped!
     return a + b;
 }""".strip(),
-        "print_message": r"""
-void print_message(const char* msg) {
-    printf("%s\\n", msg);
-}""".strip(),
-        "helper": r"""
+        r"""
 static int helper(int x) {
     return x * 2;
 }""".strip(),
-    }
+    ]
 
     tu = ast.create_translation_unit(c_code)
     result = ast.extract_info_c(tu)
@@ -92,8 +92,8 @@ static int helper(int x) {
     for decl, exp in zip(declarations, expected_declarations):
         assert decl == exp
 
-    for exp in expected_definitions.items():
-        assert definitions[exp[0]] == exp[1]
+    for name, exp in zip(names, expected_definitions):
+        assert definitions[name] == exp
 
 
 def test_function_calls(c_fn_calling_code: str):
@@ -104,16 +104,16 @@ def test_function_calls(c_fn_calling_code: str):
     fn_names = functions.keys()
     # Declared or imported function names should be extracted correctly
     assert {
-        "printf",
-        "fabs",
-        "pow",
-        "log10",
-        "add",
-        "subtract",
-        "double_value",
-        "triple_value",
-        "quadruple_value",
-        "double_absolute_value",
+        "c:@F@printf",
+        "c:@F@fabs",
+        "c:@F@pow",
+        "c:@F@log10",
+        "c:@F@add",
+        "c:@F@subtract",
+        "c:@F@double_value",
+        "c:@F@triple_value",
+        "c:@F@quadruple_value",
+        "c:@F@double_absolute_value",
     } < fn_names
 
     declarations = set(functions.values())
@@ -130,7 +130,7 @@ def test_function_calls(c_fn_calling_code: str):
     # Check that definitions of library functions are correctly pre-processed
     fn_definitions = result.fn_definitions
     assert (
-        fn_definitions["add"]
+        fn_definitions["c:@F@add"]
         == r"""
 int add(int a, int b) {
     return a + b;
@@ -138,7 +138,7 @@ int add(int a, int b) {
     )
 
     assert (
-        fn_definitions["subtract"]
+        fn_definitions["c:@F@subtract"]
         == r"""
 int subtract(int a, int b) {
     return add(a, -b);
@@ -148,26 +148,26 @@ int subtract(int a, int b) {
     # All function calls should be detected
     assert get_all_symbols_for_name_by_kind(
         result,
-        "double_value",
+        "c:@F@double_value",
         CursorKind.CALL_EXPR,  # type: ignore[reportAttributeAccessIssue]
-    ) == {"add", "printf"}
+    ) == {"c:@F@add", "c:@F@printf"}
 
     assert get_all_symbols_for_name_by_kind(
         result,
-        "triple_value",
+        "c:@F@triple_value",
         CursorKind.CALL_EXPR,  # type: ignore[reportAttributeAccessIssue]
-    ) == {"add", "subtract"}
+    ) == {"c:@F@add", "c:@F@subtract"}
 
     assert (
-        get_all_symbols_for_name_by_kind(result, "quadruple_value", CursorKind.CALL_EXPR)  # type: ignore[reportAttributeAccessIssue]
+        get_all_symbols_for_name_by_kind(result, "c:@F@quadruple_value", CursorKind.CALL_EXPR)  # type: ignore[reportAttributeAccessIssue]
         == set()
     )
 
     assert get_all_symbols_for_name_by_kind(
         result,
-        "double_absolute_value",
+        "c:@F@double_absolute_value",
         CursorKind.CALL_EXPR,  # type: ignore[reportAttributeAccessIssue]
-    ) == {"add", "fabs", "pow", "log10", "printf"}
+    ) == {"c:@F@add", "c:@F@fabs", "c:@F@pow", "c:@F@log10", "c:@F@printf"}
 
 
 def test_typedefs(c_data_structures_code: str):
@@ -175,8 +175,8 @@ def test_typedefs(c_data_structures_code: str):
     result = ast.extract_info_c(tu)
 
     typedefs = get_all_decl_by_kind(result, CursorKind.TYPEDEF_DECL)  # type: ignore[reportAttributeAccessIssue]
-    assert {"radius_t"} < typedefs.keys()
-    assert typedefs["radius_t"] == "typedef double radius_t"
+    assert {"c:file.c@T@radius_t"} < typedefs.keys()
+    assert typedefs["c:file.c@T@radius_t"] == "typedef double radius_t"
 
 
 def test_variables(c_data_structures_code: str):
@@ -185,26 +185,26 @@ def test_variables(c_data_structures_code: str):
 
     variables = get_all_decl_by_kind(result, CursorKind.VAR_DECL)  # type: ignore[reportAttributeAccessIssue]
     assert {
-        "p1",
-        "num_dimensions",
-        "anonymous_struct",
-        "half_pi",
-        "one_third_pi",
-        "quarter_pi",
-        "PI",
-        "e_powers",
-        "circle_color",
+        "c:@p1",
+        "c:@num_dimensions",
+        "c:@anonymous_struct",
+        "c:@half_pi",
+        "c:file.c@one_third_pi",
+        "c:file.c@quarter_pi",
+        "c:@PI",
+        "c:@e_powers",
+        "c:@circle_color",
     } < variables.keys()
 
-    assert variables["p1"] == "struct Point p1"
-    assert variables["num_dimensions"] == "int num_dimensions"
-    assert variables["anonymous_struct"] == "struct { int a; int b; } anonymous_struct"
-    assert variables["half_pi"] == "const double half_pi"
-    assert variables["one_third_pi"] == "static double one_third_pi"
-    assert variables["quarter_pi"] == "static const double quarter_pi"
-    assert variables["PI"] == "extern const double PI"
-    assert variables["e_powers"] == "extern float e_powers[4]"
-    assert variables["circle_color"] == "enum Color circle_color"
+    assert variables["c:@p1"] == "struct Point p1"
+    assert variables["c:@num_dimensions"] == "int num_dimensions"
+    assert variables["c:@anonymous_struct"] == "struct { int a; int b; } anonymous_struct"
+    assert variables["c:@half_pi"] == "const double half_pi"
+    assert variables["c:file.c@one_third_pi"] == "static double one_third_pi"
+    assert variables["c:file.c@quarter_pi"] == "static const double quarter_pi"
+    assert variables["c:@PI"] == "extern const double PI"
+    assert variables["c:@e_powers"] == "extern float e_powers[4]"
+    assert variables["c:@circle_color"] == "enum Color circle_color"
 
 
 def test_structs(c_data_structures_code: str):
@@ -212,9 +212,9 @@ def test_structs(c_data_structures_code: str):
     result = ast.extract_info_c(tu)
 
     structs = get_all_decl_by_kind(result, CursorKind.STRUCT_DECL)  # type: ignore[reportAttributeAccessIssue]
-    assert {"struct Point"} < structs.keys()
+    assert {"c:@S@Point"} < structs.keys()
     assert (
-        structs["struct Point"]
+        structs["c:@S@Point"]
         == r"""
 struct Point {
     int x;
@@ -228,9 +228,9 @@ def test_enums(c_data_structures_code: str):
     result = ast.extract_info_c(tu)
 
     enums = get_all_decl_by_kind(result, CursorKind.ENUM_DECL)  # type: ignore[reportAttributeAccessIssue]
-    assert enums.keys() == {"enum Color"}
+    assert enums.keys() == {"c:@E@Color"}
     assert (
-        enums["enum Color"]
+        enums["c:@E@Color"]
         == r"""
 enum Color {
     red = 1,

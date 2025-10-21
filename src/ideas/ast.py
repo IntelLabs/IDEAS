@@ -31,10 +31,10 @@ REF_NODE_KIND = {
 }
 
 DATA_STRUCT_NODE_MAP = {
-    CursorKind.STRUCT_DECL: "struct",  # type: ignore[reportAttributeAccessIssue]
-    CursorKind.UNION_DECL: "union",  # type: ignore[reportAttributeAccessIssue]
-    CursorKind.ENUM_DECL: "enum",  # type: ignore[reportAttributeAccessIssue]
-    CursorKind.ENUM_CONSTANT_DECL: "enum",  # type: ignore[reportAttributeAccessIssue]
+    CursorKind.STRUCT_DECL,  # type: ignore[reportAttributeAccessIssue]
+    CursorKind.UNION_DECL,  # type: ignore[reportAttributeAccessIssue]
+    CursorKind.ENUM_DECL,  # type: ignore[reportAttributeAccessIssue]
+    CursorKind.ENUM_CONSTANT_DECL,  # type: ignore[reportAttributeAccessIssue]
 }
 
 
@@ -71,84 +71,65 @@ def create_translation_unit(code: str) -> TranslationUnit:
 # Traverse the AST, extract symbols and resolve deep references
 def extract_info_c(tu: TranslationUnit) -> TreeResult:
     result = TreeResult()
-    previous_name: str = ""
+    previous_usr: str = ""
     for node in tu.cursor.get_children():
-        name, kind, usr = node.spelling, node.kind, node.get_usr()
+        kind, usr = node.kind, node.get_usr()
         # Top-level declaration
         decl_range = get_declaration_range(node)
         decl = get_code_from_tu_range(tu, decl_range)
 
-        match (name, kind, node.is_definition()):
-            # Nameless symbols
-            case ("", _, _):
-                assert kind in DATA_STRUCT_NODE_MAP, (
-                    f"An unexpected nameless declaration was encountered: {kind}"
-                )
-
-                # Capture nameless data structures using their usr
-                pseudo_name = " ".join([DATA_STRUCT_NODE_MAP[kind], usr])
-                result.symbols[pseudo_name] = Symbol(pseudo_name, kind, decl)
-
-                previous_name = usr
-                for child in node.get_children():
-                    # Register a dependency on the underlying enum for each enumerator
-                    if child.kind == CursorKind.ENUM_CONSTANT_DECL:  # type: ignore[reportAttributeAccessIssue]
-                        result.complete_graph[child.spelling].append(
-                            result.symbols[pseudo_name]
-                        )
-
+        match (kind, node.is_definition()):
             # Function definition
-            case (_, CursorKind.FUNCTION_DECL, True):  # type: ignore[reportAttributeAccessIssue]
-                result.symbols[name] = Symbol(name, kind, decl)
+            case (CursorKind.FUNCTION_DECL, True):  # type: ignore[reportAttributeAccessIssue]
+                result.symbols[usr] = Symbol(usr, kind, decl)
                 fn_defn = get_code_from_tu_range(tu, node.extent)
-                result.fn_definitions[name] = fn_defn
+                result.fn_definitions[usr] = fn_defn
 
             # Data structures
-            case (_, kind, _) if kind in DATA_STRUCT_NODE_MAP:
-                # Modify the name to match the data structure type
-                # e.g., "struct Point" instead of just "Point"
-                original_name = name
-                name = " ".join((DATA_STRUCT_NODE_MAP[kind], name))
-                result.symbols[name] = Symbol(name, kind, decl)
+            case (kind, _) if kind in DATA_STRUCT_NODE_MAP:
+                result.symbols[usr] = Symbol(usr, kind, decl)
 
-                previous_name = original_name
+                previous_usr = usr
                 for child in node.get_children():
                     # Register a dependency on the underlying enum for each enumerator
                     if child.kind == CursorKind.ENUM_CONSTANT_DECL:  # type: ignore[reportAttributeAccess]
-                        result.complete_graph[child.spelling].append(result.symbols[name])
+                        result.complete_graph[child.get_usr()].append(result.symbols[usr])
 
             # Typedefs
-            case (_, CursorKind.TYPEDEF_DECL, _):  # type: ignore[reportAttributeAccessIssue]
-                result.symbols[name] = Symbol(name, kind, decl)
+            case (CursorKind.TYPEDEF_DECL, _):  # type: ignore[reportAttributeAccessIssue]
+                result.symbols[usr] = Symbol(usr, kind, decl)
 
                 # NOTE: If this is a typedef <struct/union/enum> the data structure was visited just before
                 for child in node.walk_preorder():
                     if child.kind not in DATA_STRUCT_NODE_MAP:
                         continue
-                    full_name = " ".join((DATA_STRUCT_NODE_MAP[child.kind], previous_name))
+                    full_usr = previous_usr
 
                     # Suppress the data structure and force a dependence on the typedef
                     if (
                         child.kind in {CursorKind.STRUCT_DECL, CursorKind.UNION_DECL}  # type: ignore[reportAttributeAccessIssue]
-                        and full_name in result.symbols
-                        and result.symbols[full_name].decl in result.symbols[name].decl
+                        and full_usr in result.symbols
+                        and result.symbols[full_usr].decl in result.symbols[usr].decl
                     ):
-                        assert full_name != name, (
+                        assert full_usr != usr, (
                             "Typedef cannot be named the same as its underlying data structure!"
                         )
-                        del result.symbols[full_name]
-                        result.complete_graph[full_name].append(result.symbols[name])
+                        del result.symbols[full_usr]
+                        result.complete_graph[full_usr].append(result.symbols[usr])
 
                     # Register a dependency on the typedef for each (possibly deeply nested) enumerator
                     if child.kind == CursorKind.ENUM_CONSTANT_DECL:  # type: ignore[reportAttributeAccessIssue]
-                        result.complete_graph[child.spelling].append(result.symbols[name])
+                        result.complete_graph[child.get_usr()].append(result.symbols[usr])
 
             # All other declarations
-            case (_, kind, _) if kind in DECL_NODE_KIND:
-                result.symbols[name] = Symbol(name, kind, decl)
+            case (kind, _) if kind in DECL_NODE_KIND:
+                result.symbols[usr] = Symbol(usr, kind, decl)
+
+            case (_, _):
+                raise NotImplementedError()
 
         # All referenced symbols
-        result.complete_graph[name] = extract_referenced_symbols(node)
+        result.complete_graph[usr] = extract_referenced_symbols(node)
 
     # Resolve top-level dependencies
     cache = {}
@@ -166,10 +147,13 @@ def extract_info_c(tu: TranslationUnit) -> TreeResult:
 def extract_referenced_symbols(node: Cursor) -> list[Symbol]:
     symbol_uses = []
 
-    for node in node.walk_preorder():
+    for child_node in node.walk_preorder():
         # Reference to a symbol
-        if node.kind in REF_NODE_KIND:
-            symbol_uses.append(Symbol(node.spelling, node.kind))
+        if child_node.kind in REF_NODE_KIND:
+            # Ignore internal references to, e.g., function parameters
+            if child_node.referenced is None:
+                continue
+            symbol_uses.append(Symbol(child_node.referenced.get_usr(), child_node.kind))
 
     return symbol_uses
 
