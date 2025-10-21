@@ -14,7 +14,7 @@ import dspy
 from clang.cindex import TranslationUnit, CursorKind
 
 from .ast import extract_info_c, get_cursor_prettyprinted
-from .tools import extract_rust, check_rust
+from .tools import check_rust
 from .ltu import build_unit
 from .cover import CoVeR
 
@@ -138,10 +138,10 @@ class TranslateAgent(dspy.Module):
 
         success_message: str = "Completed!"
 
-        def compile_rust(rust_code: str) -> str:
-            rust_code = extract_rust(rust_code)
+        def compile_rust(output_code: dspy.Code["Rust"]) -> str:  # noqa: F821
+            rust_code = output_code.code
             success, compile_messages = check_rust(
-                rust_code, flags=["-A", "dead_code", "--crate-type", "lib"]
+                rust_code, flags=["-A", "dead_code", "--crate-type", "lib", "--edition", "2024"]
             )
             if success:
                 compile_messages = success_message

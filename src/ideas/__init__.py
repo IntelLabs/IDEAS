@@ -5,7 +5,6 @@
 #
 
 from .logging import JSONFormatter, CodePairFilter
-from .tools import extract_rust
 from .ast import create_translation_unit, extract_info_c, TreeResult
 from .ltu import build_unit
 from .model import ModelConfig, GenerateConfig
@@ -17,7 +16,6 @@ __version__ = "2025.10"
 __all__ = [
     "create_translation_unit",
     "extract_info_c",
-    "extract_rust",
     "TreeResult",
     "ModelConfig",
     "GenerateConfig",

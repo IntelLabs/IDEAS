@@ -87,19 +87,38 @@ class RepairAgent(dspy.Module):
         if not cargo_toml.exists():
             raise ValueError(f"{cargo_toml=} must exist!")
 
-        # Extract rust code and test cases and run repair
+        # Extract root package metadata from Cargo.toml
         out = subprocess.run(
             ["cargo", "metadata", "--manifest-path", cargo_toml], text=True, capture_output=True
         )
+        if out.returncode != 0:
+            raise ValueError(f"Failed to get cargo metadata from {cargo_toml}!\n{out.stderr}")
         metadata = json.loads(out.stdout)
         root = metadata["resolve"]["root"]
         root_package = next(filter(lambda p: p["id"] == root, metadata["packages"]))
-        bin_target = next(filter(lambda t: "bin" in t["kind"], root_package["targets"]))
-        test_target = next(filter(lambda t: "test" in t["kind"], root_package["targets"]))
-        rust_src_path = Path(bin_target["src_path"])
-        test_src_path = Path(test_target["src_path"])
-        test_name = test_target["name"]
 
+        # Get rust source path for bin or lib
+        bin_targets = list(filter(lambda t: "bin" in t["kind"], root_package["targets"]))
+        lib_targets = list(filter(lambda t: "lib" in t["kind"], root_package["targets"]))
+        if len(bin_targets) == 1 and len(lib_targets) == 0:
+            rust_src_path = Path(bin_targets[0]["src_path"])
+        elif len(bin_targets) == 0 and len(lib_targets) == 1:
+            rust_src_path = Path(lib_targets[0]["src_path"])
+        else:
+            raise ValueError(
+                f"Unhandled bin/lib targets configuration in Cargo.toml: {bin_targets=} {lib_targets=}"
+            )
+
+        # Get test source path
+        test_targets = list(filter(lambda t: "test" in t["kind"], root_package["targets"]))
+        if len(test_targets) != 1:
+            raise ValueError(
+                f"Unhandled test targets configuration in Cargo.toml: {test_targets=}"
+            )
+        test_src_path = Path(test_targets[0]["src_path"])
+        test_name = test_targets[0]["name"]
+
+        # Run test-repair loop
         for _ in range(self.max_iters):
             logger.info(
                 f"Running: cargo test --manifest-path {str(cargo_toml)} --test {test_name}"

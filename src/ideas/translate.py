@@ -30,8 +30,8 @@ class TranslateConfig:
     preproc_strategy: str = "clang"
     max_iters: int = 5
 
-    translator: str = "ReAct"
-    use_raw_fixer_output: bool = False
+    translator: str = "CoVeR"
+    use_raw_fixer_output: bool = True
 
     batched: bool = False
 
