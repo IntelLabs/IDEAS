@@ -4,7 +4,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-import os
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -19,10 +18,12 @@ from clang.cindex import CompilationDatabase, TranslationUnit
 
 from ideas import model, ModelConfig, GenerateConfig
 from ideas import TranslateAgent, tools
+from .ast_rust import ensure_no_mangle_in_module
 
 
 @dataclass
 class TranslateConfig:
+    c_project_dir: Path = MISSING
     filename: Path = MISSING
     model: ModelConfig = field(default_factory=ModelConfig)
     generate: GenerateConfig = field(default_factory=GenerateConfig)
@@ -32,8 +33,11 @@ class TranslateConfig:
 
     translator: str = "CoVeR"
     use_raw_fixer_output: bool = True
+    patch_no_mangle: bool = True
 
     batched: bool = False
+
+    ensure_no_mangle: bool = True
 
 
 cs = ConfigStore.instance()
@@ -81,20 +85,23 @@ def translate(cfg: TranslateConfig) -> None:
             "filename must be a pre-processed C source file with .i extension or compile_commands.json"
         )
 
-    # Find common path amongst input paths and construct examples to pass to agent
-    common_dir = Path(os.path.commonpath(c_paths))
-    if not common_dir.is_dir():
-        common_dir = common_dir.parent
+    # Construct examples to pass to agent
+    if not cfg.c_project_dir.is_dir():
+        raise ValueError(f"Common directory {cfg.c_project_dir} is not a directory!")
+    path_prefixes = [
+        "" if c_path.relative_to(cfg.c_project_dir).is_relative_to("src") else "src"
+        for c_path in c_paths
+    ]
     examples = [
         dspy.Example(
-            input_code_path=c_path.relative_to(common_dir),
+            input_code_path=path_prefix / c_path.relative_to(cfg.c_project_dir),
             input_code=c_code,
-            full_code_path=c_i_path.relative_to(common_dir),
+            full_code_path=path_prefix / c_i_path.relative_to(cfg.c_project_dir),
             full_code=c_i_code,
             tu=tu,
         ).with_inputs("input_code_path", "input_code", "full_code_path", "full_code", "tu")
-        for c_path, c_code, c_i_path, c_i_code, tu in zip(
-            c_paths, c_codes, c_i_paths, c_i_codes, tus
+        for c_path, c_code, c_i_path, c_i_code, tu, path_prefix in zip(
+            c_paths, c_codes, c_i_paths, c_i_codes, tus, path_prefixes
         )
     ]
 
@@ -104,8 +111,9 @@ def translate(cfg: TranslateConfig) -> None:
         cfg.translator,
         cfg.max_iters,
         cfg.use_raw_fixer_output,
+        cfg.patch_no_mangle,
     )
-    with chdir(common_dir):
+    with chdir(cfg.c_project_dir):
         if cfg.batched:
             translations = agent.batch(
                 examples,
@@ -124,16 +132,21 @@ def translate(cfg: TranslateConfig) -> None:
         filename = translation["input_code_path"]
         logger.info(f"Translated {filename} ...")
 
-        # Write rust translation to disk
-        rs_translation_path = output_dir / "src" / filename.with_suffix(".rs")
-        rs_translation_path.parent.mkdir(parents=True, exist_ok=True)
-        rs_translation_path.write_text(translation["output_code"])
+        output_code = translation["output_code"]
+        # Guarantee #[unsafe(no_mangle)] for all top-level symbols
+        if cfg.ensure_no_mangle:
+            output_code = ensure_no_mangle_in_module(output_code, add=True)
 
-        prompt_path = output_dir / "src" / filename.with_suffix(".translate_prompt")
+        # Write rust translation to disk
+        rs_translation_path = output_dir / filename.with_suffix(".rs")
+        rs_translation_path.parent.mkdir(parents=True, exist_ok=True)
+        rs_translation_path.write_text(output_code)
+
+        prompt_path = output_dir / filename.with_suffix(".translate_prompt")
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt_path.write_text(translation["input_code"])
 
-        history_path = output_dir / "src" / filename.with_suffix(".translate_history")
+        history_path = output_dir / filename.with_suffix(".translate_history")
         history_path.parent.mkdir(parents=True, exist_ok=True)
         history_path.write_text(translation["history"])
 

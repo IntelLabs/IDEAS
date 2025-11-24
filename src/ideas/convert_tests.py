@@ -5,7 +5,7 @@
 #
 
 """
-Convert executable JSON test cases like:
+Use JSON test vectors like:
 
 ```json
 {
@@ -18,7 +18,7 @@ Convert executable JSON test cases like:
 }
 ```
 
-to:
+to generate tests for binary targets:
 
 ```rust
 use assert_cmd::Command;
@@ -26,6 +26,7 @@ use ntest::timeout;
 use predicates::prelude::*;
 
 #[test]
+#[timeout(some_timeout)]
 fn test1() {
     Command::cargo_bin(assert_cmd::crate_name!()).unwrap()
         .args(&["--flag", "value"])
@@ -38,10 +39,12 @@ fn test1() {
         .code(rc);
 }
 ```
+
+TODO: Use a template to generate tests for library targets.
 """
 
-import sys
 import json
+import argparse
 from pathlib import Path
 
 
@@ -49,7 +52,13 @@ def to_rust_str(string):
     return '"' + repr(string)[1:-1] + '"'
 
 
-def convert_tests(test_cases: list[Path]):
+def is_bin_test(test_case: Path):
+    test_case_json = json.loads(test_case.read_text())
+    return "lib_state_in" not in test_case_json and "lib_state_out" not in test_case_json
+
+
+def convert_tests_for_exec(test_cases: list[Path], timeout: int = 60000):
+    test_cases = list(filter(is_bin_test, test_cases))
     if len(test_cases) == 0:
         return
 
@@ -103,7 +112,7 @@ def convert_tests(test_cases: list[Path]):
             raise ValueError(f"stderr.is_regex must be a boolean, got {type(is_stderr_regex)}")
 
         print("#[test]")
-        print("#[timeout(600000)]")  # 10 minutes
+        print(f"#[timeout({timeout})]")
         print(f"fn test_case_{test_case.stem}() {{")
         print("    Command::cargo_bin(assert_cmd::crate_name!()).unwrap()")
         if len(args) > 0:
@@ -126,5 +135,30 @@ def convert_tests(test_cases: list[Path]):
         print("")
 
 
+def is_lib_test(test_case: Path):
+    test_case_json = json.loads(test_case.read_text())
+    return "lib_state_in" in test_case_json and "lib_state_out" in test_case_json
+
+
+def convert_tests_for_lib(
+    test_cases: list[Path], template_path: Path | None, timeout: int = 60000
+):
+    raise ValueError("Library test conversion not implemented yet!")
+
+
 if __name__ == "__main__":
-    convert_tests([Path(test_case) for test_case in sys.argv[1:]])
+    parser = argparse.ArgumentParser(description="Convert JSON test vectors to cargo tests")
+    parser.add_argument(
+        "test_vectors", type=Path, nargs="+", help="Path(s) to JSON test vector(s)"
+    )
+    parser.add_argument(
+        "--template", type=Path, help="Path to Rust test template", required=False
+    )
+    parser.add_argument(
+        "--timeout", type=int, help="Timeout for each test in milliseconds", default=60000
+    )
+    args = parser.parse_args()
+
+    test_vectors = [Path(path) for path in args.test_vectors]
+    convert_tests_for_exec(test_vectors, args.timeout)
+    convert_tests_for_lib(test_vectors, args.template, args.timeout)

@@ -81,13 +81,13 @@ def extract_info_c(tu: TranslationUnit) -> TreeResult:
         match (kind, node.is_definition()):
             # Function definition
             case (CursorKind.FUNCTION_DECL, True):  # type: ignore[reportAttributeAccessIssue]
-                result.symbols[usr] = Symbol(usr, kind, decl)
+                result.symbols[usr] = Symbol(usr, node, decl)
                 fn_defn = get_code_from_tu_range(tu, node.extent)
                 result.fn_definitions[usr] = fn_defn
 
             # Data structures
             case (kind, _) if kind in DATA_STRUCT_NODE_MAP:
-                result.symbols[usr] = Symbol(usr, kind, decl)
+                result.symbols[usr] = Symbol(usr, node, decl)
 
                 previous_usr = usr
                 for child in node.get_children():
@@ -97,7 +97,7 @@ def extract_info_c(tu: TranslationUnit) -> TreeResult:
 
             # Typedefs
             case (CursorKind.TYPEDEF_DECL, _):  # type: ignore[reportAttributeAccessIssue]
-                result.symbols[usr] = Symbol(usr, kind, decl)
+                result.symbols[usr] = Symbol(usr, node, decl)
 
                 # NOTE: If this is a typedef <struct/union/enum> the data structure was visited just before
                 for child in node.walk_preorder():
@@ -123,7 +123,13 @@ def extract_info_c(tu: TranslationUnit) -> TreeResult:
 
             # All other declarations
             case (kind, _) if kind in DECL_NODE_KIND:
-                result.symbols[usr] = Symbol(usr, kind, decl)
+                # Handle the case where we're a declaration occurs after a definition, e.g.:
+                #   static const tflac_u16 tflac_crc16_tables[8][256] = { .. };
+                #   static const tflac_u16 tflac_crc16_tables[8][256];
+                if usr not in result.symbols or (
+                    usr in result.symbols and node.is_definition()
+                ):
+                    result.symbols[usr] = Symbol(usr, node, decl)
 
             case (_, _):
                 raise NotImplementedError()
@@ -153,7 +159,7 @@ def extract_referenced_symbols(node: Cursor) -> list[Symbol]:
             # Ignore internal references to, e.g., function parameters
             if child_node.referenced is None:
                 continue
-            symbol_uses.append(Symbol(child_node.referenced.get_usr(), child_node.kind))
+            symbol_uses.append(Symbol(child_node.referenced.get_usr(), child_node))
 
     return symbol_uses
 
@@ -195,6 +201,12 @@ def get_code_from_tu_range(
 
 
 def get_cursor_prettyprinted(cursor: Cursor) -> str:
+    # Include tag definition when typedef cursor with non-typeref child
+    include_tag_definition = 0
+    if cursor.kind == CursorKind.TYPEDEF_DECL:  # type: ignore[reportAttributeAccessIssue]
+        children = list(cursor.get_children())
+        include_tag_definition = len(children) == 1 and children[0].kind != CursorKind.TYPE_REF  # type: ignore[reportAttributeAccessIssue]
+
     # Setup FFI for unsupported python libclang functions
     # NOTE: Upgrade libclang to get these?
     clang_getCursorPrintingPolicy = conf.lib.clang_getCursorPrintingPolicy  # type: ignore[reportAttributeAccessIssue]
@@ -214,7 +226,21 @@ def get_cursor_prettyprinted(cursor: Cursor) -> str:
     clang_getCursorPrettyPrinted.errcheck = _CXString.from_result
 
     policy = clang_getCursorPrintingPolicy(cursor)
-    clang_PrintingPolicy_setProperty(policy, 3, 1)  # IncludeTagDefinition
-    clang_PrintingPolicy_setProperty(policy, 23, 1)  # ConstantsAsWritten
+    clang_PrintingPolicy_setProperty(policy, 3, include_tag_definition)
+    clang_PrintingPolicy_setProperty(policy, 23, 0)  # ConstantsAsWritten
+    # clang_PrintingPolicy_setProperty(policy, 26, 1)  # PrintAsCanonical
 
-    return clang_getCursorPrettyPrinted(cursor, policy)
+    return clang_getCursorPrettyPrinted(cursor, policy).rstrip()
+
+
+def get_cursor_code(cursor: Cursor, pretty_print: bool = False) -> str:
+    if pretty_print:
+        code = get_cursor_prettyprinted(cursor)
+    else:
+        code = get_code_from_tu_range(cursor.translation_unit, cursor.extent)
+
+    # Non-function definitions require statement terminations
+    if cursor.kind != CursorKind.FUNCTION_DECL or not cursor.is_definition():  # type: ignore[reportAttributeAccessIssue]
+        code += ";"
+
+    return code

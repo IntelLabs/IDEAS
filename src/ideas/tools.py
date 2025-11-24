@@ -4,7 +4,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import json
 from json import loads as js_loads
+from dataclasses import dataclass
+
 import logging
 import subprocess
 from typing import Any
@@ -17,6 +20,14 @@ TestCase = dict[str, None | str | int | float | list[int] | list[str] | list[flo
 logger = logging.getLogger("ideas.tools")
 
 DEFAULT_TEST_TIMEOUT = 10.0  # seconds
+
+
+@dataclass
+class Crate:
+    cargo_toml: Path
+    rust_src_path: Path
+    root_package: dict[str, Any]
+    is_bin: bool
 
 
 def run_subprocess(
@@ -114,6 +125,41 @@ def check_rust(
         cmd.extend(["-", "--out-dir", dirname])
 
     return run_subprocess(cmd, input=code)
+
+
+def get_info_from_cargo_toml(cargo_toml: Path) -> Crate:
+    # Extract root package metadata from Cargo.toml
+    out = subprocess.run(
+        ["cargo", "metadata", "--manifest-path", cargo_toml], text=True, capture_output=True
+    )
+    if out.returncode != 0:
+        raise ValueError(f"Failed to get cargo metadata from {cargo_toml}!\n{out.stderr}")
+    metadata = json.loads(out.stdout)
+    root = metadata["resolve"]["root"]
+    if root is None:
+        raise ValueError("No root package specified!")
+    root_package = next(filter(lambda p: p["id"] == root, metadata["packages"]))
+
+    # Get rust source path for bin or lib
+    bin_targets = list(filter(lambda t: "bin" in t["kind"], root_package["targets"]))
+    lib_targets = list(filter(lambda t: "lib" in t["kind"], root_package["targets"]))
+    if len(bin_targets) == 1 and len(lib_targets) == 0:
+        rust_src_path = Path(bin_targets[0]["src_path"])
+        is_bin = True
+    elif len(bin_targets) == 0 and len(lib_targets) == 1:
+        rust_src_path = Path(lib_targets[0]["src_path"])
+        is_bin = False
+    else:
+        raise ValueError(
+            f"Unhandled bin/lib targets configuration in Cargo.toml: {bin_targets=} {lib_targets=}"
+        )
+
+    return Crate(
+        cargo_toml=cargo_toml,
+        rust_src_path=rust_src_path,
+        root_package=root_package,
+        is_bin=is_bin,
+    )
 
 
 def run_clippy(

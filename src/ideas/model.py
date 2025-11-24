@@ -34,7 +34,7 @@ cs.store(name="model", node=ModelConfig)
 cs.store(name="generate", node=GenerateConfig)
 
 
-def configure(model: ModelConfig, generate: GenerateConfig):
+def get_lm(model: ModelConfig, generate: GenerateConfig) -> dspy.LM:
     lm = dspy.LM(
         model=model.name,
         cache=model.cache,
@@ -58,4 +58,9 @@ def configure(model: ModelConfig, generate: GenerateConfig):
 
         lm.kwargs["provider"] = provider  # type: ignore[reportArgumentType]
 
+    return lm
+
+
+def configure(model: ModelConfig, generate: GenerateConfig):
+    lm = get_lm(model, generate)
     dspy.configure(lm=lm)

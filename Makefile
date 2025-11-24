@@ -18,28 +18,26 @@ BASE_URL ?= http://${HOST}:${PORT}/v1## Base URL of vLLM server
 VLLM_ARGS ?= --tensor-parallel-size 8 --enable-expert-parallel --max-num-seqs 32 --max-model-len 128k## Args to pass to vllm serve
 TRANSLATION_DIR ?= translation.$(shell git rev-parse HEAD)## Directory to put IDEAS translation
 TRANSLATE_ARGS ?= ## Args to pass to IDEAS translation
+TESTGEN_DIR ?= testgen.$(shell git rev-parse HEAD)## Directory to put IDEAS test generation
+TESTGEN_ARGS ?= ## Args to pass to IDEAS test generation
 RUSTFLAGS ?= -Awarnings## Flags to build Rust translation
 VERBOSE ?= 0## Whether to output failed/partial projects in summaries
 
 AFL_TAG = aflplusplus/aflplusplus:stable
 
 # Pass these variables to IDEAS.mk
-export MODEL BASE_URL TRANSLATION_DIR RUSTFLAGS
+export MODEL BASE_URL TRANSLATION_DIR TESTGEN_DIR RUSTFLAGS
 
-EXAMPLES ?= $(sort $(shell find ${EXAMPLES_DIR} -name test_case -type d))## List of examples to run on
+EXAMPLES ?= $(sort $(shell find ${EXAMPLES_DIR} -maxdepth 3 -name test_case -type d))## List of examples to run on
 ifeq ($(EXAMPLES),)
 $(warning No projects found in ${EXAMPLES_DIR}. You may need to re-run commands!)
 endif
 
-EXAMPLES_WITH_RUNNERS := $(filter-out $(foreach ex,$(EXAMPLES),$(if $(wildcard $(ex)/../runner $(ex)/../test_vectors),,$(ex))),$(EXAMPLES))
-ifeq ($(EXAMPLES_WITH_RUNNERS),)
-$(warning No projects with runners found in ${EXAMPLES_DIR}. You may need to re-run commands!)
-endif
 
 all: help ;
 
 .PHONY: install
-install: install-uv install-rust## Install uv and Rust
+install: install-uv install-rust install-deno ## Install uv, Rust, and Deno
 
 .PHONY: install-uv
 install-uv:## Install uv@0.7.12
@@ -48,6 +46,10 @@ install-uv:## Install uv@0.7.12
 .PHONY: install-rust
 install-rust:## Install Rust@1.88.0
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain 1.88.0
+
+.PHONY: install-deno
+install-deno:## Install Deno, which is required by dspy.PythonInterpreter()
+	curl -fsSL https://deno.land/install.sh | sh
 
 .PHONY: test
 test:## Run pytest
@@ -69,6 +71,7 @@ examples/init: $(subst /test_case,/init,${EXAMPLES}) ;
 	@echo "# ${TRANSLATION_DIR}"
 examples/%/init:## Initialize specific example
 examples/%/init: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) init
 
 
@@ -95,13 +98,25 @@ examples/translate: $(subst /test_case,/translate,${EXAMPLES})
 	@echo "\`\`\`"
 examples/%/translate:## Translate specific example
 examples/%/translate: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) translate
+
+
+.PHONY: examples/wrapper
+examples/wrapper:## Generate C FFI wrappers for all examples
+examples/wrapper: $(subst /test_case,/wrapper,${EXAMPLES})
+examples/%/wrapper:## Generate C FFI wrappers for specific example
+examples/%/wrapper: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) wrapper
+
 
 .PHONY: examples/add_test_vectors
 examples/add_test_vectors:## Build all translated examples
 examples/add_test_vectors: $(subst /test_case,/add_test_vectors,${EXAMPLES})
 examples/%/add_test_vectors:## Build specific translated example
 examples/%/add_test_vectors: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) add_test_vectors
 
 .PHONY: examples/build
@@ -120,6 +135,7 @@ endif
 	@echo "\`\`\`"
 examples/%/build:## Build specific translated example
 examples/%/build: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) build
 
 .PHONY: examples/test
@@ -149,27 +165,16 @@ endif
 	@echo "\`\`\`"
 examples/%/test:## Test specific translated example
 examples/%/test: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) test
 
-.PHONY: examples/test_libc
-examples/test_libc:## Run tests using runners on all C library examples
-examples/test_libc: $(subst /test_case,/test_libc,${EXAMPLES_WITH_RUNNERS}) ;
-examples/%/test_libc:## Run tests using runners on specific C library example
-examples/%/test_libc: FORCE
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) test_libc
-
-.PHONY: examples/test_librs
-examples/test_librs:## Run tests using runners on all translated Rust library examples
-examples/test_librs: $(subst /test_case,/test_librs,${EXAMPLES_WITH_RUNNERS}) ;
-examples/%/test_librs:## Run tests using runners on specific translated Rust library example
-examples/%/test_librs: FORCE
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) test_librs
 
 .PHONY: examples/repair
 examples/repair:## Repair all examples
 examples/repair: $(subst /test_case,/repair,${EXAMPLES})
 examples/%/repair:## Repair specific example
 examples/%/repair: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) repair
 
 .PHONY: examples/clean
@@ -200,6 +205,7 @@ examples/update_tests:## Update test cases to use TRANSLATION_DIR test cases for
 examples/update_tests: $(subst /test_case,/update_tests,${EXAMPLES})
 examples/%/update_tests:## Update specific test cases to use TRANSLATION_DIR test cases
 examples/%/update_tests: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) update_tests
 
 # clean

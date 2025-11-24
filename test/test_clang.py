@@ -200,6 +200,10 @@ def test_variables(c_data_structures_code: str):
     assert variables["c:@num_dimensions"] == "int num_dimensions"
     assert variables["c:@anonymous_struct"] == "struct { int a; int b; } anonymous_struct"
     assert variables["c:@half_pi"] == "const double half_pi"
+    assert (
+        ast.get_cursor_code(result.symbols["c:@half_pi"].cursor)
+        == "const double half_pi = PI / 2.0;"
+    )
     assert variables["c:file.c@one_third_pi"] == "static double one_third_pi"
     assert variables["c:file.c@quarter_pi"] == "static const double quarter_pi"
     assert variables["c:@PI"] == "extern const double PI"

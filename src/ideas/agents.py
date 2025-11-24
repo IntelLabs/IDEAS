@@ -11,9 +11,9 @@ import logging
 from pathlib import Path
 
 import dspy
-from clang.cindex import TranslationUnit, CursorKind
+from clang.cindex import TranslationUnit
 
-from .ast import extract_info_c, get_cursor_prettyprinted
+from .ast import extract_info_c, get_cursor_code
 from .tools import check_rust
 from .ltu import build_unit
 from .cover import CoVeR
@@ -38,7 +38,7 @@ class PreProcessing(dspy.Module):
 
     def forward(
         self, c_code: str, c_full_code: str, tu: TranslationUnit
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, dict[str, str] | list[str]]:
         output_code = []
         # Use Clang to analyze the pre-processed C code
         ast_info = extract_info_c(tu)
@@ -81,13 +81,7 @@ class PreProcessing(dspy.Module):
                     if child.extent.start.column != 1:
                         continue
 
-                    output_code += get_cursor_prettyprinted(child)
-
-                    # Non-function definitions require statement terminations
-                    if child.kind != CursorKind.FUNCTION_DECL or not child.is_definition():  # type: ignore
-                        output_code += ";"
-
-                    output_code += "\n"
+                    output_code += get_cursor_code(child, pretty_print=True) + "\n"
                 output_code = [output_code]
 
             case "tu-sys-filter":
@@ -100,13 +94,7 @@ class PreProcessing(dspy.Module):
                     if child.location.file.name.startswith("/usr"):
                         continue
 
-                    output_code += get_cursor_prettyprinted(child)
-
-                    # Non-function definitions require statement terminations
-                    if child.kind != CursorKind.FUNCTION_DECL or not child.is_definition():  # type: ignore
-                        output_code += ";"
-
-                    output_code += "\n"
+                    output_code += get_cursor_code(child, pretty_print=True) + "\n"
                 output_code = [output_code]
 
             case "c":
@@ -114,11 +102,11 @@ class PreProcessing(dspy.Module):
 
             case "ltu-max":
                 output_units = build_unit(ast_info, type="functional_maximal")
-                output_code = [str(unit) for unit in output_units]
+                output_code = {unit.symbol_name: str(unit) for unit in output_units}
 
             case "ltu-min":
                 output_units = build_unit(ast_info, type="functional_minimal")
-                output_code = [str(unit) for unit in output_units]
+                output_code = {unit.symbol_name: str(unit) for unit in output_units}
 
         return {"input_code": output_code}
 
@@ -130,6 +118,7 @@ class TranslateAgent(dspy.Module):
         translator: str,
         max_iters: int,
         use_raw_fixer_output: bool,
+        patch_no_mangle: bool,
     ):
         super().__init__()
 
@@ -166,6 +155,7 @@ class TranslateAgent(dspy.Module):
                     success=success_message,
                     max_iters=max_iters,
                     use_raw_fixer_output=use_raw_fixer_output,
+                    patch_no_mangle=patch_no_mangle,
                 )
 
             case "Predict":
