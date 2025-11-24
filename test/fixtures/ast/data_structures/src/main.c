@@ -8,6 +8,7 @@ struct Point p1;
 int num_dimensions = 2;
 
 const double half_pi = PI / 2.0;
+const double half_pi;
 static double one_third_pi = PI / 3.0;
 static const double quarter_pi = PI / 4.0;
 

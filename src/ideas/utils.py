@@ -10,15 +10,28 @@ import math
 from dataclasses import dataclass
 
 from collections.abc import KeysView
-from clang.cindex import CursorKind
+from clang.cindex import Cursor, CursorKind
+from tree_sitter import Node
 
 
 @dataclass(frozen=True)
 class Symbol:
     name: str
-    kind: CursorKind
+    cursor: Cursor
     decl: str = ""
     usr: str | None = None
+
+    @property
+    def kind(self) -> CursorKind:
+        return self.cursor.kind
+
+
+@dataclass(frozen=True)
+class RustSymbol:
+    name: str
+    node: Node
+    decl: str = ""
+    attributes: list[str] | None = None
 
 
 # Modify graph edges to only count called symbols from a set

@@ -42,7 +42,7 @@ def test_convert_to_cargo_test(
 
     # Temporarily redirect stdout
     with contextlib.redirect_stdout(captured_output):
-        convert_tests.convert_tests(json_test_cases)
+        convert_tests.convert_tests_for_exec(json_test_cases)
 
     # Write the captured Rust code to a fresh tests/test_cases.rs
     original_harness = rust_tests_harness.read_text()

@@ -6,12 +6,14 @@
 #
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from litellm.exceptions import ContextWindowExceededError
 
 import dspy
 from dspy.predict.react import _fmt_exc
+
+from ideas import ensure_no_mangle_in_module
 
 logger = logging.getLogger(__name__)
 
@@ -20,20 +22,23 @@ class CoVeR(dspy.Module):
     def __init__(
         self,
         signature: dspy.SignatureMeta,
-        tools: list[dspy.Tool],
+        tools: list[dspy.Tool | Callable],
         success: str = "Success!",
         max_iters: int = 5,
         use_raw_fixer_output: bool = True,
+        patch_no_mangle: bool = True,
     ):
         super().__init__()
         self.signature = signature = dspy.ensure_signature(signature)  # type: ignore
         self.success = success
         self.max_iters = max_iters
         self.use_raw_fixer_output = use_raw_fixer_output
+        self.patch_no_mangle = patch_no_mangle
 
         if len(tools) == 0:
             raise ValueError("Need at least one valid dspy.Tool!")
-        tool_dict = {tool.name: tool for tool in tools}
+        dspy_tools = [t if isinstance(t, dspy.Tool) else dspy.Tool(t) for t in tools]
+        tool_dict = {tool.name: tool for tool in dspy_tools}
 
         inputs = ", ".join([f"`{k}`" for k in signature.input_fields.keys()])
         outputs = ", ".join([f"`{k}`" for k in signature.output_fields.keys()])
@@ -72,7 +77,7 @@ class CoVeR(dspy.Module):
                     f"No valid outputs in {self.task_outputs} can be routed to tool {name}!"
                 )
 
-        cover_signature = (
+        self.cover_signature = (
             dspy.Signature(
                 {**signature.input_fields, **signature.output_fields},  # type: ignore
                 "\n".join(instr),
@@ -86,7 +91,7 @@ class CoVeR(dspy.Module):
             signature.instructions,
         ).append("trajectory", dspy.InputField(), type_=str)
 
-        self.cover = dspy.Predict(cover_signature)
+        self.cover = dspy.Predict(self.cover_signature)
         self.extract = dspy.ChainOfThought(fallback_signature)
 
     def _format_trajectory(self, trajectory: dict[str, Any]):
@@ -109,6 +114,14 @@ class CoVeR(dspy.Module):
                 break
 
             assert pred is not None, "Prediction should not be None!"
+
+            # Patch #[no_mangle] -> #[unsafe(no_mangle)] for all Rust code outputs
+            # But do not add the attribute if it does not exist
+            if self.patch_no_mangle:
+                for key, value in self.cover_signature.output_fields.items():
+                    if isinstance(value.annotation, dspy.Code["Rust"].__class__):
+                        pred[key].code = ensure_no_mangle_in_module(pred[key].code, add=False)
+
             trajectory[f"thought_{idx}"] = pred.next_thought  # type: ignore
             tool_names, tool_args, observations = [], [], []
             for name in self.tools.keys():

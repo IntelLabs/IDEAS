@@ -1,0 +1,297 @@
+#
+# Copyright (C) 2025 Intel Corporation
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+import os
+import logging
+from pathlib import Path
+from graphlib import TopologicalSorter
+from collections.abc import Iterable, Container
+from dataclasses import dataclass
+
+import hydra
+from omegaconf import MISSING
+from hydra.core.config_store import ConfigStore
+from hydra.core.hydra_config import HydraConfig
+from clang.cindex import CompilationDatabase, TranslationUnit, CursorKind
+
+from ideas import get_info_from_cargo_toml
+from .ast import get_cursor_code, extract_info_c, TreeResult
+from .utils import Symbol
+from .tools import Crate
+
+logger = logging.getLogger("ideas.preprocess")
+
+
+@dataclass
+class InitConfig:
+    filename: Path = MISSING
+    pretty_print: bool = True
+    export_symbols: Path | None = None
+    source_priority: Path | None = None
+
+
+cs = ConfigStore.instance()
+cs.store(name="init", node=InitConfig)
+
+
+def init(
+    compile_commands: Path,
+    crate: Crate,
+    export_symbols: list[str] | None = None,
+    source_priority: list[Path] | None = None,
+    pretty_print: bool = True,
+):
+    # Get symbol table and dependencies taking into account source priority and exported symbols
+    asts = get_asts(compile_commands, valid_paths=source_priority)
+    symbols, dependencies = get_symbols_and_dependencies(asts, source_priority, export_symbols)
+    logger.info(f"Found {len(symbols)} symbols in {compile_commands}!")
+
+    # Assemble C sources in topological order
+    includes = get_includes(symbols)
+    sources = []
+    for symbol_name in TopologicalSorter(dependencies).static_order():
+        # Ignore tag definitions and function declarations
+        if symbol_name not in symbols:
+            logger.warning(f"Skipping `{symbol_name}` ...")
+            continue
+        symbol_code = get_cursor_code(symbols[symbol_name].cursor, pretty_print=pretty_print)
+        sources.append(symbol_code)
+
+    # Create initial outputs
+    crate.rust_src_path.parent.mkdir(exist_ok=True, parents=True)
+    crate.rust_src_path.with_suffix(".c").write_text(
+        "\n".join(includes) + "\n\n" + "\n\n".join(sources)
+    )
+
+
+def get_symbols_and_dependencies(
+    asts: list[TreeResult],
+    source_priority: list[Path] | None = None,
+    export_symbols: list[str] | None = None,
+) -> tuple[dict[str, Symbol], dict[str, list[str]]]:
+    global_symbols = merge_symbols(
+        [ast.symbols for ast in asts], source_priority=source_priority
+    )
+
+    # Filter global symbols to create project symbols
+    project_symbols = filter_symbols(global_symbols, filter_system=True)
+    project_dependencies = merge_complete_graphs(asts, valid_names=project_symbols)
+
+    # Use export_symbols to filter project symbols and dependencies
+    dependencies = project_dependencies
+    if export_symbols is not None:
+        export_symbols = [c14n_symbol_name(name, project_symbols) for name in export_symbols]
+        dependencies = reachable_subgraph(project_dependencies, export_symbols)
+    symbols = filter_symbols(
+        project_symbols, filter_tag_definitions=True, filter_function_declarations=True
+    )
+
+    return symbols, dependencies
+
+
+def get_includes(symbols: dict[str, Symbol]) -> set[str]:
+    includes: set[str] = set()
+    for symbol in symbols.values():
+        tu = symbol.cursor.translation_unit
+        for inclusion in tu.get_includes():
+            # Source of the include should be in same path as TU while the include should NOT be
+            tu_path = str(Path(tu.spelling).resolve())
+            inclusion_source_path = str(Path(inclusion.source.name).resolve())
+            inclusion_include_path = str(Path(inclusion.include.name).resolve())
+            if (os.path.commonprefix((tu_path, inclusion_source_path)) != "/") and (
+                os.path.commonprefix((tu_path, inclusion_include_path)) == "/"
+            ):
+                # Get include directive from source
+                with open(inclusion.location.file.name, "rb") as f:
+                    f.seek(inclusion.location.offset)
+                    include = f.readline().decode().strip()
+                includes.add(f"#include {include}")
+    return includes
+
+
+def get_asts(filename: Path, valid_paths: list[Path] | None = None) -> list[TreeResult]:
+    assert filename.name == "compile_commands.json"
+    db = CompilationDatabase.fromDirectory(filename.parent)
+    cmds = db.getAllCompileCommands()
+    tus = [TranslationUnit.from_source(None, args=list(cmd.arguments)) for cmd in cmds]
+    if valid_paths is not None:
+        tus = [tu for tu in tus if Path(tu.cursor.spelling) in valid_paths]
+    asts = [extract_info_c(tu) for tu in tus]
+    return asts
+
+
+def filter_symbols(
+    symbols: dict[str, Symbol],
+    filter_system: bool = True,
+    filter_tag_definitions: bool = False,
+    filter_function_declarations: bool = False,
+) -> dict[str, Symbol]:
+    filtered_symbols = {}
+    for name, symbol in symbols.items():
+        # Ignore "system" symbols
+        if filter_system:
+            tu_path = Path(symbol.cursor.translation_unit.spelling).resolve()
+            sym_path = Path(symbol.cursor.location.file.name).resolve()
+            if os.path.commonprefix([str(tu_path), str(sym_path)]) == "/":
+                continue
+
+        # Ignore "tag definitions" that are contained with in other symbols like:
+        #   typedef enum name { value } name;
+        # This produces two ENUM cursors.
+        if filter_tag_definitions:
+            children = list(symbol.cursor.get_children())
+            if (
+                symbol.cursor.kind == CursorKind.TYPEDEF_DECL  # type: ignore[reportAttributeAccessIssue]
+                and len(children) == 1
+                and children[0].kind != CursorKind.TYPE_REF  # type: ignore[reportAttributeAccessIssue]
+            ):
+                contained_name = children[0].get_usr()
+                filtered_symbols.pop(contained_name, None)
+
+        # Filter function declarations
+        if filter_function_declarations:
+            if (
+                symbol.cursor.kind == CursorKind.FUNCTION_DECL  # type: ignore[reportAttributeAccessIssue]
+                and not symbol.cursor.is_definition()
+            ):
+                continue
+
+        filtered_symbols[name] = symbols[name]
+    return filtered_symbols
+
+
+def merge_symbols(
+    list_of_symbols: list[dict[str, Symbol]], source_priority: list[Path] | None = None
+) -> dict[str, Symbol]:
+    if source_priority is None:
+        source_priority = []
+
+    global_symbols: dict[str, Symbol] = {}
+    for symbols in list_of_symbols:
+        # Gather symbols
+        for name, symbol in symbols.items():
+            # If not in global symbol table add it
+            if name not in global_symbols:
+                global_symbols[name] = symbol
+                continue
+
+            # If code matches, then don't bother replacing
+            global_code = get_cursor_code(global_symbols[name].cursor)
+            code = get_cursor_code(symbol.cursor)
+            if global_code == code:
+                continue
+
+            global_source = Path(
+                global_symbols[name].cursor.translation_unit.spelling
+            ).resolve()
+            symbol_source = Path(symbol.cursor.translation_unit.spelling).resolve()
+
+            # If overwriting a symbol, then prefer one with a definition
+            if (
+                global_symbols[name].cursor.is_definition()
+                and not symbol.cursor.is_definition()
+            ):
+                continue
+            elif (
+                not global_symbols[name].cursor.is_definition()
+                and symbol.cursor.is_definition()
+            ):
+                global_symbols[name] = symbol
+            # Or prefer the symbol with source priority
+            elif global_source in source_priority and symbol_source not in source_priority:
+                continue
+            elif global_source not in source_priority and symbol_source in source_priority:
+                global_symbols[name] = symbol
+            elif (
+                global_source in source_priority
+                and symbol_source in source_priority
+                and source_priority.index(global_source) > source_priority.index(symbol_source)
+            ):
+                global_symbols[name] = symbol
+            elif (
+                global_source in source_priority
+                and symbol_source in source_priority
+                and source_priority.index(global_source) < source_priority.index(symbol_source)
+            ):
+                continue
+            else:
+                # Two symbols have similar names but different declarations or definitions and no source priority!
+                raise NotImplementedError(
+                    f"Unable to handle symbol {name} with multiple different definitions and unknown source priority!\nSymbol found in {global_source} and {symbol_source}."
+                )
+    return global_symbols
+
+
+def merge_complete_graphs(
+    asts: list[TreeResult], valid_names: Container[str]
+) -> dict[str, list[str]]:
+    graph: dict[str, list[str]] = {}
+    for ast in asts:
+        # FIXME: Would be nice if complete_graph was a dict[str, list[str]] instead of dict[str, list[Symbol]]
+        for node, neighbor_symbols in ast.complete_graph.items():
+            neighbors = [sym.name for sym in neighbor_symbols]
+            if node not in valid_names:
+                continue
+            if node not in graph:
+                graph[node] = []
+            for neighbor in neighbors:
+                if neighbor not in valid_names or neighbor in graph[node]:
+                    continue
+                graph[node].append(neighbor)
+    return dict(graph)
+
+
+def reachable_subgraph(
+    dependencies: dict[str, list[str]], names: Iterable[str]
+) -> dict[str, list[str]]:
+    subgraph: dict[str, list[str]] = {}
+    for name in names:
+        subgraph[name] = dependencies[name]
+        subgraph.update(reachable_subgraph(dependencies, subgraph[name]))
+    return subgraph
+
+
+def c14n_symbol_name(name: str, symbols: dict[str, Symbol]):
+    if name in symbols:
+        return name
+    if f"c:@F@{name}" in symbols:
+        return f"c:@F@{name}"
+
+    # Find symbols with spelling of name
+    potential_names = {s.name for s in symbols.values() if name in s.cursor.spelling}
+    if len(potential_names) == 0:
+        symbol_names = "\n".join(symbols.keys())
+        raise ValueError(f"Unable to find {name} in symbols:\n{symbol_names}")
+    elif len(potential_names) != 1:
+        raise ValueError(f"Unable to find {name} in symbols! Found: {potential_names}")
+    return potential_names.pop()
+
+
+@hydra.main(version_base=None, config_name="init")
+def main(cfg: InitConfig) -> None:
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
+    crate = get_info_from_cargo_toml(output_dir / "Cargo.toml")
+
+    export_symbols = None
+    if isinstance(cfg.export_symbols, Path):
+        export_symbols = cfg.export_symbols.read_text().splitlines()
+
+    source_priority = None
+    if isinstance(cfg.source_priority, Path):
+        source_priority = [Path(path) for path in cfg.source_priority.read_text().splitlines()]
+
+    init(
+        cfg.filename,
+        crate,
+        export_symbols=export_symbols,
+        source_priority=source_priority,
+        pretty_print=cfg.pretty_print,
+    )
+    logger.info(f"Prepared translation in {output_dir}")
+
+
+if __name__ == "__main__":
+    main()

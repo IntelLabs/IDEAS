@@ -6,7 +6,7 @@
 
 MAKEFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
 MAKEFILE_DIR := $(realpath $(dir $(MAKEFILE_PATH)))
-CARGO_TOML_CMAKE := ${MAKEFILE_DIR}/cargo_toml.cmake
+EXTRACT_INFO_CMAKE := ${MAKEFILE_DIR}/extract_info.cmake
 IDEAS_MAKEFILE := $(MAKEFILE_DIR)/IDEAS.mk
 
 PROVIDER ?= hosted_vllm
@@ -18,6 +18,7 @@ TRANSLATION_DIR ?= translation.$(shell git --git-dir=${MAKEFILE_DIR}/.git rev-pa
 ifeq (${PROVIDER},hosted_vllm)
 override TRANSLATE_ARGS += model.base_url=${BASE_URL}
 override REPAIR_ARGS += model.base_url=${BASE_URL}
+override WRAPPER_ARGS += model.base_url=${BASE_URL}
 endif
 RUSTFLAGS ?= -Awarnings## Ignore Rust compiler warnings
 CFLAGS ?= -w## Ignore C compiler warnings
@@ -32,6 +33,13 @@ GREEN_COL := \033[1;32m
 PROJECT_C_FILES = $(shell jq -r 'map(.file) | .[] | @text' build-ninja/compile_commands.json)
 C_FILES = $(subst ${CURDIR}/test_case/,,${PROJECT_C_FILES})
 TEST_FILES := $(wildcard test_vectors/*.json)
+TARGETS := $(shell find build-ninja -maxdepth 1 -type f -executable -exec basename {} \; | cut -d. -f1 | sed -e "s/^lib//gi")
+ARTIFACTS := $(shell find build-ninja -maxdepth 1 -type f -executable -exec basename {} \;)
+ifeq (${TARGETS},)
+ifneq (${MAKECMDGOALS},cmake)
+$(error No TARGETS found! You need to run cmake!)
+endif
+endif
 
 AFL_TAG = aflplusplus/aflplusplus:stable
 FUZZING_TIMEOUT ?= 60
@@ -39,9 +47,6 @@ FUZZING_TIMEOUT ?= 60
 FUZZING_TEST_VECTORS := $(subst :,\:, $(wildcard afl/out/default/queue/*))
 
 CRATEIFY_BIN = ${MAKEFILE_DIR}/tools/crateify/target/debug/crateify
-
-.PHONY: FORCE
-FORCE:
 
 
 # cmake
@@ -51,41 +56,48 @@ build-ninja/translate.log: build-ninja/compile_commands.json
 	@$(MAKE) --no-print-directory -f ${IDEAS_MAKEFILE} $(addprefix test_case/,$(addsuffix .i,${C_FILES}))
 	@touch $@
 
-.PRECIOUS: build-ninja/%
-build-ninja/%: build-ninja/CMakeCache.txt ;
-
 .PRECIOUS: build-ninja/CMakeCache.txt
-build-ninja/CMakeCache.txt: test_case/CMakeLists.txt ${CARGO_TOML_CMAKE}
+build-ninja/CMakeCache.txt: test_case/CMakeLists.txt ${EXTRACT_INFO_CMAKE}
 	@rm -rf build-ninja
 ifeq ($(wildcard CMakePresets.json),)
 	cmake -S test_case -B build-ninja -G Ninja \
-          -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=${CARGO_TOML_CMAKE} \
-          -DCMAKE_C_FLAGS="${CFLAGS}" \
-          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_C_FLAGS_DEBUG="-g -O0" \
+      -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${EXTRACT_INFO_CMAKE}" \
+      -DCMAKE_C_FLAGS="${CFLAGS}" \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 else
 	cmake -S . --preset test \
-          -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=${CARGO_TOML_CMAKE} \
-          -DCMAKE_C_FLAGS="${CFLAGS}" \
-          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_C_FLAGS_DEBUG="-g -O0" \
+      -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${EXTRACT_INFO_CMAKE}" \
+      -DCMAKE_C_FLAGS="${CFLAGS}" \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 endif
 
 .PRECIOUS: build-ninja/compile_commands.json
 build-ninja/compile_commands.json: build-ninja/CMakeCache.txt ;
 
 .PRECIOUS: build-ninja/build.log
-build-ninja/build.log: build-ninja/translate.log
+build-ninja/build.log: build-ninja/CMakeCache.txt
 ifeq ($(wildcard CMakePresets.json),)
 	-cmake --build build-ninja --target all 2> $@
 else
 	-cmake --build build-ninja --target all --preset test 2> $@
 endif
+	@find build-ninja -maxdepth 1 -type f -executable | \
+     xargs -I{} sh -c "nm --extern-only {} | \
+                       awk '{if (\$$2 == \"T\") print \$$NF}' | \
+                       grep -v ^_ > {}.symbols"
 
 .PRECIOUS: test_case/%.c.i
 test_case/%.c.i: build-ninja/compile_commands.json
-	$(shell cat build-ninja/compile_commands.json | \
+	cat build-ninja/compile_commands.json | \
      jq -r '.[] | select(.file == "${CURDIR}/test_case/$*.c") | .command' | \
      sed -e 's/-o [^ ]*//g' | \
-     xargs -I{} echo "{} -E -o $@")
+     xargs -I{} echo "{} -E -o $@" | \
+     sh
+
 
 # Add more tests from fuzzing. The procedure is
 # 1. Copy test input from the initial JSON test vectors;
@@ -168,95 +180,148 @@ test_vectors/%.json: afl/out/default/queue/%
 
 # init
 .PHONY: init
-init: ${TRANSLATION_DIR}/Cargo.toml build-ninja/compile_commands.json ${CRATEIFY_BIN}
-	@$(MAKE) --no-print-directory -f${IDEAS_MAKEFILE} $(addprefix ${TRANSLATION_DIR}/src/,$(patsubst src/%,%,$(patsubst %.c,%.rs,${C_FILES})))
-	${CRATEIFY_BIN} ${TRANSLATION_DIR}/src
+init: $(patsubst %,${TRANSLATION_DIR}/%/init.log,${TARGETS}) ;
 
 .PRECIOUS: ${TRANSLATION_DIR}/Cargo.toml
-${TRANSLATION_DIR}/Cargo.toml: build-ninja/Cargo.toml
-	@mkdir -p $(@D)
-	cp build-ninja/Cargo.toml $@
+${TRANSLATION_DIR}/Cargo.toml:
+	mkdir -p $(@D)
+	echo -n "[workspace]\nresolver = \"3\"" > $@
 
-${TRANSLATION_DIR}/%.rs:
-	@mkdir -p $(@D)
-	echo 'fn main() {\n    println!("Hello, world!");\n}' > $@
+.PRECIOUS: ${TRANSLATION_DIR}/%/Cargo.toml
+${TRANSLATION_DIR}/%/Cargo.toml: | ${TRANSLATION_DIR}/Cargo.toml build-ninja/lib%.so.type
+	cargo new --quiet --lib --vcs=none $(@D)
+	echo -n "\n[lib]\ncrate-type = [\"lib\", \"cdylib\"]" >> $@
+	cargo add --quiet --manifest-path $@ --dev assert_cmd@2.0.17 ntest@0.9.3 predicates@3.1.3
+	cargo add --quiet --manifest-path $@ openssl@0.10.75
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/Cargo.toml
+${TRANSLATION_DIR}/%/Cargo.toml: | ${TRANSLATION_DIR}/Cargo.toml build-ninja/%.type
+	cargo new --quiet --bin --vcs=none $(@D)
+	cargo add --quiet --manifest-path $@ --dev assert_cmd@2.0.17 ntest@0.9.3 predicates@3.1.3
+	cargo add --quiet --manifest-path $@ openssl@0.10.75
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/src/lib.c
+${TRANSLATION_DIR}/%/src/lib.c: ${TRANSLATION_DIR}/%/init.log ;
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/init.log
+${TRANSLATION_DIR}/%/init.log: | ${TRANSLATION_DIR}/%/Cargo.toml build-ninja/lib%.so.type
+	uv run python -m ideas.init filename=build-ninja/compile_commands.json \
+                            export_symbols=build-ninja/lib$*.so.symbols \
+                            source_priority=build-ninja/lib$*.so.sources \
+                            hydra.output_subdir=.init \
+                            hydra.run.dir=${TRANSLATION_DIR}/$*
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/src/main.c
+${TRANSLATION_DIR}/%/src/main.c: ${TRANSLATION_DIR}/%/init.log ;
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/init.log
+${TRANSLATION_DIR}/%/init.log: | ${TRANSLATION_DIR}/%/Cargo.toml build-ninja/%.type
+	uv run python -m ideas.init filename=build-ninja/compile_commands.json \
+                            export_symbols=build-ninja/$*.symbols \
+                            source_priority=build-ninja/$*.sources \
+                            hydra.output_subdir=.init \
+                            hydra.run.dir=${TRANSLATION_DIR}/$*
 
 .PRECIOUS: ${CRATEIFY_BIN}
 ${CRATEIFY_BIN}:
 	@cd ${MAKEFILE_DIR}/tools/crateify && cargo build
 
-.PRECIOUS: runner/release/runner
-runner/release/runner: runner/Cargo.toml
-	@cd runner && cargo build --release --target-dir .
 
 # translate
 .PHONY: translate
-translate: ${TRANSLATION_DIR}/translate.log ;
-${TRANSLATION_DIR}/translate.log: build-ninja/compile_commands.json
-	-uv run python -m ideas.translate model.name=${PROVIDER}/${MODEL} filename=build-ninja/compile_commands.json hydra.run.dir=${TRANSLATION_DIR} ${TRANSLATE_ARGS}
+translate: $(patsubst %,${TRANSLATION_DIR}/%/translate.log,${TARGETS}) ;
+
+${TRANSLATION_DIR}/translate.log: $(patsubst %,${TRANSLATION_DIR}/%/translate.log,${TARGETS})
+	cat $^ > $@
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/src/lib.rs
+${TRANSLATION_DIR}/%/src/lib.rs: ${TRANSLATION_DIR}/%/translate.log ;
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/translate.log
+${TRANSLATION_DIR}/%/translate.log: | ${TRANSLATION_DIR}/%/src/lib.c build-ninja/compile_commands.json build-ninja/lib%.so.symbols build-ninja/lib%.so.sources
+	-uv run python -m ideas.translate_recurrent model.name=${PROVIDER}/${MODEL} \
+                                      filename=${TRANSLATION_DIR}/$*/src/lib.c \
+                                      hydra.output_subdir=.translate \
+                                      hydra.job.name=translate \
+                                      hydra.run.dir=${TRANSLATION_DIR}/$* ${TRANSLATE_ARGS}
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/src/main.rs
+${TRANSLATION_DIR}/%/src/main.rs: ${TRANSLATION_DIR}/%/translate.log ;
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/translate.log
+${TRANSLATION_DIR}/%/translate.log: | ${TRANSLATION_DIR}/%/src/main.c build-ninja/compile_commands.json build-ninja/%.symbols build-ninja/%.sources
+	-uv run python -m ideas.translate_recurrent model.name=${PROVIDER}/${MODEL} \
+                                      filename=${TRANSLATION_DIR}/$*/src/main.c \
+                                      hydra.output_subdir=.translate \
+                                      hydra.job.name=translate \
+                                      hydra.run.dir=${TRANSLATION_DIR}/$* ${TRANSLATE_ARGS}
+
+
+# wrapper
+.PHONY: wrapper
+wrapper: $(patsubst %,${TRANSLATION_DIR}/%/wrapper.log,${TARGETS}) ;
+
+${TRANSLATION_DIR}/%/wrapper.log: ${TRANSLATION_DIR}/%/translate.log | build-ninja/lib%.so.symbols
+	@mkdir -p $(@D)/src/wrapper
+	-@cat build-ninja/lib$*.so.symbols | xargs -t -I{} bindgen --disable-header-comment --no-doc-comments --no-layout-tests $(@D)/src/lib.c --allowlist-function {} -o $(@D)/src/wrapper/{}.rs
+	-@cat build-ninja/lib$*.so.symbols | xargs -t -I{} sed -zEe 's/\nunsafe extern "C" \{\s+(.*);\s+}/\n\#[unsafe(export_name = "{}")]\1 {\n    unimplemented!();\n}/gi' -i $(@D)/src/wrapper/{}.rs
+	-@cat build-ninja/lib$*.so.symbols | xargs -t -I{} sed -e 's/pub fn/pub extern "C" fn/gi' -i $(@D)/src/wrapper/{}.rs
+	-@cat build-ninja/lib$*.so.symbols | xargs -t -I{} rustfmt ${@D}/src/wrapper/{}.rs
+	-uv run python -m ideas.wrapper model.name=${PROVIDER}/${MODEL} \
+                               symbols=build-ninja/lib$*.so.symbols \
+                               cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
+                               hydra.output_subdir=.wrapper \
+                               hydra.job.name=wrapper \
+                               hydra.run.dir=${TRANSLATION_DIR}/$* ${WRAPPER_ARGS}
+
+${TRANSLATION_DIR}/%/wrapper.log: ${TRANSLATION_DIR}/%/translate.log | build-ninja/%.symbols ;
 
 
 # build
 .PHONY: build
 build: ${TRANSLATION_DIR}/build.log ;
 
-.PRECIOUS: ${TRANSLATION_DIR}/build.log
-${TRANSLATION_DIR}/build.log: ${TRANSLATION_DIR}/translate.log ${TRANSLATION_DIR}/Cargo.toml ${CRATEIFY_BIN} FORCE
-	${CRATEIFY_BIN} ${TRANSLATION_DIR}/src
+${TRANSLATION_DIR}/build.log: $(patsubst %,${TRANSLATION_DIR}/%/build.log,${TARGETS})
+	cat $^ > $@
+
+${TRANSLATION_DIR}/%/build.log: ${TRANSLATION_DIR}/%/wrapper.log
 	-export RUSTFLAGS=${RUSTFLAGS} && cargo build --quiet --manifest-path $(@D)/Cargo.toml 2> $@
+	@cat $@
+
+${TRANSLATION_DIR}/target/debug/lib%.so: ${TRANSLATION_DIR}/%/build.log | build-ninja/lib%.so.type ;
+${TRANSLATION_DIR}/target/debug/%: ${TRANSLATION_DIR}/%/build.log | build-ninja/%.type ;
 
 
-# tests for executables
+# tests for TARGETS
 .PHONY: test
 test: ${TRANSLATION_DIR}/cargo_test.log ;
 
 .PRECIOUS: ${TRANSLATION_DIR}/cargo_test.log
-${TRANSLATION_DIR}/cargo_test.log: ${TRANSLATION_DIR}/Cargo.toml \
-                                   ${TRANSLATION_DIR}/tests/test_cases.rs \
-                                   ${TRANSLATION_DIR}/build.log
-	@if [ $$(stat -c %s ${TRANSLATION_DIR}/build.log) = 0 ]; then \
+${TRANSLATION_DIR}/cargo_test.log: ${TRANSLATION_DIR}/build.log $(patsubst %,${TRANSLATION_DIR}/%/tests/test_cases.rs,${TARGETS})
+	if [ $$(stat -c %s ${TRANSLATION_DIR}/build.log) = 0 ]; then \
       cargo test --manifest-path ${TRANSLATION_DIR}/Cargo.toml --test test_cases | tee $@ ; \
     else \
       find test_vectors -name '*.json' -exec echo "test {} ... FAILED" \; | tee $@ ; \
     fi
 
-.PRECIOUS: ${TRANSLATION_DIR}/tests/test_cases.rs
-${TRANSLATION_DIR}/tests/test_cases.rs: ${TEST_FILES}
+.PRECIOUS: ${TRANSLATION_DIR}/%/tests/test_cases.rs
+${TRANSLATION_DIR}/%/tests/test_cases.rs: ${TEST_FILES}
 	@mkdir -p $(@D)
-	-uv run python -m ideas.convert_tests $^ | rustfmt > $@
+	-uv run python -m ideas.convert_tests ${TEST_FILES} | rustfmt > $@
 
 .PRECIOUS: test_vectors/%.json
 test_vectors/%.json:
 	$(error $@ not found)
 
-# tests for C libraries
-.PHONY: test_libc
-test_libc: runner/test_libc.log ;
-
-.PRECIOUS: runner/test_libc.log
-runner/test_libc.log: build-ninja/build.log \
-                      runner/release/runner
-	find test_vectors -name '*.json' \
-      | sort \
-      | xargs -I {} sh -c './runner/release/runner lib -c ../{} -v' \
-      | tee $@
-
-# tests for Rust libraries
-.PHONY: test_librs
-test_librs: runner/test_librs.log ;
-
-.PRECIOUS: runner/test_librs.log
-runner/test_librs.log: ${TRANSLATION_DIR}/build.log \
-                       runner/release/runner
-	find test_vectors -name '*.json' \
-      | sort \
-      | xargs -I {} sh -c './runner/release/runner -b ${TRANSLATION_DIR}/target/debug lib -c ../{} -v' \
-      | tee $@
 
 # repair
 .PHONY: repair
-repair: ${TRANSLATION_DIR}/translate.log ${TRANSLATION_DIR}/Cargo.toml ${TRANSLATION_DIR}/tests/test_cases.rs
-	-uv run python -m ideas.repair model.name=${PROVIDER}/${MODEL} cargo_toml=${TRANSLATION_DIR}/Cargo.toml ${REPAIR_ARGS}
+repair: ${TRANSLATION_DIR}/translate.log \
+        ${TRANSLATION_DIR}/Cargo.toml \
+        ${TRANSLATION_DIR}/tests/test_cases.rs
+	-uv run python -m ideas.repair model.name=${PROVIDER}/${MODEL} \
+      cargo_toml=${TRANSLATION_DIR}/Cargo.toml \
+      ${REPAIR_ARGS}
 
 # clean
 .PHONY: clean

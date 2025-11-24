@@ -6,7 +6,6 @@
 
 import io
 import sys
-import json
 import logging
 import subprocess
 from pathlib import Path
@@ -19,8 +18,10 @@ from hydra.types import RunMode
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 
-
 from ideas import model, ModelConfig, GenerateConfig
+from ideas import get_info_from_cargo_toml
+from .ast_rust import ensure_no_mangle_in_module
+from .tools import Crate
 
 logger = logging.getLogger("ideas.repair")
 OmegaConf.register_new_resolver(
@@ -46,6 +47,8 @@ class RepairConfig:
     cargo_toml: Path = MISSING
     max_iters: int = 100
 
+    ensure_no_mangle: bool = True
+
 
 cs = ConfigStore.instance()
 cs.store(name="repair", node=RepairConfig)
@@ -57,7 +60,7 @@ def repair(cfg: RepairConfig) -> None:
 
     model.configure(cfg.model, cfg.generate)
 
-    agent = RepairAgent(max_iters=cfg.max_iters)
+    agent = RepairAgent(max_iters=cfg.max_iters, ensure_no_mangle=cfg.ensure_no_mangle)
     reparation = agent(cfg.cargo_toml)
 
     if "history" in reparation:
@@ -77,40 +80,24 @@ class Reparation(dspy.Signature):
 
 
 class RepairAgent(dspy.Module):
-    def __init__(self, max_iters: int = 1):
+    def __init__(self, max_iters: int = 1, ensure_no_mangle: bool = True):
         super().__init__()
 
         self.max_iters = max_iters
         self.repair = dspy.ChainOfThought(Reparation)
+        self.ensure_no_mangle = ensure_no_mangle
 
     def forward(self, cargo_toml: Path) -> dict[str, str]:
         if not cargo_toml.exists():
             raise ValueError(f"{cargo_toml=} must exist!")
 
-        # Extract root package metadata from Cargo.toml
-        out = subprocess.run(
-            ["cargo", "metadata", "--manifest-path", cargo_toml], text=True, capture_output=True
-        )
-        if out.returncode != 0:
-            raise ValueError(f"Failed to get cargo metadata from {cargo_toml}!\n{out.stderr}")
-        metadata = json.loads(out.stdout)
-        root = metadata["resolve"]["root"]
-        root_package = next(filter(lambda p: p["id"] == root, metadata["packages"]))
-
-        # Get rust source path for bin or lib
-        bin_targets = list(filter(lambda t: "bin" in t["kind"], root_package["targets"]))
-        lib_targets = list(filter(lambda t: "lib" in t["kind"], root_package["targets"]))
-        if len(bin_targets) == 1 and len(lib_targets) == 0:
-            rust_src_path = Path(bin_targets[0]["src_path"])
-        elif len(bin_targets) == 0 and len(lib_targets) == 1:
-            rust_src_path = Path(lib_targets[0]["src_path"])
-        else:
-            raise ValueError(
-                f"Unhandled bin/lib targets configuration in Cargo.toml: {bin_targets=} {lib_targets=}"
-            )
+        # Get target source path
+        crate: Crate = get_info_from_cargo_toml(cargo_toml)
 
         # Get test source path
-        test_targets = list(filter(lambda t: "test" in t["kind"], root_package["targets"]))
+        test_targets = list(
+            filter(lambda t: "test" in t["kind"], crate.root_package["targets"])
+        )
         if len(test_targets) != 1:
             raise ValueError(
                 f"Unhandled test targets configuration in Cargo.toml: {test_targets=}"
@@ -134,13 +121,17 @@ class RepairAgent(dspy.Module):
                 break
 
             reparation: dspy.Prediction = self.repair(
-                input_code=rust_src_path.read_text(),
+                input_code=crate.rust_src_path.read_text(),
                 test_code=test_src_path.read_text(),
                 cargo_test_output=out.stdout,
             )
 
             repaired_code = reparation["repaired_code"].code
-            rust_src_path.write_text(repaired_code)
+            # Guarantee #[unsafe(no_mangle)] for all top-level symbols
+            if self.ensure_no_mangle:
+                repaired_code = ensure_no_mangle_in_module(repaired_code, add=True)
+
+            crate.rust_src_path.write_text(repaired_code)
 
         # Save agent history to string
         history = io.StringIO()
