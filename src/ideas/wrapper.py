@@ -42,6 +42,7 @@ class WrapperGenerator(dspy.Module):
     class Signature(dspy.Signature):
         """
         Implement a C-compatible FFI wrapper for `crate::{symbol_name}` by replacing the `unimplemented!()` macro in `example_wrapper`.
+        **Only** modify the body of the function, and **nothing** else.
         The implementation for `crate::{symbol_name}` is in a crate that was read from "{crate_path}".
         Assume the types in `crate::wrapper::` do not have the same memory layout as those in `crate::`.
         The wrapper should properly convert between `crate::wrapper::` and `crate::` types by copying the values from the wrapper type to the crate type before calling `crate::{symbol_name}`.
@@ -69,7 +70,16 @@ class WrapperGenerator(dspy.Module):
         crate_path = crate.rust_src_path
         wrapper_path = crate.rust_src_path.parent / "wrapper.rs"
         symbol_wrapper_path = crate.rust_src_path.parent / "wrapper" / f"{symbol_name}.rs"
-        example_wrapper = symbol_wrapper_path.read_text()
+        example_wrapper = symbol_wrapper_path.read_text().strip()
+
+        # Replace lines containing unimplemented!() with anything
+        allowed_changes = re.escape(example_wrapper)
+        allowed_changes = re.sub(
+            r"^[\ \\t]*unimplemented!\\\(\\\);[\ \\t]*$",
+            r".*",
+            allowed_changes,
+            flags=re.MULTILINE,
+        )
 
         signature = WrapperGenerator.Signature.with_instructions(
             WrapperGenerator.Signature.instructions.format(
@@ -98,17 +108,18 @@ class WrapperGenerator(dspy.Module):
                 prior_wrapper=prior_wrapper,
             )
             if pred.wrapper is None:
+                feedback = "No wrapper was generated. You must respect the template and instructions **exactly**!"
                 continue
-            prior_wrapper = pred.wrapper.code
+            prior_wrapper = wrapper = pred.wrapper.code
 
-            # Statically convert #[no_mangle] to #[unsafe(export_name="...")]
-            # TODO: Attempt to use `cargo fix`
-            wrapper = re.sub(
-                r"^(\s*)#\[no_mangle\]",
-                f'\\1#[unsafe(export_name="{symbol_name}")]',
-                prior_wrapper,
-                flags=re.MULTILINE,
-            )
+            # Enforce only function body changes
+            matches = re.match(f"^{allowed_changes}$", wrapper, flags=re.DOTALL)
+            if matches is None:
+                feedback = (
+                    "The generated wrapper modifies parts outside the function body."
+                    "You must **only** modify the `unimplemented!()` function body and leave everything else **unchanged**!"
+                )
+                continue
 
             # Write wrapper to disk and check if we build
             wrapper_path.write_text(wrapper)
@@ -127,7 +138,9 @@ class WrapperGenerator(dspy.Module):
         # Write original code and wrapper and return wrapper
         crate_path.write_text(orig_code)
         wrapper_path.write_text(orig_wrapper)
-        return dspy.Prediction(wrapper=wrapper, success=success, iters=i)
+        return dspy.Prediction(
+            wrapper=wrapper, example_wrapper=example_wrapper, success=success, iters=i
+        )
 
     def get_history(self, n: int = 1, clear: bool = False) -> str:
         f = io.StringIO()
@@ -166,14 +179,22 @@ def main(cfg: WrapperConfig) -> None:
 
         # Write wrapper to disk and reference in wrapper.rs
         symbol_wrapper = pred.wrapper
+        if not pred.success:
+            symbol_wrapper = pred.example_wrapper
+            # Write the failure example wrapper for debugging
+            failed_wrapper_path = (
+                crate.rust_src_path.parent / "wrapper" / f"{symbol_name}.rs.failure"
+            )
+            failed_wrapper_path.parent.mkdir(exist_ok=True, parents=True)
+            failed_wrapper_path.write_text(pred.wrapper)
+
         symbol_wrapper_path = crate.rust_src_path.parent / "wrapper" / f"{symbol_name}.rs"
         symbol_wrapper_path.parent.mkdir(exist_ok=True, parents=True)
         symbol_wrapper_path.write_text(symbol_wrapper)
         symbol_wrapper_path.with_suffix(".history").write_text(agent.get_history(n=100000))
 
-        if pred.success:
-            with wrapper_path.open("a+") as f:
-                f.write(f"pub mod {symbol_name};\n")
+        with wrapper_path.open("a+") as f:
+            f.write(f"pub mod {symbol_name};\n")
 
 
 if __name__ == "__main__":

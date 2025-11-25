@@ -99,12 +99,15 @@ class Translator(dspy.Module):
             logger.info(f"Translating `{symbol_name}` ...")
             logger.debug(f"```c\n{symbol_code}\n```")
 
+            # FIXME: Pass a Symbol here instead of symbol_code and is_snippet_main. Similarly,
+            #        dep_sources should probably be a list[Symbol] too.
             pred = self.translate_with_feedback(
                 ref_translations,
                 symbol_code,
                 dep_sources,
                 crate,
                 max_iters=self.max_iters,
+                is_snippet_main=symbol_name == "c:@F@main",
             )
             # pred = dspy.Prediction(translation=dspy.Code(code=""))
 
@@ -185,6 +188,7 @@ class Translator(dspy.Module):
         crate: Crate,
         *,
         max_iters: int = 0,
+        is_snippet_main: bool = False,
     ) -> dspy.Prediction:
         pred = self.translate(reference_code, snippet, dependent_code)
         i = 0
@@ -193,7 +197,7 @@ class Translator(dspy.Module):
             if len(reference_code) > 0:
                 rust_src += reference_code + "\n\n"
             rust_src += pred.translation.code + "\n\n"
-            if crate.is_bin and "fn main()" not in rust_src:
+            if crate.is_bin and not is_snippet_main:
                 # Work around E0601 error
                 rust_src += 'fn main() {\n    println!("Hello, world!");\n}\n'
 

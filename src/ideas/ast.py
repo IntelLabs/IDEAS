@@ -159,6 +159,9 @@ def extract_referenced_symbols(node: Cursor) -> list[Symbol]:
             # Ignore internal references to, e.g., function parameters
             if child_node.referenced is None:
                 continue
+            # Ignore self references
+            if child_node.referenced.get_usr() == node.get_usr():
+                continue
             symbol_uses.append(Symbol(child_node.referenced.get_usr(), child_node))
 
     return symbol_uses
