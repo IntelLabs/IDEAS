@@ -9,7 +9,6 @@
 import math
 from dataclasses import dataclass
 
-from collections.abc import KeysView
 from clang.cindex import Cursor, CursorKind
 from tree_sitter import Node
 
@@ -32,17 +31,6 @@ class RustSymbol:
     node: Node
     decl: str = ""
     attributes: list[str] | None = None
-
-
-# Modify graph edges to only count called symbols from a set
-def filter_edges_by_set(inputs: list[Symbol], symbols: KeysView | set[str]) -> list[Symbol]:
-    output = []
-
-    for symbol in inputs:
-        if symbol.name in symbols and symbol not in output:
-            output.append(symbol)
-
-    return output
 
 
 # Recursively collect dependencies of a symbol

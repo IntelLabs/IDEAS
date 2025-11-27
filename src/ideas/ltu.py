@@ -31,28 +31,11 @@ def build_unit(
     ast_info: TreeResult, type: str = "functional_maximal"
 ) -> list[LLMTranslationUnit]:
     if type == "functional_maximal":
-        return build_functional_maximal_unit(ast_info)
+        raise ValueError("ltu-max not implemented!")
     elif type == "functional_minimal":
         return build_functional_minimal_unit(ast_info)
     else:
         raise ValueError(f"Unknown unit type: {type}")
-
-
-def build_functional_maximal_unit(ast_info: TreeResult) -> list[LLMTranslationUnit]:
-    definitions = [
-        (name, definition) for name, definition in ast_info.fn_definitions.items() if definition
-    ]
-    units = []
-    for name, definition in definitions:
-        unit = LLMTranslationUnit(
-            symbol_name=name,
-            symbol_definition=definition,
-        )
-        # Add unique symbols referenced by this function
-        # NOTE: We use dict.fromkeys to preserve the order of appearance
-        unit.ref_symbols = list(dict.fromkeys(ast_info.get_top_level_symbols_for_name(name)))
-        units.append(unit)
-    return units
 
 
 def build_functional_minimal_unit(ast_info: TreeResult) -> list[LLMTranslationUnit]:

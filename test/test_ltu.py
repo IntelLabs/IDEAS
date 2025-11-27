@@ -32,30 +32,9 @@ def test_mtu_builder(c_data_structures_code: str, c_data_structures_lib: tuple[s
     # Build the maximal translation units for each function
     macro_tu = ast.create_translation_unit(c_data_structures_code)
     ast_info = ast.extract_info_c(macro_tu)
-    mtus = ltu.build_unit(ast_info, type="functional_maximal")
-
-    # Compile the library
-    with open("/tmp/lib.h", "w") as f:
-        f.write(c_data_structures_lib[0])
-    with open("/tmp/lib.c", "w") as f:
-        f.write(c_data_structures_lib[1])
-
-    success, out = tools.compile_c(
-        "/tmp/lib.c", "/tmp/lib.o", flags=["-Wall", "-c", "-I", "/tmp/lib.h"]
-    )
-
-    for mtu in mtus:
-        # Check that the name and definition is not empty
-        assert mtu.symbol_name.strip() != ""
-        assert mtu.symbol_definition.strip() != ""
-
-        # And that it compiles
-        success, out = tools.check_c(
-            str(mtu),
-            flags=["-Wall", "-I", "include", "/tmp/lib.o"],
-        )
-        assert success
-        assert out == ""
+    with pytest.raises(ValueError) as error:
+        _ = ltu.build_unit(ast_info, type="functional_maximal")
+        assert str(error.value) == "ltu-max not implemented!"
 
 
 def test_mtu_on_typedef():
@@ -109,16 +88,9 @@ int main() {
     macro_tu = ast.create_translation_unit(nested_code)
     ast_info = ast.extract_info_c(macro_tu)
 
-    mtus = ltu.build_unit(ast_info, type="functional_maximal")
-    mtu = mtus[0]
-
-    # Check that this compiles
-    success, out = tools.check_c(
-        str(mtu),
-        flags=["-c"],
-    )
-    assert success
-    assert out == ""
+    with pytest.raises(ValueError) as error:
+        _ = ltu.build_unit(ast_info, type="functional_maximal")
+        assert str(error.value) == "ltu-max not implemented!"
 
 
 def test_mtu_delayed_dependency():
@@ -161,16 +133,9 @@ int main() {
     macro_tu = ast.create_translation_unit(delayed_code)
     ast_info = ast.extract_info_c(macro_tu)
 
-    mtus = ltu.build_unit(ast_info, type="functional_maximal")
-    mtu = mtus[0]
-
-    # Check that this compiles
-    success, out = tools.check_c(
-        str(mtu),
-        flags=["-c"],
-    )
-    assert success
-    assert out == ""
+    with pytest.raises(ValueError) as error:
+        _ = ltu.build_unit(ast_info, type="functional_maximal")
+        assert str(error.value) == "ltu-max not implemented!"
 
 
 def test_mtu_deep_nested_enum():
@@ -202,13 +167,6 @@ int main(int argc, char **argv) {
     macro_tu = ast.create_translation_unit(deep_enum_code)
     ast_info = ast.extract_info_c(macro_tu)
 
-    mtus = ltu.build_unit(ast_info, type="functional_maximal")
-    mtu = mtus[0]
-
-    # Check that this compiles
-    success, out = tools.check_c(
-        str(mtu),
-        flags=["-c"],
-    )
-    assert success
-    assert out == ""
+    with pytest.raises(ValueError) as error:
+        _ = ltu.build_unit(ast_info, type="functional_maximal")
+        assert str(error.value) == "ltu-max not implemented!"
