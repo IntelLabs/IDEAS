@@ -23,8 +23,7 @@ class ModelConfig:
 @dataclass
 class GenerateConfig:
     max_new_tokens: int = 32000
-    do_sample: bool = False
-    temperature: float = 1.0
+    temperature: float = 0.0
     top_p: float = 1.0
     top_k: int | None = None
 

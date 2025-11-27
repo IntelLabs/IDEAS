@@ -281,7 +281,9 @@ def main(cfg: InitConfig) -> None:
 
     source_priority = None
     if isinstance(cfg.source_priority, Path):
-        source_priority = [Path(path) for path in cfg.source_priority.read_text().splitlines()]
+        source_priority = [
+            Path(path).resolve() for path in cfg.source_priority.read_text().splitlines()
+        ]
 
     init(
         cfg.filename,
