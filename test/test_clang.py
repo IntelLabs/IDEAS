@@ -242,6 +242,9 @@ enum Color {
     undefined = -1,
 }""".strip()
     )
+    assert "c:@E@Color@red" in result.symbols
+    assert "c:@E@Color@green" in result.symbols
+    assert "c:@E@Color@undefined" in result.symbols
 
 
 def test_get_code_from_tu_range():
