@@ -33,10 +33,9 @@ GREEN_COL := \033[1;32m
 PROJECT_C_FILES = $(shell jq -r 'map(.file) | .[] | @text' build-ninja/compile_commands.json)
 C_FILES = $(subst ${CURDIR}/test_case/,,${PROJECT_C_FILES})
 TEST_FILES := $(wildcard test_vectors/*.json)
-TARGETS := $(shell find build-ninja -maxdepth 1 -type f -executable -exec basename {} \; | cut -d. -f1 | sed -e "s/^lib//gi")
-ARTIFACTS := $(shell find build-ninja -maxdepth 1 -type f -executable -exec basename {} \;)
+TARGETS ?= $(shell find build-ninja -maxdepth 1 -type f -executable -exec basename {} \; | cut -d. -f1 | sed -e "s/^lib//gi")
 ifeq (${TARGETS},)
-ifneq (${MAKECMDGOALS},cmake)
+ifeq ($(filter cmake clean,$(MAKECMDGOALS)),)
 $(error No TARGETS found! You need to run cmake!)
 endif
 endif
@@ -328,4 +327,4 @@ repair: ${TRANSLATION_DIR}/translate.log \
 clean:
 	rm -rf $(addprefix test_case/,$(addsuffix .i,${C_FILES}))
 	rm -rf build-ninja
-	rm -rf ${TRANSLATION_DIR}
+	find . -name Cargo.toml -exec cargo clean --quiet --manifest-path {} \;

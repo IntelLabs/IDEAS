@@ -81,6 +81,7 @@ def extract_info_c(tu: TranslationUnit) -> TreeResult:
                 for child in node.get_children():
                     # Register a dependency on the underlying enum for each enumerator
                     if child.kind == CursorKind.ENUM_CONSTANT_DECL:  # type: ignore[reportAttributeAccess]
+                        result.symbols[child.get_usr()] = Symbol(child.get_usr(), child)
                         result.complete_graph[child.get_usr()].append(result.symbols[usr])
 
             # Typedefs
@@ -107,6 +108,7 @@ def extract_info_c(tu: TranslationUnit) -> TreeResult:
 
                     # Register a dependency on the typedef for each (possibly deeply nested) enumerator
                     if child.kind == CursorKind.ENUM_CONSTANT_DECL:  # type: ignore[reportAttributeAccessIssue]
+                        result.symbols[child.get_usr()] = Symbol(child.get_usr(), child)
                         result.complete_graph[child.get_usr()].append(result.symbols[usr])
 
             # All other declarations

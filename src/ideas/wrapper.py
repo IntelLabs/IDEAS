@@ -85,7 +85,7 @@ class WrapperGenerator(dspy.Module):
             WrapperGenerator.Signature.instructions.format(
                 symbol_name=symbol_name,
                 crate_path="src/lib.rs",
-                wrapper_path="src/wrapper.rs",
+                wrapper_path=f"src/wrapper/{symbol_name}.rs",
             )
         )
         generate_wrapper = dspy.ChainOfThought(signature)
@@ -98,6 +98,13 @@ class WrapperGenerator(dspy.Module):
         if not re.search(r"^pub mod wrapper;$", code, flags=re.MULTILINE):
             code = f"pub mod wrapper;\n\n{code}"
             crate_path.write_text(code)
+
+        # Add "pub mod {symbol_name};" to wrapper
+        if not re.search(
+            rf"^pub mod {re.escape(symbol_name)};$", orig_wrapper, flags=re.MULTILINE
+        ):
+            with wrapper_path.open("a+") as f:
+                f.write(f"pub mod {symbol_name};\n")
 
         i, wrapper, success, feedback, prior_wrapper = 0, "", False, "", example_wrapper
         for i in range(self.max_iters):
@@ -122,7 +129,7 @@ class WrapperGenerator(dspy.Module):
                 continue
 
             # Write wrapper to disk and check if we build
-            wrapper_path.write_text(wrapper)
+            symbol_wrapper_path.write_text(wrapper)
             success, feedback = tools.run_subprocess(
                 [
                     "cargo",
