@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import os
 import io
 import json
 import logging
@@ -73,25 +74,12 @@ class Translator(dspy.Module):
         # Translate symbol by symbol
         translations: dict[str, str] = OrderedDict()
         for symbol_name, symbol_code in sources.items():
-            ref_names = [
-                name for name in bfs(symbol_name, dependencies) if name in translations
-            ]
             dep_names = [
                 name for name in bfs(symbol_name, references, max_depth=1) if name in sources
             ]
-            # move dependent names that has a translation to reference names
-            for dep_name in dep_names:
-                assert dep_name not in translations, (
-                    f"Dependency {dep_name} should not already be translated"
-                )
-                for ref_name in bfs(dep_name, dependencies):
-                    if ref_name in translations and ref_name not in ref_names:
-                        ref_names.append(ref_name)
 
             # Gather reference and dependent code in order of translations and sources, respectively
-            ref_translations = "\n\n".join(
-                [translation for name, translation in translations.items() if name in ref_names]
-            )
+            ref_translations = "\n\n".join(translations.values())
             dep_sources = "\n\n".join(
                 [source for name, source in sources.items() if name in dep_names]
             )
@@ -99,12 +87,15 @@ class Translator(dspy.Module):
             logger.info(f"Translating `{symbol_name}` ...")
             logger.debug(f"```c\n{symbol_code}\n```")
 
+            # FIXME: Pass a Symbol here instead of symbol_code and is_snippet_main. Similarly,
+            #        dep_sources should probably be a list[Symbol] too.
             pred = self.translate_with_feedback(
                 ref_translations,
                 symbol_code,
                 dep_sources,
                 crate,
                 max_iters=self.max_iters,
+                is_snippet_main=symbol_name == "c:@F@main",
             )
             # pred = dspy.Prediction(translation=dspy.Code(code=""))
 
@@ -115,16 +106,22 @@ class Translator(dspy.Module):
             # Update state
             translations[symbol_name] = pred.translation.code
             with crate.rust_src_path.with_suffix(".jsonl").open("a") as f:
-                f.write(
-                    json.dumps(
+                for prior_translation, feedback in zip(pred.prior_translations, pred.feedbacks):
+                    jsonl = json.dumps(
                         {
                             "name": symbol_name,
-                            "source": symbol_code,
+                            "reference_names": list(translations.keys()),
+                            "reference_code": ref_translations,
+                            "snippet": symbol_code,
+                            "dependent_names": dep_names,
+                            "dependent_code": dep_sources,
+                            "prior_translation": prior_translation,
+                            "feedback": feedback,
                             "translation": pred.translation.code,
+                            "success": pred.success,
                         }
                     )
-                    + "\n"
-                )
+                    f.write(jsonl + "\n")
 
         translation = "\n\n".join(translations.values())
         return dspy.Prediction(translation=translation)
@@ -145,8 +142,6 @@ class Translator(dspy.Module):
         For all bitwise operations, including those that may appear to swap bits for bytes, implement the behavior exactly as written in the C code, without making assumptions about intent.
         Use the `cargo build` feedback about the prior_translation, if provided, when generating the Rust translation.
         """
-
-        # For example, reason about how a Rust translation of the dependent_code would inform a safe and idiomatic translation of the C snippet.
 
         reference_code: dspy.Code["Rust"] = dspy.InputField()  # noqa: F821
         snippet: dspy.Code["C"] = dspy.InputField()  # noqa: F821
@@ -185,19 +180,22 @@ class Translator(dspy.Module):
         crate: Crate,
         *,
         max_iters: int = 0,
+        is_snippet_main: bool = False,
     ) -> dspy.Prediction:
         pred = self.translate(reference_code, snippet, dependent_code)
-        i = 0
-        for i in range(max_iters):
+        success, prior_translations, feedbacks = False, [""], [""]
+        for _ in range(max_iters):
             rust_src = ""
             if len(reference_code) > 0:
                 rust_src += reference_code + "\n\n"
             rust_src += pred.translation.code + "\n\n"
-            if crate.is_bin and "fn main()" not in rust_src:
+            if crate.is_bin and not is_snippet_main:
                 # Work around E0601 error
                 rust_src += 'fn main() {\n    println!("Hello, world!");\n}\n'
 
             crate.rust_src_path.write_text(rust_src)
+            env = os.environ.copy()
+            env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " -D unsafe-code").strip()
             success, feedback = tools.run_subprocess(
                 [
                     "cargo",
@@ -205,7 +203,8 @@ class Translator(dspy.Module):
                     "--quiet",
                     "--color=never",
                     f"--manifest-path={crate.cargo_toml}",
-                ]
+                ],
+                env=env,
             )
             if success:
                 break
@@ -213,18 +212,22 @@ class Translator(dspy.Module):
                 f"Feedback\n```rust\n{reference_code}\n{pred.translation.code}\n```\n\n# Feedback\n{feedback}\n\n# reasoning\n{pred.reasoning}"
             )
 
+            feedbacks.append(feedback)
+            prior_translations.append(pred.translation.code)
             pred = self.translate(
                 reference_code,
                 snippet,
                 dependent_code,
-                prior_translation=pred.translation,
+                prior_translation=pred.translation.code,
                 feedback=feedback,
             )
         else:
             logger.warning(
                 f"Translation failed to build after {max_iters} feedback iterations!"
             )
-        pred["iters"] = i
+        pred["feedbacks"] = feedbacks
+        pred["prior_translations"] = prior_translations
+        pred["success"] = success
         return pred
 
     def get_history(self, n: int = 1, clear: bool = False) -> str:

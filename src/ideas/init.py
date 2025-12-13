@@ -86,7 +86,10 @@ def get_symbols_and_dependencies(
         export_symbols = [c14n_symbol_name(name, project_symbols) for name in export_symbols]
         dependencies = reachable_subgraph(project_dependencies, export_symbols)
     symbols = filter_symbols(
-        project_symbols, filter_tag_definitions=True, filter_function_declarations=True
+        project_symbols,
+        filter_tag_definitions=True,
+        filter_function_declarations=True,
+        filter_enum_constants=True,
     )
 
     return symbols, dependencies
@@ -128,6 +131,7 @@ def filter_symbols(
     filter_system: bool = True,
     filter_tag_definitions: bool = False,
     filter_function_declarations: bool = False,
+    filter_enum_constants: bool = False,
 ) -> dict[str, Symbol]:
     filtered_symbols = {}
     for name, symbol in symbols.items():
@@ -157,6 +161,11 @@ def filter_symbols(
                 symbol.cursor.kind == CursorKind.FUNCTION_DECL  # type: ignore[reportAttributeAccessIssue]
                 and not symbol.cursor.is_definition()
             ):
+                continue
+
+        # Filter enum constants since they should be contained with an ENUM_DECL
+        if filter_enum_constants:
+            if symbol.cursor.kind == CursorKind.ENUM_CONSTANT_DECL:  # type: ignore[reportAttributeAccessIssue]
                 continue
 
         filtered_symbols[name] = symbols[name]
@@ -281,7 +290,9 @@ def main(cfg: InitConfig) -> None:
 
     source_priority = None
     if isinstance(cfg.source_priority, Path):
-        source_priority = [Path(path) for path in cfg.source_priority.read_text().splitlines()]
+        source_priority = [
+            Path(path).resolve() for path in cfg.source_priority.read_text().splitlines()
+        ]
 
     init(
         cfg.filename,

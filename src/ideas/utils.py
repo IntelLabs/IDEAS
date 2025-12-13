@@ -6,10 +6,8 @@
 # These contents may have been developed with support from one or more
 # Intel-operated generative artificial intelligence solutions.
 
-import math
 from dataclasses import dataclass
 
-from collections.abc import KeysView
 from clang.cindex import Cursor, CursorKind
 from tree_sitter import Node
 
@@ -34,39 +32,24 @@ class RustSymbol:
     attributes: list[str] | None = None
 
 
-# Modify graph edges to only count called symbols from a set
-def filter_edges_by_set(inputs: list[Symbol], symbols: KeysView | set[str]) -> list[Symbol]:
-    output = []
-
-    for symbol in inputs:
-        if symbol.name in symbols and symbol not in output:
-            output.append(symbol)
-
-    return output
-
-
 # Recursively collect dependencies of a symbol
 def get_all_deps(
     current_graph: dict[str, list[Symbol]],
     name: str,
-    cutoffs: set[str] | None = None,
     cache: dict[str, list[Symbol]] | None = None,
-    max_depth: int | float = math.inf,
     _visited: set[str] | None = None,
     _depth: int = 0,
 ) -> list[Symbol]:
     expanded_deps = []
     if not cache:
         cache = dict()
-    if not cutoffs:
-        cutoffs = set()
     if not _visited:
         _visited = set()
 
     # If we have already visited this symbol, return the cached result
     if name in cache:
         return cache[name]
-    if name in _visited or _depth > max_depth:
+    if name in _visited:
         return expanded_deps
     _visited.add(name)
 
@@ -82,16 +65,11 @@ def get_all_deps(
     # Depth-first recursion
     seen_names = set()
     for dep_symbol in current_deps:
-        if dep_symbol.name in cutoffs:
-            continue
-
         # Collect transitive deps of this dependency
         trans_deps = get_all_deps(
             current_graph,
             dep_symbol.name,
-            cutoffs,
             cache,
-            max_depth,
             _visited,
             _depth + 1,
         )

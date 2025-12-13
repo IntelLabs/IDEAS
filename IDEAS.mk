@@ -33,10 +33,9 @@ GREEN_COL := \033[1;32m
 PROJECT_C_FILES = $(shell jq -r 'map(.file) | .[] | @text' build-ninja/compile_commands.json)
 C_FILES = $(subst ${CURDIR}/test_case/,,${PROJECT_C_FILES})
 TEST_FILES := $(wildcard test_vectors/*.json)
-TARGETS := $(shell find build-ninja -maxdepth 1 -type f -executable -exec basename {} \; | cut -d. -f1 | sed -e "s/^lib//gi")
-ARTIFACTS := $(shell find build-ninja -maxdepth 1 -type f -executable -exec basename {} \;)
+TARGETS ?= $(shell find build-ninja -maxdepth 1 -type f -executable -exec basename {} \; | cut -d. -f1 | sed -e "s/^lib//gi")
 ifeq (${TARGETS},)
-ifneq (${MAKECMDGOALS},cmake)
+ifeq ($(filter cmake clean,$(MAKECMDGOALS)),)
 $(error No TARGETS found! You need to run cmake!)
 endif
 endif
@@ -264,7 +263,7 @@ wrapper: $(patsubst %,${TRANSLATION_DIR}/%/wrapper.log,${TARGETS}) ;
 ${TRANSLATION_DIR}/%/wrapper.log: ${TRANSLATION_DIR}/%/translate.log | build-ninja/lib%.so.symbols
 	@mkdir -p $(@D)/src/wrapper
 	-@cat build-ninja/lib$*.so.symbols | xargs -t -I{} bindgen --disable-header-comment --no-doc-comments --no-layout-tests $(@D)/src/lib.c --allowlist-function {} -o $(@D)/src/wrapper/{}.rs
-	-@cat build-ninja/lib$*.so.symbols | xargs -t -I{} sed -zEe 's/\nunsafe extern "C" \{\s+(.*);\s+}/\n\#[unsafe(export_name = "{}")]\1 {\n    unimplemented!();\n}/gi' -i $(@D)/src/wrapper/{}.rs
+	-@cat build-ninja/lib$*.so.symbols | xargs -t -I{} sed -zEe 's/unsafe extern "C" \{\s+(.*);\s+}/\n\#[unsafe(export_name = "{}")]\n\1 {\n    unimplemented!();\n}/gi' -i $(@D)/src/wrapper/{}.rs
 	-@cat build-ninja/lib$*.so.symbols | xargs -t -I{} sed -e 's/pub fn/pub extern "C" fn/gi' -i $(@D)/src/wrapper/{}.rs
 	-@cat build-ninja/lib$*.so.symbols | xargs -t -I{} rustfmt ${@D}/src/wrapper/{}.rs
 	-uv run python -m ideas.wrapper model.name=${PROVIDER}/${MODEL} \
@@ -328,4 +327,4 @@ repair: ${TRANSLATION_DIR}/translate.log \
 clean:
 	rm -rf $(addprefix test_case/,$(addsuffix .i,${C_FILES}))
 	rm -rf build-ninja
-	rm -rf ${TRANSLATION_DIR}
+	find . -name Cargo.toml -exec cargo clean --quiet --manifest-path {} \;

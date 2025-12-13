@@ -11,7 +11,7 @@ from clang.cindex import TranslationUnit, Cursor, CursorKind, TokenKind, SourceR
 from clang.cindex import conf, c_object_p
 from ctypes import pointer, c_size_t, c_char_p, c_uint, c_int
 
-from ideas.utils import Symbol, filter_edges_by_set, get_all_deps
+from ideas.utils import Symbol
 
 FILENAME = "file.c"
 
@@ -48,18 +48,6 @@ class TreeResult:
     complete_graph: dict[str, list[Symbol]] = field(
         default_factory=lambda: defaultdict(lambda: list())
     )
-    top_level_ref_graph: dict[str, list[Symbol]] = field(
-        default_factory=lambda: defaultdict(lambda: list())
-    )
-
-    def get_top_level_symbols_for_name(self, name: str) -> list[str]:
-        ref_fn = [
-            self.symbols[symbol.name].decl
-            for symbol in self.top_level_ref_graph[name]
-            if symbol.name in self.symbols
-        ]
-
-        return ref_fn
 
 
 def create_translation_unit(code: str) -> TranslationUnit:
@@ -93,6 +81,7 @@ def extract_info_c(tu: TranslationUnit) -> TreeResult:
                 for child in node.get_children():
                     # Register a dependency on the underlying enum for each enumerator
                     if child.kind == CursorKind.ENUM_CONSTANT_DECL:  # type: ignore[reportAttributeAccess]
+                        result.symbols[child.get_usr()] = Symbol(child.get_usr(), child)
                         result.complete_graph[child.get_usr()].append(result.symbols[usr])
 
             # Typedefs
@@ -119,6 +108,7 @@ def extract_info_c(tu: TranslationUnit) -> TreeResult:
 
                     # Register a dependency on the typedef for each (possibly deeply nested) enumerator
                     if child.kind == CursorKind.ENUM_CONSTANT_DECL:  # type: ignore[reportAttributeAccessIssue]
+                        result.symbols[child.get_usr()] = Symbol(child.get_usr(), child)
                         result.complete_graph[child.get_usr()].append(result.symbols[usr])
 
             # All other declarations
@@ -137,16 +127,6 @@ def extract_info_c(tu: TranslationUnit) -> TreeResult:
         # All referenced symbols
         result.complete_graph[usr] = extract_referenced_symbols(node)
 
-    # Resolve top-level dependencies
-    cache = {}
-    for name in result.symbols.keys():
-        # Get all dependencies of this symbol
-        expanded_deps = get_all_deps(result.complete_graph, name, cache=cache)
-        # Add the dependencies to the top-level graph
-        result.top_level_ref_graph[name] = filter_edges_by_set(
-            expanded_deps, result.symbols.keys()
-        )
-
     return result
 
 
@@ -158,6 +138,9 @@ def extract_referenced_symbols(node: Cursor) -> list[Symbol]:
         if child_node.kind in REF_NODE_KIND:
             # Ignore internal references to, e.g., function parameters
             if child_node.referenced is None:
+                continue
+            # Ignore self references
+            if child_node.referenced.get_usr() == node.get_usr():
                 continue
             symbol_uses.append(Symbol(child_node.referenced.get_usr(), child_node))
 
