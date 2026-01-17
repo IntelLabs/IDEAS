@@ -6,6 +6,7 @@
 
 import os
 import logging
+import sys
 from pathlib import Path
 from graphlib import TopologicalSorter
 from collections.abc import Iterable, Container
@@ -17,10 +18,9 @@ from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 from clang.cindex import CompilationDatabase, TranslationUnit, CursorKind
 
-from ideas import get_info_from_cargo_toml
-from .ast import get_cursor_code, extract_info_c, TreeResult
+from .ast import get_cursor_code, extract_info_c, TreeResult, get_internally_linked_cursors
 from .utils import Symbol
-from .tools import Crate
+from .tools import Crate, clang_rename_
 
 logger = logging.getLogger("ideas.preprocess")
 
@@ -28,9 +28,18 @@ logger = logging.getLogger("ideas.preprocess")
 @dataclass
 class InitConfig:
     filename: Path = MISSING
+    crate_type: str = MISSING
+    vcs: str = "none"
+
     pretty_print: bool = True
     export_symbols: Path | None = None
     source_priority: Path | None = None
+
+    def __post_init__(self):
+        if self.crate_type not in ["bin", "lib"]:
+            raise ValueError(f"Invalid crate type: {self.crate_type}!")
+        if self.vcs not in ["git", "none"]:
+            raise ValueError(f"Invalid VCS: {self.vcs}!")
 
 
 cs = ConfigStore.instance()
@@ -39,13 +48,20 @@ cs.store(name="init", node=InitConfig)
 
 def init(
     compile_commands: Path,
-    crate: Crate,
     export_symbols: list[str] | None = None,
     source_priority: list[Path] | None = None,
     pretty_print: bool = True,
-):
-    # Get symbol table and dependencies taking into account source priority and exported symbols
-    asts = get_asts(compile_commands, valid_paths=source_priority)
+) -> str:
+    # Get symbol table and dependencies taking into account source priority and exported symbols,
+    # and prefix internally linked declarations/references when more than 1 translation unit since
+    # there can be name collisions between translation units.
+    asts = get_asts(
+        compile_commands,
+        valid_paths=source_priority,
+        prefix_internally_linked=(
+            True if source_priority is not None and len(source_priority) > 1 else False
+        ),
+    )
     symbols, dependencies = get_symbols_and_dependencies(asts, source_priority, export_symbols)
     logger.info(f"Found {len(symbols)} symbols in {compile_commands}!")
 
@@ -59,12 +75,7 @@ def init(
             continue
         symbol_code = get_cursor_code(symbols[symbol_name].cursor, pretty_print=pretty_print)
         sources.append(symbol_code)
-
-    # Create initial outputs
-    crate.rust_src_path.parent.mkdir(exist_ok=True, parents=True)
-    crate.rust_src_path.with_suffix(".c").write_text(
-        "\n".join(includes) + "\n\n" + "\n\n".join(sources)
-    )
+    return "\n".join(includes) + "\n\n" + "\n\n".join(sources)
 
 
 def get_symbols_and_dependencies(
@@ -104,6 +115,7 @@ def get_includes(symbols: dict[str, Symbol]) -> set[str]:
             tu_path = str(Path(tu.spelling).resolve())
             inclusion_source_path = str(Path(inclusion.source.name).resolve())
             inclusion_include_path = str(Path(inclusion.include.name).resolve())
+            # FIXME: Use is_in_system_header? Inclusion locations are always false though.
             if (os.path.commonprefix((tu_path, inclusion_source_path)) != "/") and (
                 os.path.commonprefix((tu_path, inclusion_include_path)) == "/"
             ):
@@ -115,15 +127,54 @@ def get_includes(symbols: dict[str, Symbol]) -> set[str]:
     return includes
 
 
-def get_asts(filename: Path, valid_paths: list[Path] | None = None) -> list[TreeResult]:
-    assert filename.name == "compile_commands.json"
-    db = CompilationDatabase.fromDirectory(filename.parent)
+def get_asts(
+    compile_commands: Path,
+    valid_paths: list[Path] | None = None,
+    prefix_internally_linked: bool = False,
+) -> list[TreeResult]:
+    assert compile_commands.name == "compile_commands.json"
+    db = CompilationDatabase.fromDirectory(compile_commands.parent)
     cmds = db.getAllCompileCommands()
-    tus = [TranslationUnit.from_source(None, args=list(cmd.arguments)) for cmd in cmds]
-    if valid_paths is not None:
-        tus = [tu for tu in tus if Path(tu.cursor.spelling) in valid_paths]
-    asts = [extract_info_c(tu) for tu in tus]
+    assert cmds is not None
+    asts = []
+    for cmd in cmds:
+        tu = TranslationUnit.from_source(None, args=list(cmd.arguments))
+        if prefix_internally_linked:
+            # FIXME: It would be nicer to add a prefix to only those symbols that collide but we
+            #        cannot know that until symbol merge time.
+            tu = add_prefix_to_internally_linked_cursors(tu, compile_commands)
+        assert tu.cursor is not None
+        if valid_paths is None or Path(tu.cursor.spelling) in valid_paths:
+            ast = extract_info_c(tu)
+            asts.append(ast)
     return asts
+
+
+def add_prefix_to_internally_linked_cursors(
+    tu: TranslationUnit,
+    compile_commands: Path,
+) -> TranslationUnit:
+    assert tu.cursor is not None
+    cursors = get_internally_linked_cursors(tu.cursor)
+
+    # Prefix internally-linked declarations using TU stem
+    # FIXME: TU stem isn't guaranteed to be a non-clashing since folder1/stem.c
+    #        and folder2/stem.c will produce same prefix.
+    source = Path(tu.spelling)
+    prefix = source.stem + "_"
+    renames = {cursor.spelling: prefix + cursor.spelling for cursor in cursors}
+
+    # XXX: This is an in-place rename! Would be nice to have a context manager that can automatically
+    #      restore the contents of the file. We need an in-place rename because downstream code may
+    #      use tu.cursor.spelling which needs to point to a valid file.
+    source_bytes = source.read_bytes()
+    try:
+        clang_rename_(source, renames, compile_commands=compile_commands)
+        tu.reparse()
+    finally:
+        source.write_bytes(source_bytes)
+
+    return tu
 
 
 def filter_symbols(
@@ -136,11 +187,8 @@ def filter_symbols(
     filtered_symbols = {}
     for name, symbol in symbols.items():
         # Ignore "system" symbols
-        if filter_system:
-            tu_path = Path(symbol.cursor.translation_unit.spelling).resolve()
-            sym_path = Path(symbol.cursor.location.file.name).resolve()
-            if os.path.commonprefix([str(tu_path), str(sym_path)]) == "/":
-                continue
+        if filter_system and symbol.cursor.location.is_in_system_header:
+            continue
 
         # Ignore "tag definitions" that are contained with in other symbols like:
         #   typedef enum name { value } name;
@@ -148,9 +196,9 @@ def filter_symbols(
         if filter_tag_definitions:
             children = list(symbol.cursor.get_children())
             if (
-                symbol.cursor.kind == CursorKind.TYPEDEF_DECL  # type: ignore[reportAttributeAccessIssue]
+                symbol.cursor.kind == CursorKind.TYPEDEF_DECL
                 and len(children) == 1
-                and children[0].kind != CursorKind.TYPE_REF  # type: ignore[reportAttributeAccessIssue]
+                and children[0].kind != CursorKind.TYPE_REF
             ):
                 contained_name = children[0].get_usr()
                 filtered_symbols.pop(contained_name, None)
@@ -158,14 +206,14 @@ def filter_symbols(
         # Filter function declarations
         if filter_function_declarations:
             if (
-                symbol.cursor.kind == CursorKind.FUNCTION_DECL  # type: ignore[reportAttributeAccessIssue]
+                symbol.cursor.kind == CursorKind.FUNCTION_DECL
                 and not symbol.cursor.is_definition()
             ):
                 continue
 
         # Filter enum constants since they should be contained with an ENUM_DECL
         if filter_enum_constants:
-            if symbol.cursor.kind == CursorKind.ENUM_CONSTANT_DECL:  # type: ignore[reportAttributeAccessIssue]
+            if symbol.cursor.kind == CursorKind.ENUM_CONSTANT_DECL:
                 continue
 
         filtered_symbols[name] = symbols[name]
@@ -282,7 +330,23 @@ def c14n_symbol_name(name: str, symbols: dict[str, Symbol]):
 @hydra.main(version_base=None, config_name="init")
 def main(cfg: InitConfig) -> None:
     output_dir = Path(HydraConfig.get().runtime.output_dir)
-    crate = get_info_from_cargo_toml(output_dir / "Cargo.toml")
+
+    # Initialize crate
+    crate = Crate(
+        cargo_toml=output_dir / "Cargo.toml",
+        type=cfg.crate_type,  # type: ignore[reportArgumentType]
+        vcs=cfg.vcs,  # type: ignore[reportArgumentType]
+    )
+    commit_msg = f"Consolidated `{crate.root_package['name']}` C code\n"
+    commit_msg += f"Running ideas.init with args:\n\n{sys.argv}\n\n"
+    crate.add(crate.cargo_toml)
+    commit_msg += f"Created {crate.root_package['name']} crate\n\n"
+
+    crate.cargo_add(dep="openssl@0.10.75")
+    if cfg.crate_type == "lib":
+        with crate.cargo_toml.open("a") as f:
+            f.write('\n[lib]\ncrate-type = ["lib", "cdylib"]\n')
+        crate.invalidate_metadata()
 
     export_symbols = None
     if isinstance(cfg.export_symbols, Path):
@@ -294,14 +358,23 @@ def main(cfg: InitConfig) -> None:
             Path(path).resolve() for path in cfg.source_priority.read_text().splitlines()
         ]
 
-    init(
+    output = init(
         cfg.filename,
-        crate,
         export_symbols=export_symbols,
         source_priority=source_priority,
         pretty_print=cfg.pretty_print,
     )
     logger.info(f"Prepared translation in {output_dir}")
+
+    # Create initial outputs
+    crate.rust_src_path.parent.mkdir(exist_ok=True, parents=True)
+    crate.rust_src_path.with_suffix(".c").write_text(output)
+
+    # Commit initial outputs
+    crate.add(crate.rust_src_path.with_suffix(".c"))
+    if (output_subdir := HydraConfig.get().output_subdir) is not None:
+        crate.add(output_dir / output_subdir)
+    crate.commit(commit_msg)
 
 
 if __name__ == "__main__":

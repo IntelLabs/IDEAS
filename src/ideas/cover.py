@@ -13,8 +13,6 @@ from litellm.exceptions import ContextWindowExceededError
 import dspy
 from dspy.predict.react import _fmt_exc
 
-from ideas import ensure_no_mangle_in_module
-
 logger = logging.getLogger(__name__)
 
 
@@ -26,14 +24,12 @@ class CoVeR(dspy.Module):
         success: str = "Success!",
         max_iters: int = 5,
         use_raw_fixer_output: bool = True,
-        patch_no_mangle: bool = True,
     ):
         super().__init__()
         self.signature = signature = dspy.ensure_signature(signature)  # type: ignore
         self.success = success
         self.max_iters = max_iters
         self.use_raw_fixer_output = use_raw_fixer_output
-        self.patch_no_mangle = patch_no_mangle
 
         if len(tools) == 0:
             raise ValueError("Need at least one valid dspy.Tool!")
@@ -86,13 +82,7 @@ class CoVeR(dspy.Module):
             .append("next_thought", dspy.OutputField(), type_=str)
         )
 
-        fallback_signature = dspy.Signature(
-            {**signature.input_fields, **signature.output_fields},  # type: ignore
-            signature.instructions,
-        ).append("trajectory", dspy.InputField(), type_=str)
-
         self.cover = dspy.Predict(self.cover_signature)
-        self.extract = dspy.ChainOfThought(fallback_signature)
 
     def _format_trajectory(self, trajectory: dict[str, Any]):
         adapter = dspy.settings.adapter or dspy.ChatAdapter()
@@ -102,6 +92,7 @@ class CoVeR(dspy.Module):
     def forward(self, **input_args):
         trajectory = {}
         max_iters = input_args.pop("max_iters", self.max_iters)
+        prediction = None
         for idx in range(max_iters):
             try:
                 pred = self._call_with_potential_trajectory_truncation(
@@ -114,13 +105,6 @@ class CoVeR(dspy.Module):
                 break
 
             assert pred is not None, "Prediction should not be None!"
-
-            # Patch #[no_mangle] -> #[unsafe(no_mangle)] for all Rust code outputs
-            # But do not add the attribute if it does not exist
-            if self.patch_no_mangle:
-                for key, value in self.cover_signature.output_fields.items():
-                    if isinstance(value.annotation, dspy.Code["Rust"].__class__):
-                        pred[key].code = ensure_no_mangle_in_module(pred[key].code, add=False)
 
             trajectory[f"thought_{idx}"] = pred.next_thought  # type: ignore
             tool_names, tool_args, observations = [], [], []
@@ -135,10 +119,10 @@ class CoVeR(dspy.Module):
 
                 observations.append(feedback)
 
+            prediction = dspy.Prediction(trajectory=trajectory, **pred)
             if self.success in observations:
                 if self.use_raw_fixer_output:
                     # Return exactly the output that sucessfully satisfies the tools
-                    prediction = dspy.Prediction(trajectory=trajectory, **pred)
                     return prediction
                 break
 
@@ -147,10 +131,9 @@ class CoVeR(dspy.Module):
             trajectory[f"tool_args_{idx}"] = "\n\n".join(tool_args)
             trajectory[f"observation_{idx}"] = "\n\n".join(observations)
 
-        extract = self._call_with_potential_trajectory_truncation(
-            self.extract, trajectory, **input_args
-        )
-        prediction = dspy.Prediction(trajectory=trajectory, **extract)
+        # Return the last failed prediction if max_iters reached
+        if prediction is None:
+            raise RuntimeError("No prediction was made during the forward pass!")
         return prediction
 
     def _call_with_potential_trajectory_truncation(

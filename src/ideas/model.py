@@ -15,6 +15,7 @@ from hydra.core.config_store import ConfigStore
 class ModelConfig:
     name: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
     cache: bool = False
+    text_output: bool = True
     revision: str | None = None
     base_url: str | None = None
     api_key: str | None = None
@@ -56,6 +57,12 @@ def get_lm(model: ModelConfig, generate: GenerateConfig) -> dspy.LM:
             provider["max_price"] = {"prompt": 0.5, "completion": 2}
 
         lm.kwargs["provider"] = provider  # type: ignore[reportArgumentType]
+
+        # Mask and/or disable reasoning if desired and possible
+        if model.text_output:
+            lm.kwargs["reasoning"] = {"exclude": True}  # type: ignore[reportArgumentType]
+            if model.name.startswith("openrouter/x-ai"):
+                lm.kwargs["reasoning"].update({"effort": "none"})  # type: ignore[reportArgumentType]
 
     return lm
 
