@@ -4,13 +4,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import os
 import json
 from json import loads as js_loads
-from dataclasses import dataclass
 
 import logging
 import subprocess
-from typing import Any
+from functools import cached_property
+from typing import Any, Literal
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
@@ -22,12 +23,175 @@ logger = logging.getLogger("ideas.tools")
 DEFAULT_TEST_TIMEOUT = 10.0  # seconds
 
 
-@dataclass
 class Crate:
-    cargo_toml: Path
-    rust_src_path: Path
-    root_package: dict[str, Any]
-    is_bin: bool
+    def __init__(
+        self,
+        cargo_toml: Path,
+        vcs: Literal["none", "git"] = "none",
+        type: Literal["bin", "lib"] | None = None,
+    ):
+        self.cargo_toml: Path = cargo_toml
+        self.vcs = vcs
+
+        if not self.cargo_toml.exists():
+            # Create a new crate with specified type, but without VCS
+            crate_dir = self.cargo_toml.parent
+            if not type:
+                raise ValueError(
+                    f"Crate at {crate_dir} does not exist; type must be specified!"
+                )
+            os.makedirs(crate_dir, exist_ok=True)
+            success, output = run_subprocess(
+                [
+                    "cargo",
+                    "init",
+                    "--quiet",
+                    f"--{type}",
+                    "--vcs=none",
+                    str(crate_dir),
+                ]
+            )
+            if not success:
+                raise RuntimeError(
+                    f"Failed to create new crate at {crate_dir} with error:\n\n{output}"
+                )
+
+        # Initialize repository
+        if self.vcs == "git":
+            ok, out = self.git("rev-parse --abbrev-ref HEAD")
+            if not ok:
+                ok, out = self.git("init --initial-branch=main")
+            if not ok:
+                raise ValueError(
+                    f"Failed to initialize git in {self.cargo_toml.parent}!\n{out}"
+                )
+
+    @cached_property
+    def metadata(self) -> dict[str, Any]:
+        success, out = run_subprocess(
+            ["cargo", "metadata", "--manifest-path", str(self.cargo_toml)],
+        )
+        if not success:
+            raise ValueError(f"Failed to get cargo metadata from {self.cargo_toml}!\n{out}")
+        metadata = json.loads(out)
+        return metadata
+
+    def invalidate_metadata(self) -> None:
+        if "metadata" in self.__dict__:
+            del self.metadata
+
+    @property
+    def root_package(self) -> dict[str, Any]:
+        root = self.metadata["resolve"]["root"]
+        if root is None:
+            if len(self.metadata["workspace_members"]) != 1:
+                raise ValueError("No root package specified!")
+            root = self.metadata["workspace_members"][0]
+
+        root_package = next(filter(lambda p: p["id"] == root, self.metadata["packages"]))
+        return root_package
+
+    @property
+    def bin_targets(self) -> list[dict[str, Any]]:
+        return list(filter(lambda t: "bin" in t["kind"], self.root_package["targets"]))
+
+    @property
+    def lib_targets(self) -> list[dict[str, Any]]:
+        return list(filter(lambda t: "lib" in t["kind"], self.root_package["targets"]))
+
+    @property
+    def is_bin(self) -> bool:
+        if len(self.bin_targets) == 1 and len(self.lib_targets) == 0:
+            is_bin = True
+        elif len(self.bin_targets) == 0 and len(self.lib_targets) == 1:
+            is_bin = False
+        else:
+            raise ValueError(
+                f"Unhandled bin/lib targets configuration in Cargo.toml: {self.bin_targets=} {self.lib_targets=}"
+            )
+        return is_bin
+
+    @property
+    def rust_src_path(self) -> Path:
+        if len(self.bin_targets) == 1 and len(self.lib_targets) == 0:
+            rust_src_path = Path(self.bin_targets[0]["src_path"])
+        elif len(self.bin_targets) == 0 and len(self.lib_targets) == 1:
+            rust_src_path = Path(self.lib_targets[0]["src_path"])
+        else:
+            raise ValueError(
+                f"Unhandled bin/lib targets configuration in Cargo.toml: {self.bin_targets=} {self.lib_targets=}"
+            )
+        return rust_src_path
+
+    def cargo_add(self, dep: str, section: str | None = None) -> str:
+        cmd = [
+            "cargo",
+            "add",
+            "--quiet",
+            f"--manifest-path={self.cargo_toml}",
+        ]
+        if section:
+            cmd.append(f"--{section}")
+        cmd.append(dep)
+
+        success, output = run_subprocess(cmd)
+        if not success:
+            raise RuntimeError(
+                f"Failed to add dependency {dep} to {self.cargo_toml} with error:\n\n{output}"
+            )
+
+        # Invalidate cached metadata
+        self.invalidate_metadata()
+        return output
+
+    def cargo_build(self, allow_unsafe: bool = False) -> tuple[bool, str]:
+        env = os.environ.copy()
+        # Disallow unsafe by default; allow when explicitly requested
+        if not allow_unsafe:
+            env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " -D unsafe-code").strip()
+        return run_subprocess(
+            [
+                "cargo",
+                "build",
+                "--quiet",
+                "--color=never",
+                f"--manifest-path={self.cargo_toml}",
+            ],
+            env=env,
+        )
+
+    def add(self, *paths: Path) -> bool:
+        if self.vcs != "git":
+            return True
+
+        ok = True
+        for path in paths:
+            ok, out = self.git(f"add {path}")
+            if not ok:
+                raise ValueError(f"Failed to add {path}!\n{out}")
+        return ok
+
+    def commit(self, message: str = "") -> bool:
+        if self.vcs != "git":
+            return True
+
+        ok, out = self.git("commit --allow-empty -F -", input=message)
+        if not ok:
+            raise ValueError(f"Failed to commit changes to git!\n{out}")
+        return ok
+
+    def git(self, cmd, *args, **kwargs) -> tuple[bool, str]:
+        if self.vcs != "git":
+            return True, ""
+
+        repo_dir = self.cargo_toml.parent
+        return run_subprocess(["git", "-C", str(repo_dir), *cmd.split(" "), *args], **kwargs)
+
+    def write(self, path: Path, data, **kwargs):
+        if path.is_absolute():
+            raise ValueError("path must not be absolute")
+        path = self.cargo_toml.parent / path
+        return path.write_text(data, **kwargs)
 
 
 def run_subprocess(
@@ -54,7 +218,7 @@ def run_subprocess(
 def compile_c(
     source_file: str, output_file: str, flags: list[str] | None = None
 ) -> tuple[bool, str]:
-    cmd = ["clang"]
+    cmd = ["clang-21"]
 
     if flags:
         cmd.extend(flags)
@@ -72,7 +236,7 @@ def check_c(
     *,
     flags: list[str] | None = None,
 ) -> tuple[bool, str]:
-    cmd = ["clang"]
+    cmd = ["clang-21"]
 
     if flags:
         cmd.extend(flags)
@@ -125,41 +289,6 @@ def check_rust(
         cmd.extend(["-", "--out-dir", dirname])
 
     return run_subprocess(cmd, input=code)
-
-
-def get_info_from_cargo_toml(cargo_toml: Path) -> Crate:
-    # Extract root package metadata from Cargo.toml
-    out = subprocess.run(
-        ["cargo", "metadata", "--manifest-path", cargo_toml], text=True, capture_output=True
-    )
-    if out.returncode != 0:
-        raise ValueError(f"Failed to get cargo metadata from {cargo_toml}!\n{out.stderr}")
-    metadata = json.loads(out.stdout)
-    root = metadata["resolve"]["root"]
-    if root is None:
-        raise ValueError("No root package specified!")
-    root_package = next(filter(lambda p: p["id"] == root, metadata["packages"]))
-
-    # Get rust source path for bin or lib
-    bin_targets = list(filter(lambda t: "bin" in t["kind"], root_package["targets"]))
-    lib_targets = list(filter(lambda t: "lib" in t["kind"], root_package["targets"]))
-    if len(bin_targets) == 1 and len(lib_targets) == 0:
-        rust_src_path = Path(bin_targets[0]["src_path"])
-        is_bin = True
-    elif len(bin_targets) == 0 and len(lib_targets) == 1:
-        rust_src_path = Path(lib_targets[0]["src_path"])
-        is_bin = False
-    else:
-        raise ValueError(
-            f"Unhandled bin/lib targets configuration in Cargo.toml: {bin_targets=} {lib_targets=}"
-        )
-
-    return Crate(
-        cargo_toml=cargo_toml,
-        rust_src_path=rust_src_path,
-        root_package=root_package,
-        is_bin=is_bin,
-    )
 
 
 def run_clippy(
@@ -274,3 +403,18 @@ def run_and_check_tests(
     for test_case in test_cases:
         success += 1 if run_and_check_test(executable, test_case, timeout=timeout) else 0
     return success
+
+
+def clang_rename_(source: Path, renames: dict[str, str], compile_commands: Path | None = None):
+    for name, new_name in renames.items():
+        logger.info(f"{source}: renaming `{name}` to `{new_name}`")
+        cmd = ["clang-refactor-21", "local-rename"]
+        if compile_commands is not None:
+            cmd.append(f"-p={str(compile_commands.absolute())}")
+        cmd.append(f"--old-qualified-name={name}")
+        cmd.append(f"--new-qualified-name={new_name}")
+        cmd.append("-i")
+        cmd.append(str(source))
+        success, output = run_subprocess(cmd)
+        if not success:
+            raise ValueError(f"`{' '.join(cmd)}` failed!\n{output}")

@@ -10,7 +10,7 @@ import pytest
 import subprocess
 from pathlib import Path
 
-from ideas import convert_tests
+from ideas import convert_tests, tools
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def test_convert_to_cargo_test(
 
     # Temporarily redirect stdout
     with contextlib.redirect_stdout(captured_output):
-        convert_tests.convert_tests_for_exec(json_test_cases)
+        convert_tests.convert_tests_for_exec(json_test_cases, tools.Crate(cargo_toml))
 
     # Write the captured Rust code to a fresh tests/test_cases.rs
     original_harness = rust_tests_harness.read_text()

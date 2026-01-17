@@ -6,11 +6,10 @@
 
 from .logging import JSONFormatter, CodePairFilter
 from .ast import create_translation_unit, extract_info_c, TreeResult
-from .ast_rust import ensure_no_mangle_in_module
-from .ltu import build_unit
 from .model import ModelConfig, GenerateConfig
-from .agents import TranslateAgent
-from .tools import get_info_from_cargo_toml
+from .translate_recurrent import RecurrentTranslator
+from .translate_symbol import SymbolTranslator
+from clang.cindex import Config
 
 __version__ = "2025.10"
 
@@ -18,12 +17,13 @@ __all__ = [
     "create_translation_unit",
     "extract_info_c",
     "TreeResult",
-    "ensure_no_mangle_in_module",
     "ModelConfig",
     "GenerateConfig",
     "JSONFormatter",
     "CodePairFilter",
-    "build_unit",
-    "TranslateAgent",
-    "get_info_from_cargo_toml",
+    "RecurrentTranslator",
+    "SymbolTranslator",
 ]
+
+# NOTE: .so is *nix specific
+Config.set_library_file("libclang-21.so")

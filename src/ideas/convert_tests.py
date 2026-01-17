@@ -47,6 +47,8 @@ import json
 import argparse
 from pathlib import Path
 
+from .tools import Crate
+
 
 def to_rust_str(string):
     return '"' + repr(string)[1:-1] + '"'
@@ -57,10 +59,15 @@ def is_bin_test(test_case: Path):
     return "lib_state_in" not in test_case_json and "lib_state_out" not in test_case_json
 
 
-def convert_tests_for_exec(test_cases: list[Path], timeout: int = 60000):
+def convert_tests_for_exec(test_cases: list[Path], crate: Crate, timeout: int = 60000):
     test_cases = list(filter(is_bin_test, test_cases))
     if len(test_cases) == 0:
         return
+
+    # Add test dependencies
+    crate.cargo_add(dep="assert_cmd@2.0.17", section="dev")
+    crate.cargo_add(dep="ntest@0.9.3", section="dev")
+    crate.cargo_add(dep="predicates@3.1.3", section="dev")
 
     print("use assert_cmd::Command;")
     print("use ntest::timeout;")
@@ -141,7 +148,11 @@ def is_lib_test(test_case: Path):
 
 
 def convert_tests_for_lib(
-    test_cases: list[Path], template_path: Path | None, timeout: int = 60000
+    test_cases: list[Path],
+    crate: Crate,
+    runner_manifest: Path | None,
+    template_path: Path | None,
+    timeout: int = 60000,
 ):
     raise ValueError("Library test conversion not implemented yet!")
 
@@ -152,13 +163,22 @@ if __name__ == "__main__":
         "test_vectors", type=Path, nargs="+", help="Path(s) to JSON test vector(s)"
     )
     parser.add_argument(
+        "--crate_manifest", type=Path, help="Path to the crate manifest", required=True
+    )
+    parser.add_argument(
+        "--runner_manifest", type=Path, help="Path to the runner manifest", required=False
+    )
+    parser.add_argument(
         "--template", type=Path, help="Path to Rust test template", required=False
     )
     parser.add_argument(
-        "--timeout", type=int, help="Timeout for each test in milliseconds", default=60000
+        "--timeout", type=int, help="Timeout for each test in milliseconds", default=600000
     )
     args = parser.parse_args()
 
     test_vectors = [Path(path) for path in args.test_vectors]
-    convert_tests_for_exec(test_vectors, args.timeout)
-    convert_tests_for_lib(test_vectors, args.template, args.timeout)
+    crate = Crate(cargo_toml=args.crate_manifest)
+    convert_tests_for_exec(test_vectors, crate, args.timeout)
+    convert_tests_for_lib(
+        test_vectors, crate, args.runner_manifest, args.template, args.timeout
+    )
