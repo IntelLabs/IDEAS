@@ -149,16 +149,25 @@ class Crate:
         # Disallow unsafe by default; allow when explicitly requested
         if not allow_unsafe:
             env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " -D unsafe-code").strip()
-        return run_subprocess(
-            [
-                "cargo",
-                "build",
-                "--quiet",
-                "--color=never",
-                f"--manifest-path={self.cargo_toml}",
-            ],
-            env=env,
-        )
+
+        cmd = [
+            "cargo",
+            "build",
+            "--quiet",
+            "--color=never",
+            f"--manifest-path={self.cargo_toml}",
+        ]
+        builds, output = run_subprocess(cmd, env=env)
+
+        # Work around E0601 error "No main function was found in a binary crate."
+        if "error[E0601]" in output:
+            rust_src = self.rust_src_path.read_text()
+            with self.rust_src_path.open("a") as f:
+                f.write('fn main() {\n    println!("Hello, world!");\n}\n')
+            builds, output = run_subprocess(cmd, env=env)
+            self.rust_src_path.write_text(rust_src)
+
+        return builds, output
 
     def add(self, *paths: Path) -> bool:
         if self.vcs != "git":

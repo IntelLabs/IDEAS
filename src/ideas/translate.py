@@ -15,7 +15,7 @@ from clang.cindex import TranslationUnit
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 
-from ideas import model, ModelConfig, GenerateConfig
+from ideas import adapters, model, ModelConfig, GenerateConfig
 from ideas import SymbolTranslator, RecurrentTranslator
 from ideas import extract_info_c
 from .init import get_symbols_and_dependencies
@@ -47,6 +47,7 @@ def main(cfg: TranslateConfig) -> None:
     crate = Crate(cargo_toml=output_dir / "Cargo.toml", vcs=cfg.vcs)  # type: ignore[reportArgumentType]
 
     model.configure(cfg.model, cfg.generate)
+    dspy.configure(adapter=adapters.ChatAdapter())
     translator = getattr(dspy, cfg.translator)
     symbol_translator = SymbolTranslator(translator, crate, cfg.max_iters)
     agent = RecurrentTranslator(symbol_translator)

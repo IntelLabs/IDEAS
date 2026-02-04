@@ -7,7 +7,7 @@
 import re
 import logging
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from dataclasses import dataclass, field
 
 import dspy
@@ -16,10 +16,13 @@ from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 
-from ideas import model, ModelConfig, GenerateConfig
-from ideas.tools import Crate, run_subprocess
+from ideas import adapters, model, ModelConfig, GenerateConfig
+from ideas.tools import Crate, check_rust, run_subprocess
+from ideas.adapters import Code
+from ideas.ast_rust import validate_changes
 
 logger = logging.getLogger("ideas.wrapper")
+CodeRust = Code["rust"]
 
 
 @dataclass
@@ -49,15 +52,19 @@ class Signature(dspy.Signature):
     After this conversion, the wrapper should call the Rust function `crate::{symbol_name}`.
     After the call to `crate::{symbol_name}`, the wrapper should convert back the `crate::` types to `crate::wrapper::` types.
     The wrapper will be written to "{wrapper_path}".
-    Use the feedback, if provided, from `cargo build` about the `prior_wrapper` when generating the wrapper.
+    You will receive feedback about a `prior_wrapper` attempt that should be fixed, if any.
+    Use the `build_feedback` from `cargo build` about possible build errors.
+    Use the `scope_feedback` about possible deviations from the templated `example_wrapper`.
     """
 
     # FIXME: Move crate and example_wrapper into instructions?
-    crate: dspy.Code["Rust"] = dspy.InputField()  # noqa: F821
-    example_wrapper: dspy.Code["Rust"] = dspy.InputField()  # noqa: F821
-    wrapper: dspy.Code["Rust"] = dspy.OutputField()  # noqa: F821
-    prior_wrapper: dspy.Code["Rust"] = dspy.InputField()  # noqa: F821
-    feedback: str = dspy.InputField()
+    crate: CodeRust = dspy.InputField()
+    example_wrapper: CodeRust = dspy.InputField()
+    prior_wrapper: CodeRust = dspy.InputField()
+    build_feedback: str = dspy.InputField()
+    scope_feedback: str = dspy.InputField()
+
+    wrapper: CodeRust = dspy.OutputField()
 
 
 class WrapperGenerator(dspy.Module):
@@ -99,15 +106,6 @@ class WrapperGenerator(dspy.Module):
         unimplemented_wrapper = self.generate_unimplemented_wrapper(symbol_name)
         symbol_wrapper_path.write_text(unimplemented_wrapper)
 
-        # Replace lines containing "unimplemented!()" with ".*". Note the triple-backslashes
-        # are due to re.escape turning "(" into "\(".
-        allowed_changes = re.sub(
-            r"^.* unimplemented!\\\(\\\);.*$",
-            r".*",
-            re.escape(unimplemented_wrapper),
-            flags=re.MULTILINE,
-        )
-
         # Generate dynamic signature and module for symbol
         signature = Signature.with_instructions(
             Signature.instructions.format(
@@ -120,40 +118,46 @@ class WrapperGenerator(dspy.Module):
 
         # Try generating wrapper up to max_iter times
         code = self.crate.rust_src_path.read_text()
-        wrapper, success, feedback = "", False, ""
+        wrapper, success, build_feedback = "", False, ""
+        scope_feedback: OrderedDict[str, str] = OrderedDict()
         for i in range(max_iters):
             pred = generate_wrapper(
-                crate=code,
-                example_wrapper=unimplemented_wrapper,
-                feedback=feedback,
-                prior_wrapper=wrapper,
+                crate=CodeRust(code=code),
+                example_wrapper=CodeRust(code=unimplemented_wrapper),
+                prior_wrapper=CodeRust(code=wrapper),
+                build_feedback=build_feedback,
+                scope_feedback="\n\n".join(scope_feedback.values()),
             )
+            # Reset scope feedback
+            scope_feedback.clear()
 
             if pred.wrapper is None:
-                feedback = "No wrapper was generated. You must respect the template and instructions **exactly**!"
-                continue
-            wrapper = pred.wrapper.code
-
-            # Enforce only function body changes
-            if re.match(f"^{allowed_changes}$", wrapper, flags=re.DOTALL) is None:
-                feedback = (
-                    "The generated wrapper modifies parts outside the function body."
-                    "You must **only** modify the `unimplemented!()` function body and leave everything else **unchanged**!"
+                scope_feedback["no_wrapper"] = (
+                    "No wrapper was generated. You must respect the template and instructions **exactly**!"
                 )
-                continue
+                wrapper = unimplemented_wrapper
+            else:
+                wrapper = pred.wrapper.code
+                # Validate that changes are in scope
+                scope_feedback.update(validate_changes(wrapper, unimplemented_wrapper))
+
+                # TODO: Check for a single crate function call in scope
 
             # Write wrapper to disk and check if we build with unsafe code since wrappers can use unsafe code
             symbol_wrapper_path.write_text(wrapper)
             self.crate.add(self.crate.rust_src_path, self.wrapper_path, symbol_wrapper_path)
-            success, feedback = self.crate.cargo_build(allow_unsafe=True)
-            if success:
+            success, build_feedback = self.crate.cargo_build(allow_unsafe=True)
+            if success and not build_feedback and not scope_feedback:
                 self.crate.commit(
                     f"Wrapped symbol `{symbol_name}`\n\n# Reasoning\n{pred.reasoning}"
                 )
                 break
 
             self.crate.commit(
-                f"Failed to wrap symbol `{symbol_name}` ({i + 1}/{max_iters})!\n\n# Reasoning\n{pred.reasoning}\n\n# Feedback\n{feedback}"
+                f"Failed to wrap symbol `{symbol_name}` ({i + 1}/{max_iters})!\n\n"
+                f"# Reasoning\n{pred.reasoning}\n\n"
+                f"# Build feedback\n{build_feedback}\n\n"
+                f"# Scope Feedback\n{scope_feedback}"
             )
         else:
             logger.warning(f"Wrapper generation failed after {max_iters} feedback iterations!")
@@ -195,7 +199,17 @@ class WrapperGenerator(dspy.Module):
         )
         if unimplemented_wrapper == bindgen_wrapper:
             raise ValueError("Failed to convert bindgen to valid wrapper!")
-        return unimplemented_wrapper.rstrip()
+        unimplemented_wrapper = unimplemented_wrapper.rstrip()
+
+        # Validate the template
+        success, output = check_rust(
+            unimplemented_wrapper, flags=["--crate-type", "lib", "--emit", "metadata"]
+        )
+        if not success:
+            raise ValueError(
+                f"Invalid template for the wrapper: {unimplemented_wrapper}\n\nBuild error:\n{output}"
+            )
+        return unimplemented_wrapper
 
 
 @hydra.main(version_base=None, config_name="wrapper")
@@ -206,6 +220,7 @@ def main(cfg: WrapperConfig) -> None:
     crate = Crate(cargo_toml=cfg.cargo_toml.resolve(), vcs=cfg.vcs)  # type: ignore[reportArgumentType]
 
     model.configure(cfg.model, cfg.generate)
+    dspy.configure(adapter=adapters.ChatAdapter())
     agent = WrapperGenerator(crate, max_iters=cfg.max_iters)
     wrappers: dict[Path, list[str]] = defaultdict(list)
 

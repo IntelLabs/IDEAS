@@ -17,10 +17,11 @@ from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 from clang.cindex import CompilationDatabase, TranslationUnit, CursorKind
+from clang.cindex import Rewriter, TokenKind, SourceRange
 
 from .ast import get_cursor_code, extract_info_c, TreeResult, get_internally_linked_cursors
 from .utils import Symbol
-from .tools import Crate, clang_rename_
+from .tools import Crate, clang_rename_, check_c
 
 logger = logging.getLogger("ideas.preprocess")
 
@@ -53,14 +54,12 @@ def init(
     pretty_print: bool = True,
 ) -> str:
     # Get symbol table and dependencies taking into account source priority and exported symbols,
-    # and prefix internally linked declarations/references when more than 1 translation unit since
-    # there can be name collisions between translation units.
+    # and prefix internally linked declarations/references since there can be name collisions
+    # between translation units.
     asts = get_asts(
         compile_commands,
         valid_paths=source_priority,
-        prefix_internally_linked=(
-            True if source_priority is not None and len(source_priority) > 1 else False
-        ),
+        prefix_internally_linked=False,
     )
     symbols, dependencies = get_symbols_and_dependencies(asts, source_priority, export_symbols)
     logger.info(f"Found {len(symbols)} symbols in {compile_commands}!")
@@ -169,12 +168,39 @@ def add_prefix_to_internally_linked_cursors(
     #      use tu.cursor.spelling which needs to point to a valid file.
     source_bytes = source.read_bytes()
     try:
+        # Remove static visibility from internally-linked cursors
+        remove_static_keyword_(tu)
+
+        # Add prefix to internally-linked declarations
         clang_rename_(source, renames, compile_commands=compile_commands)
         tu.reparse()
     finally:
         source.write_bytes(source_bytes)
 
+    # There should be no more internally linked cursors because we made them externally visible
+    assert len(get_internally_linked_cursors(tu.cursor)) == 0
+
     return tu
+
+
+def remove_static_keyword_(tu: TranslationUnit):
+    assert tu.cursor is not None
+    cursors = get_internally_linked_cursors(tu.cursor)
+
+    rewriter = Rewriter.create(tu)
+    for cursor in cursors:
+        # Find static keyword in cursor tokens
+        tokens = list(cursor.get_tokens())
+        for i, token in enumerate(tokens):
+            if token.kind == TokenKind.KEYWORD and token.spelling == "static":
+                # Use next token's start as end of extent so we capture the spacing between the static
+                # keyword and the next token.
+                extent = SourceRange.from_locations(
+                    token.extent.start,
+                    tokens[i + 1].extent.start if i + 1 < len(tokens) else token.extent.end,
+                )
+                rewriter.remove_text(extent)
+    rewriter.overwrite_changed_files()
 
 
 def filter_symbols(
@@ -337,10 +363,7 @@ def main(cfg: InitConfig) -> None:
         type=cfg.crate_type,  # type: ignore[reportArgumentType]
         vcs=cfg.vcs,  # type: ignore[reportArgumentType]
     )
-    commit_msg = f"Consolidated `{crate.root_package['name']}` C code\n"
-    commit_msg += f"Running ideas.init with args:\n\n{sys.argv}\n\n"
     crate.add(crate.cargo_toml)
-    commit_msg += f"Created {crate.root_package['name']} crate\n\n"
 
     crate.cargo_add(dep="openssl@0.10.75")
     if cfg.crate_type == "lib":
@@ -364,17 +387,29 @@ def main(cfg: InitConfig) -> None:
         source_priority=source_priority,
         pretty_print=cfg.pretty_print,
     )
-    logger.info(f"Prepared translation in {output_dir}")
 
-    # Create initial outputs
+    # Only run preprocess, compile, and assemble steps on C code
+    compiles, compile_errors = check_c(output, flags=["-c"])
+
+    # Write C code to disk
     crate.rust_src_path.parent.mkdir(exist_ok=True, parents=True)
     crate.rust_src_path.with_suffix(".c").write_text(output)
-
-    # Commit initial outputs
     crate.add(crate.rust_src_path.with_suffix(".c"))
+
+    # Add hydra directory
     if (output_subdir := HydraConfig.get().output_subdir) is not None:
         crate.add(output_dir / output_subdir)
-    crate.commit(commit_msg)
+
+    # If the C code didn't compile, then error loudly
+    name = crate.root_package["name"]
+    if not compiles:
+        logger.error(f"Failed to compile `{name}` C code!")
+        crate.commit(
+            f"Failed to compile `{name}` C code!\n\n{' '.join(sys.argv)}\n\n{compile_errors}"
+        )
+        sys.exit(1)
+    logger.info(f"Consolidated `{name}` in {output_dir}")
+    crate.commit(f"Consolidated `{name}`\n\n{' '.join(sys.argv)}")
 
 
 if __name__ == "__main__":
