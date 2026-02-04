@@ -31,7 +31,7 @@ class RecurrentTranslator(dspy.Module):
         for symbol_name in sorted_symbol_names:
             # Ignore tag definitions and function declarations
             if symbol_name not in symbols:
-                logger.warning(f"Skipping `{symbol_name}` ...")
+                logger.warning(f"Skipping symbol `{symbol_name}` ...")
                 continue
 
             symbol = symbols[symbol_name]
@@ -43,10 +43,8 @@ class RecurrentTranslator(dspy.Module):
             ref_translations = "\n\n".join(translations.values())
             dep_symbols = [symbols[name] for name in sorted_symbol_names if name in dep_names]
 
-            logger.info(f"Translating `{symbol_name}` ...")
             pred = self.translate_symbol(ref_translations, symbol, dep_symbols)
             if not pred.success:
-                logger.error(f"Failed to translate `{symbol_name}`!")
                 break
 
             # Save translation if it builds

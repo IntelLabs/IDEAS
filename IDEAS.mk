@@ -21,6 +21,7 @@ endif
 RUSTFLAGS ?= -Awarnings## Ignore Rust compiler warnings
 CARGO_NET_OFFLINE ?= true## Cargo offline mode
 CFLAGS ?= -w## Ignore C compiler warnings
+export EXTRACT_INFO_CMAKE CFLAGS
 
 GIT = git -C ${TRANSLATION_DIR}
 
@@ -34,42 +35,17 @@ endif
 
 
 # cmake
-cmake: build-ninja/build.log
+.PHONY: cmake
+cmake: build-ninja/cmake.log
 
-.PRECIOUS: build-ninja/CMakeCache.txt
-build-ninja/CMakeCache.txt: test_case/CMakeLists.txt ${EXTRACT_INFO_CMAKE}
-	@rm -rf build-ninja
-ifeq ($(wildcard CMakePresets.json),)
-	cmake -S test_case -B build-ninja -G Ninja \
-      -DCMAKE_BUILD_TYPE=Debug \
-      -DCMAKE_C_FLAGS_DEBUG="-g -O0" \
-      -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${EXTRACT_INFO_CMAKE}" \
-      -DCMAKE_C_FLAGS="${CFLAGS}" \
-      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-else
-	cmake -S . --preset test \
-      -DCMAKE_BUILD_TYPE=Debug \
-      -DCMAKE_C_FLAGS_DEBUG="-g -O0" \
-      -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${EXTRACT_INFO_CMAKE}" \
-      -DCMAKE_C_FLAGS="${CFLAGS}" \
-      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-endif
+build-ninja/cmake.log: test_case/CMakeLists.txt ${EXTRACT_INFO_CMAKE}
+	uv run python -m ideas.cmake source_dir=test_case \
+      build_dir=build-ninja
+	@touch $@
 
-.PRECIOUS: build-ninja/compile_commands.json
-build-ninja/compile_commands.json: build-ninja/CMakeCache.txt ;
-
-.PRECIOUS: build-ninja/build.log
-build-ninja/build.log: build-ninja/CMakeCache.txt
-ifeq ($(wildcard CMakePresets.json),)
-	-cmake --build build-ninja --target all 2> $@
-else
-	-cmake --build build-ninja --target all --preset test 2> $@
-endif
-	@find build-ninja -maxdepth 1 -type f -executable | \
-     xargs -I{} sh -c "nm --extern-only {} | \
-                       awk '{if (\$$2 == \"T\") print \$$NF}' | \
-                       grep -v ^_ > {}.symbols"
-
+build-ninja/CMakeCache.txt: build-ninja/cmake.log
+build-ninja/compile_commands.json: build-ninja/cmake.log
+build-ninja/build.log: build-ninja/cmake.log
 
 # init
 .PHONY: init
@@ -87,7 +63,7 @@ ${TRANSLATION_DIR}/.git/config:
 	${GIT} commit --quiet --all --message "Initial commit"
 
 .PRECIOUS: ${TRANSLATION_DIR}/Cargo.toml
-${TRANSLATION_DIR}/Cargo.toml: ${TRANSLATION_DIR}/.git/config
+${TRANSLATION_DIR}/Cargo.toml: | ${TRANSLATION_DIR}/.git/config
 	echo -n "[workspace]\nresolver = \"3\"" > $@
 	${GIT} add Cargo.toml
 	${GIT} commit --quiet --all --message "Created cargo workspace"
@@ -180,16 +156,16 @@ ${TRANSLATION_DIR}/cargo_test.log: ${TRANSLATION_DIR}/build.log $(patsubst %,${T
 .PRECIOUS: ${TRANSLATION_DIR}/%/cargo_test.log
 ${TRANSLATION_DIR}/%/cargo_test.log: ${TRANSLATION_DIR}/%/build.log ${TRANSLATION_DIR}/%/tests/test_cases.rs
 	if [ $$(stat -c %s ${TRANSLATION_DIR}/$*/build.log) = 0 ]; then \
-    cargo test --manifest-path ${TRANSLATION_DIR}/$*/Cargo.toml --test test_cases | tee $@ ; \
-else \
-    find test_vectors -name '*.json' -exec echo "test {} ... FAILED" \; | tee $@ ; \
-fi \
+        cargo test --manifest-path ${TRANSLATION_DIR}/$*/Cargo.toml --test test_cases | tee $@ ; \
+    else \
+        find test_vectors -name '*.json' -exec echo "test {} ... FAILED" \; | tee $@ ; \
+    fi \
 
 .PRECIOUS: ${TRANSLATION_DIR}/%/tests/test_cases.rs
 ${TRANSLATION_DIR}/%/tests/test_cases.rs: | ${TEST_FILES} ${TRANSLATION_DIR}/%/Cargo.toml build-ninja/%.type
 	@mkdir -p $(@D)
-	cargo add --quiet --manifest-path ${TRANSLATION_DIR}/$*/Cargo.toml --dev assert_cmd@2.0.17 ntest@0.9.3 predicates@3.1.3
-	-uv run python -m ideas.convert_tests ${TEST_FILES} --crate_manifest $(realpath ${TRANSLATION_DIR}/$*/Cargo.toml) | rustfmt > $@
+	-uv run python -m ideas.convert_tests --crate_manifest $(realpath ${TRANSLATION_DIR}/$*/Cargo.toml) \
+                                     ${TEST_FILES} | rustfmt > $@
 	${GIT} add $*/Cargo.toml $*/tests/test_cases.rs
 	${GIT} commit --quiet --message "Converted \`$*\` test vectors"
 

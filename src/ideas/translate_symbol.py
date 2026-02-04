@@ -12,9 +12,13 @@ import dspy
 from .tools import Crate
 from .utils import Symbol
 from .ast import get_cursor_code
+from .adapters import Code
 
 
 logger = logging.getLogger("ideas.translate_symbol")
+
+CodeC = Code["c"]
+CodeRust = Code["rust"]
 
 
 class SymbolTranslatorSignature(dspy.Signature):
@@ -34,12 +38,12 @@ class SymbolTranslatorSignature(dspy.Signature):
     Use the `cargo build` feedback about the prior_translation, if provided, when generating the Rust translation.
     """
 
-    reference_code: dspy.Code["Rust"] = dspy.InputField()  # noqa: F821
-    snippet: dspy.Code["C"] = dspy.InputField()  # noqa: F821
-    dependent_code: dspy.Code["C"] = dspy.InputField()  # noqa: F821
-    prior_translation: dspy.Code["Rust"] = dspy.InputField()  # noqa: F821
+    reference_code: CodeRust = dspy.InputField()
+    snippet: CodeC = dspy.InputField()
+    dependent_code: CodeC = dspy.InputField()
+    prior_translation: CodeRust = dspy.InputField()
     feedback: str = dspy.InputField()
-    translation: dspy.Code["Rust"] = dspy.OutputField()  # noqa: F821
+    translation: CodeRust = dspy.OutputField()
 
 
 class SymbolTranslator(dspy.Module):
@@ -65,6 +69,7 @@ class SymbolTranslator(dspy.Module):
         prior_translation: str = "",
         feedback: str = "",
     ) -> dspy.Prediction:
+        logger.info(f"Translating symbol `{symbol.name}` ...")
         snippet = get_cursor_code(symbol.cursor)
         dependent_code = "\n\n".join([get_cursor_code(s.cursor) for s in dependent_symbols])
 
@@ -72,10 +77,10 @@ class SymbolTranslator(dspy.Module):
         for i in range(max(self.max_iters, 1)):
             # Predict symbol translation
             pred = self.translate(
-                reference_code=reference_code,
-                snippet=snippet,
-                dependent_code=dependent_code,
-                prior_translation=prior_translation,
+                reference_code=CodeRust(code=reference_code),
+                snippet=CodeC(code=snippet),
+                dependent_code=CodeC(code=dependent_code),
+                prior_translation=CodeRust(code=prior_translation),
                 feedback=feedback,
             )
 
@@ -84,9 +89,6 @@ class SymbolTranslator(dspy.Module):
             if len(reference_code) > 0:
                 rust_src += reference_code + "\n\n"
             rust_src += pred.translation.code + "\n\n"
-            if self.crate.is_bin and symbol.name != "c:@F@main":
-                # Work around E0601 error
-                rust_src += 'fn main() {\n    println!("Hello, world!");\n}\n'
             self.crate.rust_src_path.write_text(rust_src)
             self.crate.add(self.crate.rust_src_path)
             # FIXME: Add rustfmt and FeedbackException?
@@ -116,9 +118,13 @@ class SymbolTranslator(dspy.Module):
                 self.crate.commit(
                     f"Translated symbol `{symbol.name}`\n\n# Reasoning\n{pred.reasoning}"
                 )
+                logger.info(f"Translated symbol `{symbol.name}`")
                 break
             self.crate.commit(
                 f"Failed to translate symbol `{symbol.name}` ({i + 1}/{self.max_iters})!\n\n# Reasoning\n{pred.reasoning}\n\n# Feedback\n{pred.feedback}"
+            )
+            logger.error(
+                f"Failed to translate symbol `{symbol.name}` ({i + 1}/{self.max_iters})!"
             )
             prior_translation = pred.translation.code
         return pred
