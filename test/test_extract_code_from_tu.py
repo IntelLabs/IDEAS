@@ -7,6 +7,7 @@
 
 import pytest
 from pathlib import Path
+from textwrap import dedent as d
 
 from ideas import ast
 
@@ -28,19 +29,21 @@ def test_all_code_from_tu(i_code: str):
 
     # Check for exact formatting
     assert (
-        result.fn_definitions["c:@F@foo"]
-        == r"""void foo() {
-      int x = 10; int y = 20;
-    // A comment
-    int z = 20;
-
-
-    /* A comment
-    block */
-    if (z > 15) { z += 5;    } else {
-        z -= 5;
-    }
-}""".strip()
+        result.symbols["c:@F@foo"].code
+        == d(
+            """
+            void foo() {
+                int x = 10;
+                int y = 20;
+                int z = 20;
+                if (z > 15) {
+                    z += 5;
+                } else {
+                    z -= 5;
+                }
+            }
+            """
+        ).strip()
     )
 
 
@@ -50,5 +53,12 @@ def test_newline():
     result = ast.extract_info_c(tu)
 
     assert (
-        result.fn_definitions["c:@F@main"] == "int main(int argc, char **argv) { return 0;\r\n}"
+        result.symbols["c:@F@main"].code
+        == d(
+            """
+            int main(int argc, char **argv) {
+                return 0;
+            }
+            """
+        ).strip()
     )

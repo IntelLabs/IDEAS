@@ -26,7 +26,7 @@ export EXTRACT_INFO_CMAKE CFLAGS
 GIT = git -C ${TRANSLATION_DIR}
 
 TEST_FILES := $(realpath $(wildcard test_vectors/*.json))
-TARGETS ?= $(shell find build-ninja -maxdepth 1 -type f -executable -exec basename {} \; | cut -d. -f1 | sed -e "s/^lib//gi")
+TARGETS ?= $(shell [ -d build-ninja ] && find build-ninja -maxdepth 1 -type f -executable -exec basename {} \; | cut -d. -f1 | sed -e "s/^lib//gi")
 ifeq (${TARGETS},)
 ifeq ($(filter cmake clean,$(MAKECMDGOALS)),)
 $(error No TARGETS found! You need to run cmake!)
@@ -39,8 +39,7 @@ endif
 cmake: build-ninja/cmake.log
 
 build-ninja/cmake.log: test_case/CMakeLists.txt ${EXTRACT_INFO_CMAKE}
-	uv run python -m ideas.cmake source_dir=test_case \
-      build_dir=build-ninja
+	uv run python -m ideas.cmake source_dir=test_case build_dir=build-ninja
 	@touch $@
 
 build-ninja/CMakeCache.txt: build-ninja/cmake.log
@@ -53,41 +52,49 @@ init: $(patsubst %,${TRANSLATION_DIR}/%/init,${TARGETS}) ;
 ${TRANSLATION_DIR}/%/init: ${TRANSLATION_DIR}/%/src/lib.c | build-ninja/lib%.so.type ;
 ${TRANSLATION_DIR}/%/init: ${TRANSLATION_DIR}/%/src/main.c | build-ninja/%.type ;
 
-# FIXME: It would be really nice if we could just check out a branch here if the repo already exists and start from there
-.PRECIOUS: ${TRANSLATION_DIR}/.git/config
-${TRANSLATION_DIR}/.git/config:
+# initialize workspace
+.PRECIOUS: ${TRANSLATION_DIR}/Cargo.toml
+${TRANSLATION_DIR}/Cargo.toml:
 	@mkdir -p ${TRANSLATION_DIR}
 	${GIT} init --quiet --initial-branch=main
 	echo "Cargo.lock\ntarget/\n*.log\n*.jsonl" > ${TRANSLATION_DIR}/.gitignore
 	${GIT} add .gitignore
 	${GIT} commit --quiet --all --message "Initial commit"
-
-.PRECIOUS: ${TRANSLATION_DIR}/Cargo.toml
-${TRANSLATION_DIR}/Cargo.toml: | ${TRANSLATION_DIR}/.git/config
 	echo -n "[workspace]\nresolver = \"3\"" > $@
 	${GIT} add Cargo.toml
 	${GIT} commit --quiet --all --message "Created cargo workspace"
 
+# initialize translated crate for each C target
+.PRECIOUS: ${TRANSLATION_DIR}/%/Cargo.toml
+${TRANSLATION_DIR}/%/Cargo.toml: | ${TRANSLATION_DIR}/Cargo.toml build-ninja/lib%.so.type
+	uv run python -m ideas.init.crate crate_type=lib vcs=git \
+                            hydra.output_subdir=.init \
+                            hydra.run.dir=${TRANSLATION_DIR}/$*
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/Cargo.toml
+${TRANSLATION_DIR}/%/Cargo.toml: | ${TRANSLATION_DIR}/Cargo.toml build-ninja/%.type
+	uv run python -m ideas.init.crate crate_type=bin vcs=git \
+                            hydra.output_subdir=.init \
+                            hydra.run.dir=${TRANSLATION_DIR}/$*
+
+# consolidate each C target
 .PRECIOUS: ${TRANSLATION_DIR}/%/src/lib.c
-${TRANSLATION_DIR}/%/Cargo.toml ${TRANSLATION_DIR}/%/src/lib.c &: | ${TRANSLATION_DIR}/Cargo.toml build-ninja/lib%.so.type
-	uv run python -m ideas.init filename=build-ninja/compile_commands.json \
-                            crate_type=lib \
+${TRANSLATION_DIR}/%/src/lib.c: | ${TRANSLATION_DIR}/%/Cargo.toml build-ninja/lib%.so.type
+	uv run python -m ideas.init.consolidate filename=build-ninja/compile_commands.json \
+                            cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
                             export_symbols=build-ninja/lib$*.so.symbols \
                             source_priority=build-ninja/lib$*.so.sources \
-                            vcs=git \
-                            hydra.output_subdir=.init \
+                            hydra.output_subdir=.init.consolidate \
                             hydra.run.dir=${TRANSLATION_DIR}/$*
 
 .PRECIOUS: ${TRANSLATION_DIR}/%/src/main.c
-${TRANSLATION_DIR}/%/Cargo.toml ${TRANSLATION_DIR}/%/src/main.c &: | ${TRANSLATION_DIR}/Cargo.toml build-ninja/%.type
-	uv run python -m ideas.init filename=build-ninja/compile_commands.json \
-                            crate_type=bin \
+${TRANSLATION_DIR}/%/src/main.c: | ${TRANSLATION_DIR}/%/Cargo.toml build-ninja/%.type
+	uv run python -m ideas.init.consolidate filename=build-ninja/compile_commands.json \
+                            cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
                             export_symbols=build-ninja/$*.symbols \
                             source_priority=build-ninja/$*.sources \
-                            vcs=git \
-                            hydra.output_subdir=.init \
+                            hydra.output_subdir=.init.consolidate \
                             hydra.run.dir=${TRANSLATION_DIR}/$*
-
 
 # translate
 .PHONY: translate
@@ -96,7 +103,7 @@ ${TRANSLATION_DIR}/%/translate: ${TRANSLATION_DIR}/%/src/lib.rs | build-ninja/li
 ${TRANSLATION_DIR}/%/translate: ${TRANSLATION_DIR}/%/src/main.rs | build-ninja/%.type ;
 
 .PRECIOUS: ${TRANSLATION_DIR}/%/src/lib.rs
-${TRANSLATION_DIR}/%/src/lib.rs: ${TRANSLATION_DIR}/%/src/lib.c ${TRANSLATION_DIR}/%/tests/test_cases.rs | build-ninja/compile_commands.json build-ninja/lib%.so.symbols build-ninja/lib%.so.sources
+${TRANSLATION_DIR}/%/src/lib.rs: ${TRANSLATION_DIR}/%/src/lib.c | build-ninja/compile_commands.json build-ninja/lib%.so.symbols build-ninja/lib%.so.sources
 	-uv run python -m ideas.translate model.name=${PROVIDER}/${MODEL} \
                                  filename=${TRANSLATION_DIR}/$*/src/lib.c \
                                  vcs=git \
@@ -105,7 +112,7 @@ ${TRANSLATION_DIR}/%/src/lib.rs: ${TRANSLATION_DIR}/%/src/lib.c ${TRANSLATION_DI
                                  hydra.run.dir=${TRANSLATION_DIR}/$* ${TRANSLATE_ARGS}
 
 .PRECIOUS: ${TRANSLATION_DIR}/%/src/main.rs
-${TRANSLATION_DIR}/%/src/main.rs: ${TRANSLATION_DIR}/%/src/main.c ${TRANSLATION_DIR}/%/tests/test_cases.rs | build-ninja/compile_commands.json build-ninja/%.symbols build-ninja/%.sources
+${TRANSLATION_DIR}/%/src/main.rs: ${TRANSLATION_DIR}/%/src/main.c | build-ninja/compile_commands.json build-ninja/%.symbols build-ninja/%.sources
 	-uv run python -m ideas.translate model.name=${PROVIDER}/${MODEL} \
                                  filename=${TRANSLATION_DIR}/$*/src/main.c \
                                  vcs=git \
@@ -162,12 +169,17 @@ ${TRANSLATION_DIR}/%/cargo_test.log: ${TRANSLATION_DIR}/%/build.log ${TRANSLATIO
     fi \
 
 .PRECIOUS: ${TRANSLATION_DIR}/%/tests/test_cases.rs
+${TRANSLATION_DIR}/%/tests/test_cases.rs: | ${TEST_FILES} ${TRANSLATION_DIR}/%/Cargo.toml runner/Cargo.toml build-ninja/lib%.so.type
+	-uv run python -m ideas.convert_tests runner_manifest=$(realpath runner/Cargo.toml) \
+                                     crate_manifest=$(realpath ${TRANSLATION_DIR}/$*/Cargo.toml) \
+                                     template=${MAKEFILE_DIR}/tools/rust_tests/lib_testing.rs \
+                                     output=${TRANSLATION_DIR}/$*/tests/test_cases.rs \
+                                     'test_vectors=[$(shell echo "$(TEST_FILES)" | tr ' ' ',')]'
+
 ${TRANSLATION_DIR}/%/tests/test_cases.rs: | ${TEST_FILES} ${TRANSLATION_DIR}/%/Cargo.toml build-ninja/%.type
-	@mkdir -p $(@D)
-	-uv run python -m ideas.convert_tests --crate_manifest $(realpath ${TRANSLATION_DIR}/$*/Cargo.toml) \
-                                     ${TEST_FILES} | rustfmt > $@
-	${GIT} add $*/Cargo.toml $*/tests/test_cases.rs
-	${GIT} commit --quiet --message "Converted \`$*\` test vectors"
+	-uv run python -m ideas.convert_tests crate_manifest=$(realpath ${TRANSLATION_DIR}/$*/Cargo.toml) \
+                                     output=${TRANSLATION_DIR}/$*/tests/test_cases.rs \
+                                     'test_vectors=[$(shell echo "$(TEST_FILES)" | tr ' ' ',')]'
 
 .PRECIOUS: test_vectors/%.json
 test_vectors/%.json:

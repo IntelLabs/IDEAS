@@ -35,6 +35,7 @@ MANIFEST
 # Environments
 .env
 .venv
+docker/.venv
 env/
 venv/
 ENV/

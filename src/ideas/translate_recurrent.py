@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict, deque
 
 import dspy
 
-from .utils import Symbol
+from .ast import Symbol
 
 logger = logging.getLogger("ideas.translate_recurrent")
 

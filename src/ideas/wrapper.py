@@ -67,6 +67,49 @@ class Signature(dspy.Signature):
     wrapper: CodeRust = dspy.OutputField()
 
 
+def generate_unimplemented_wrapper(crate: Crate, symbol_name: str) -> str:
+    # unsafe extern "C" {
+    #     pub fn helloworld() -> ::std::os::raw::c_int;
+    # }
+    ok, bindgen_wrapper = run_subprocess(
+        [
+            "bindgen",
+            "--disable-header-comment",
+            "--no-doc-comments",
+            "--no-layout-tests",
+            str(crate.rust_src_path.with_suffix(".c")),
+            "--allowlist-function",
+            symbol_name,
+        ]
+    )
+    if not ok:
+        raise ValueError(f"bindgen failed!\n{bindgen_wrapper}")
+
+    # #[unsafe(export_name="helloworld")]
+    # pub extern "C" fn helloworld() -> ::std::os::raw::c_int {
+    #     unimplemented!();
+    # }
+    unimplemented_wrapper = re.sub(
+        r'unsafe extern "C" {\s+pub fn (.*);\s+}',
+        rf'#[unsafe(export_name="{symbol_name}")]\npub extern "C" fn \1 {{\n    unimplemented!();\n}}',
+        bindgen_wrapper,
+        flags=re.DOTALL,
+    )
+    if unimplemented_wrapper == bindgen_wrapper:
+        raise ValueError("Failed to convert bindgen to valid wrapper!")
+    unimplemented_wrapper = unimplemented_wrapper.rstrip()
+
+    # Validate the template
+    success, output = check_rust(
+        unimplemented_wrapper, flags=["--crate-type", "lib", "--emit", "metadata"]
+    )
+    if not success:
+        raise ValueError(
+            f"Invalid template for the wrapper: {unimplemented_wrapper}\n\nBuild error:\n{output}"
+        )
+    return unimplemented_wrapper
+
+
 class WrapperGenerator(dspy.Module):
     def __init__(
         self,
@@ -77,14 +120,18 @@ class WrapperGenerator(dspy.Module):
         self.crate = crate
         self.max_iters = max_iters
 
-        # Setup crate for wrappers by writing empty wrapper.rs and adding `pub mod wrapper;` to lib.rs
+        # Setup crate for wrappers by writing empty wrapper.rs and adding `#[cfg(feature = "wrapper")]\npub mod wrapper;` to lib.rs
         self.wrapper_path = crate.rust_src_path.parent / "wrapper.rs"
         self.wrapper_path.write_text("")
         if not re.search(
             r"^pub mod wrapper;$", crate.rust_src_path.read_text(), flags=re.MULTILINE
         ):
             with crate.rust_src_path.open("a+") as f:
-                f.write("\npub mod wrapper;\n")
+                f.write('\n#[cfg(feature = "wrapper")]\npub mod wrapper;\n')
+        # Add the feature to Cargo.toml and make it default
+        self.crate.cargo_feature("wrapper = []")
+        # TODO: Make this more robust (currently features are stacked in reverse call order)
+        self.crate.cargo_feature('default = ["wrapper"]')
 
     def forward(
         self,
@@ -103,7 +150,7 @@ class WrapperGenerator(dspy.Module):
 
         # Use bindgen to generate unimplemented wrapper and write to disk. Note the unimplemented
         # wrapper contains unsafe code!
-        unimplemented_wrapper = self.generate_unimplemented_wrapper(symbol_name)
+        unimplemented_wrapper = generate_unimplemented_wrapper(self.crate, symbol_name)
         symbol_wrapper_path.write_text(unimplemented_wrapper)
 
         # Generate dynamic signature and module for symbol
@@ -168,48 +215,6 @@ class WrapperGenerator(dspy.Module):
             symbol_wrapper=wrapper if success else unimplemented_wrapper,
             success=success,
         )
-
-    def generate_unimplemented_wrapper(self, symbol_name) -> str:
-        # unsafe extern "C" {
-        #     pub fn helloworld() -> ::std::os::raw::c_int;
-        # }
-        ok, bindgen_wrapper = run_subprocess(
-            [
-                "bindgen",
-                "--disable-header-comment",
-                "--no-doc-comments",
-                "--no-layout-tests",
-                str(self.crate.rust_src_path.with_suffix(".c")),
-                "--allowlist-function",
-                symbol_name,
-            ]
-        )
-        if not ok:
-            raise ValueError(f"bindgen failed!\n{bindgen_wrapper}")
-
-        # #[unsafe(export_name="helloworld")]
-        # pub extern "C" fn helloworld() -> ::std::os::raw::c_int {
-        #     unimplemented!();
-        # }
-        unimplemented_wrapper = re.sub(
-            r'unsafe extern "C" {\s+pub fn (.*);\s+}',
-            rf'#[unsafe(export_name="{symbol_name}")]\npub extern "C" fn \1 {{\n    unimplemented!();\n}}',
-            bindgen_wrapper,
-            flags=re.DOTALL,
-        )
-        if unimplemented_wrapper == bindgen_wrapper:
-            raise ValueError("Failed to convert bindgen to valid wrapper!")
-        unimplemented_wrapper = unimplemented_wrapper.rstrip()
-
-        # Validate the template
-        success, output = check_rust(
-            unimplemented_wrapper, flags=["--crate-type", "lib", "--emit", "metadata"]
-        )
-        if not success:
-            raise ValueError(
-                f"Invalid template for the wrapper: {unimplemented_wrapper}\n\nBuild error:\n{output}"
-            )
-        return unimplemented_wrapper
 
 
 @hydra.main(version_base=None, config_name="wrapper")

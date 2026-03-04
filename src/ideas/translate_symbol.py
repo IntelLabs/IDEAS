@@ -10,8 +10,7 @@ import logging
 import dspy
 
 from .tools import Crate
-from .utils import Symbol
-from .ast import get_cursor_code
+from .ast import Symbol
 from .adapters import Code
 
 
@@ -70,15 +69,14 @@ class SymbolTranslator(dspy.Module):
         feedback: str = "",
     ) -> dspy.Prediction:
         logger.info(f"Translating symbol `{symbol.name}` ...")
-        snippet = get_cursor_code(symbol.cursor)
-        dependent_code = "\n\n".join([get_cursor_code(s.cursor) for s in dependent_symbols])
+        dependent_code = "\n\n".join([s.code for s in dependent_symbols])
 
         pred = dspy.Prediction()
         for i in range(max(self.max_iters, 1)):
             # Predict symbol translation
             pred = self.translate(
                 reference_code=CodeRust(code=reference_code),
-                snippet=CodeC(code=snippet),
+                snippet=CodeC(code=symbol.code),
                 dependent_code=CodeC(code=dependent_code),
                 prior_translation=CodeRust(code=prior_translation),
                 feedback=feedback,
@@ -103,7 +101,7 @@ class SymbolTranslator(dspy.Module):
                         {
                             "symbol_name": symbol.name,
                             "reference_code": reference_code,
-                            "snippet": snippet,
+                            "snippet": symbol.code,
                             "dependent_code": dependent_code,
                             "prior_translation": prior_translation,
                             "feedback": pred.feedback,
