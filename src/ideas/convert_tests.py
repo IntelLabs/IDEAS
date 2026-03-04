@@ -4,50 +4,42 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-"""
-Use JSON test vectors like:
-
-```json
-{
-    "argv": ["--flag", "value"],                         // optional; appended after the driver path
-    "stdin": "input string\n",                           // optional
-    "rc": 0,                                             // optional; default 0
-    "stdout": { "pattern": "ok\n", "is_regex": false },  // exact by default
-    "stderr": { "pattern": "", "is_regex": false },      // exact by default
-    "has_ub": "overflow"                                 // optional; if present, test is skipped
-}
-```
-
-to generate tests for binary targets:
-
-```rust
-use assert_cmd::Command;
-use ntest::timeout;
-use predicates::prelude::*;
-
-#[test]
-#[timeout(some_timeout)]
-fn test1() {
-    Command::cargo_bin(assert_cmd::crate_name!()).unwrap()
-        .args(&["--flag", "value"])
-        .write_stdin("input string\n")
-        .assert()
-        .stdout("ok\n") # if not regex
-        .stdout(predicates::str::is_match("ok\n").unwrap()) # if regex
-        .stderr("") # if not regex
-        .stderr(predicates::str::is_match("").unwrap()) # if regex
-        .code(rc);
-}
-```
-
-TODO: Use a template to generate tests for library targets.
-"""
 
 import json
-import argparse
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 
-from .tools import Crate
+import hydra
+from omegaconf import MISSING
+from hydra.core.config_store import ConfigStore
+from hydra.core.hydra_config import HydraConfig
+
+from ideas.tools import Crate, run_subprocess
+
+
+logger = logging.getLogger("ideas.translate")
+
+
+@dataclass
+class ConvertConfig:
+    test_vectors: list[Path] = MISSING
+    output: Path = MISSING
+    crate_manifest: Path = MISSING
+    timeout: int = 600000
+
+    # Library-specific inputs
+    runner_manifest: Path | None = None
+    template: Path | None = None
+
+
+cs = ConfigStore.instance()
+cs.store(name="convert_tests", node=ConvertConfig)
+
+
+def rustfmt(path: Path) -> None:
+    cmd = ["rustfmt", str(path)]
+    run_subprocess(cmd)
 
 
 def to_rust_str(string):
@@ -59,29 +51,28 @@ def is_bin_test(test_case: Path):
     return "lib_state_in" not in test_case_json and "lib_state_out" not in test_case_json
 
 
-def convert_tests_for_exec(test_cases: list[Path], crate: Crate, timeout: int = 60000):
+def convert_tests_for_exec(test_cases: list[Path], crate: Crate, timeout: int = 60000) -> str:
     test_cases = list(filter(is_bin_test, test_cases))
     if len(test_cases) == 0:
-        return
+        return ""
 
     # Add test dependencies
     crate.cargo_add(dep="assert_cmd@2.0.17", section="dev")
     crate.cargo_add(dep="ntest@0.9.3", section="dev")
     crate.cargo_add(dep="predicates@3.1.3", section="dev")
 
-    print("use assert_cmd::Command;")
-    print("use ntest::timeout;")
-    print("use predicates::prelude::*;")
-    print("")
+    output = ""
+    output += "use assert_cmd::Command;\n"
+    output += "use ntest::timeout;\n"
+    output += "use predicates::prelude::*;\n"
+    output += "\n"
 
     for test_case in test_cases:
         test_case_json = json.loads(test_case.read_text())
 
         # Skip tests that exercise undefined behavior
         if "has_ub" in test_case_json:
-            print(
-                f"// Skipping {test_case} because it exercises undefined C behavior of type {test_case_json['has_ub']}"
-            )
+            output += f"// Skipping {test_case} because it exercises undefined C behavior of type {test_case_json['has_ub']}\n"
             continue
 
         # Return code
@@ -118,28 +109,29 @@ def convert_tests_for_exec(test_cases: list[Path], crate: Crate, timeout: int = 
         if not isinstance(is_stderr_regex, bool):
             raise ValueError(f"stderr.is_regex must be a boolean, got {type(is_stderr_regex)}")
 
-        print("#[test]")
-        print(f"#[timeout({timeout})]")
-        print(f"fn test_case_{test_case.stem}() {{")
-        print("    Command::cargo_bin(assert_cmd::crate_name!()).unwrap()")
+        output += "#[test]\n"
+        output += f"#[timeout({timeout})]\n"
+        output += f"fn test_case_{test_case.stem}() {{\n"
+        output += "    Command::cargo_bin(assert_cmd::crate_name!()).unwrap()"
         if len(args) > 0:
-            print(f"        .args(&[{', '.join([to_rust_str(arg) for arg in args])}])")
+            output += f".args(&[{', '.join([to_rust_str(arg) for arg in args])}])"
         if stdin is not None:
-            print(f"        .write_stdin({to_rust_str(stdin)})")
-        print("        .assert()")
-        print(
-            f"        .stdout({to_rust_str(stdout_pattern)})"
+            output += f".write_stdin({to_rust_str(stdin)})"
+        output += ".assert()"
+        output += (
+            f".stdout({to_rust_str(stdout_pattern)})"
             if not is_stdout_regex
-            else f"        .stdout(predicates::str::is_match({to_rust_str(stdout_pattern)}).unwrap())"
+            else f".stdout(predicates::str::is_match({to_rust_str(stdout_pattern)}).unwrap())"
         )
-        print(
-            f"        .stderr({to_rust_str(stderr_pattern)})"
+        output += (
+            f".stderr({to_rust_str(stderr_pattern)})"
             if not is_stderr_regex
-            else f"        .stderr(predicates::str::is_match({to_rust_str(stderr_pattern)}).unwrap())"
+            else f".stderr(predicates::str::is_match({to_rust_str(stderr_pattern)}).unwrap())"
         )
-        print(f"        .code({rc});")
-        print("}")
-        print("")
+        output += f".code({rc});\n"
+        output += "}\n"
+
+    return output
 
 
 def is_lib_test(test_case: Path):
@@ -153,32 +145,63 @@ def convert_tests_for_lib(
     runner_manifest: Path | None,
     template_path: Path | None,
     timeout: int = 60000,
-):
-    raise ValueError("Library test conversion not implemented yet!")
+) -> str:
+    if template_path is None:
+        return ""
+
+    test_cases = list(filter(is_lib_test, test_cases))
+    if len(test_cases) == 0:
+        return ""
+
+    # Add test dependencies
+    crate.cargo_add(dep="ntest@0.9.3", section="dev")
+    crate.cargo_add(dep="once_cell@1.21.3", section="dev")
+    crate.cargo_add(dep="test-cdylib@1.1.0", section="dev")
+
+    # Load template
+    template = template_path.read_text()
+    # Replace the timeout
+    template = template.replace("#[timeout(placeholder)]", f"#[timeout({timeout})]")
+
+    # FIXME: This currently assumes that the macro generate_tests! is defined in the template
+    # Use the generate_tests! macro to add tests
+    lines = ["\n", "generate_tests! {"]
+    lines.append(f'    "{runner_manifest}";')
+    for test_case in test_cases:
+        # Skip tests that exercise undefined behavior
+        test_case_json = json.loads(test_case.read_text())
+        if "has_ub" in test_case_json:
+            continue
+        lines.append(f'    test_vector_{test_case.stem} => "{test_case}",')
+    lines.append("}")
+
+    template += "\n".join(lines)
+    return template
+
+
+@hydra.main(version_base=None, config_name="convert_tests")
+def main(cfg: ConvertConfig) -> None:
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
+    logger.info(f"Saving results to {output_dir}")
+
+    test_vectors = [Path(path) for path in cfg.test_vectors]
+    crate = Crate(cargo_toml=cfg.crate_manifest)
+
+    exec_tests = convert_tests_for_exec(test_vectors, crate, cfg.timeout)
+    lib_tests = convert_tests_for_lib(
+        test_vectors, crate, cfg.runner_manifest, cfg.template, cfg.timeout
+    )
+    # Write and format tests
+    cfg.output.parent.mkdir(exist_ok=True, parents=True)
+    cfg.output.write_text(exec_tests + "\n" + lib_tests)
+    rustfmt(cfg.output)
+
+    # Update VCS
+    crate.add(cfg.crate_manifest)
+    crate.add(cfg.output)
+    crate.invalidate_metadata()
+    crate.commit("Converted JSON test vectors to Rust tests")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert JSON test vectors to cargo tests")
-    parser.add_argument(
-        "test_vectors", type=Path, nargs="+", help="Path(s) to JSON test vector(s)"
-    )
-    parser.add_argument(
-        "--crate_manifest", type=Path, help="Path to the crate manifest", required=True
-    )
-    parser.add_argument(
-        "--runner_manifest", type=Path, help="Path to the runner manifest", required=False
-    )
-    parser.add_argument(
-        "--template", type=Path, help="Path to Rust test template", required=False
-    )
-    parser.add_argument(
-        "--timeout", type=int, help="Timeout for each test in milliseconds", default=600000
-    )
-    args = parser.parse_args()
-
-    test_vectors = [Path(path) for path in args.test_vectors]
-    crate = Crate(cargo_toml=args.crate_manifest)
-    convert_tests_for_exec(test_vectors, crate, args.timeout)
-    convert_tests_for_lib(
-        test_vectors, crate, args.runner_manifest, args.template, args.timeout
-    )
+    main()

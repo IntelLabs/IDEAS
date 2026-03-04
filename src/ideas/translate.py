@@ -18,7 +18,7 @@ from hydra.core.hydra_config import HydraConfig
 from ideas import adapters, model, ModelConfig, GenerateConfig
 from ideas import SymbolTranslator, RecurrentTranslator
 from ideas import extract_info_c
-from .init import get_symbols_and_dependencies
+from ideas.init.consolidate import get_symbols_and_dependencies
 from .tools import Crate
 
 logger = logging.getLogger("ideas.translate")

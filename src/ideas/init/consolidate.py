@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2025 Intel Corporation
+# Copyright (C) 2026 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -8,7 +8,7 @@ import os
 import logging
 import sys
 from pathlib import Path
-from graphlib import TopologicalSorter
+from graphlib import TopologicalSorter, CycleError
 from collections.abc import Iterable, Container
 from dataclasses import dataclass
 
@@ -18,40 +18,32 @@ from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 from clang.cindex import CompilationDatabase, TranslationUnit, CursorKind
 from clang.cindex import Rewriter, TokenKind, SourceRange
+from clang.cindex import TranslationUnitLoadError, Diagnostic
 
-from .ast import get_cursor_code, extract_info_c, TreeResult, get_internally_linked_cursors
-from .utils import Symbol
-from .tools import Crate, clang_rename_, check_c
+from ideas.ast import extract_info_c, TreeResult, Symbol
+from ideas.ast import get_internally_linked_cursors
+from ideas.tools import Crate, clang_rename_, check_c
 
 logger = logging.getLogger("ideas.preprocess")
 
 
 @dataclass
-class InitConfig:
+class ConsolidateConfig:
     filename: Path = MISSING
-    crate_type: str = MISSING
-    vcs: str = "none"
+    cargo_toml: Path = MISSING
 
-    pretty_print: bool = True
     export_symbols: Path | None = None
     source_priority: Path | None = None
 
-    def __post_init__(self):
-        if self.crate_type not in ["bin", "lib"]:
-            raise ValueError(f"Invalid crate type: {self.crate_type}!")
-        if self.vcs not in ["git", "none"]:
-            raise ValueError(f"Invalid VCS: {self.vcs}!")
-
 
 cs = ConfigStore.instance()
-cs.store(name="init", node=InitConfig)
+cs.store(name="init.consolidate", node=ConsolidateConfig)
 
 
 def init(
     compile_commands: Path,
     export_symbols: list[str] | None = None,
     source_priority: list[Path] | None = None,
-    pretty_print: bool = True,
 ) -> str:
     # Get symbol table and dependencies taking into account source priority and exported symbols,
     # and prefix internally linked declarations/references since there can be name collisions
@@ -67,12 +59,15 @@ def init(
     # Assemble C sources in topological order
     includes = get_includes(symbols)
     sources = []
-    for symbol_name in TopologicalSorter(dependencies).static_order():
-        # Ignore tag definitions and function declarations
+    sorted_symbol_names = list(TopologicalSorter(dependencies).static_order())
+    for symbol_name in sorted_symbol_names:
+        # Ignore function declarations
         if symbol_name not in symbols:
             logger.warning(f"Skipping `{symbol_name}` ...")
             continue
-        symbol_code = get_cursor_code(symbols[symbol_name].cursor, pretty_print=pretty_print)
+        symbol_code = symbols[symbol_name].code
+        if symbol_code in sources:
+            continue
         sources.append(symbol_code)
     return "\n".join(includes) + "\n\n" + "\n\n".join(sources)
 
@@ -82,25 +77,19 @@ def get_symbols_and_dependencies(
     source_priority: list[Path] | None = None,
     export_symbols: list[str] | None = None,
 ) -> tuple[dict[str, Symbol], dict[str, list[str]]]:
-    global_symbols = merge_symbols(
-        [ast.symbols for ast in asts], source_priority=source_priority
-    )
+    asts_symbols = [filter_symbols(ast.symbols) for ast in asts]
+    global_symbols = merge_symbols(asts_symbols, source_priority=source_priority)
 
     # Filter global symbols to create project symbols
     project_symbols = filter_symbols(global_symbols, filter_system=True)
     project_dependencies = merge_complete_graphs(asts, valid_names=project_symbols)
 
     # Use export_symbols to filter project symbols and dependencies
-    dependencies = project_dependencies
+    dependencies = remove_cycles_from_graph(project_dependencies, project_symbols)
     if export_symbols is not None:
         export_symbols = [c14n_symbol_name(name, project_symbols) for name in export_symbols]
-        dependencies = reachable_subgraph(project_dependencies, export_symbols)
-    symbols = filter_symbols(
-        project_symbols,
-        filter_tag_definitions=True,
-        filter_function_declarations=True,
-        filter_enum_constants=True,
-    )
+        dependencies = reachable_subgraph(dependencies, export_symbols)
+    symbols = filter_symbols(project_symbols, filter_function_declarations=True)
 
     return symbols, dependencies
 
@@ -137,13 +126,20 @@ def get_asts(
     assert cmds is not None
     asts = []
     for cmd in cmds:
-        tu = TranslationUnit.from_source(None, args=list(cmd.arguments))
+        try:
+            tu = TranslationUnit.from_source(None, args=list(cmd.arguments))
+        except TranslationUnitLoadError as e:
+            raise TranslationUnitLoadError(
+                f"Error parsing '{cmd.filename}' using args `{' '.join(cmd.arguments)}`\n{e}"
+            )
+        if any(d.severity >= Diagnostic.Error for d in tu.diagnostics):
+            raise TranslationUnitLoadError("\n".join([d.format() for d in tu.diagnostics]))
         if prefix_internally_linked:
             # FIXME: It would be nicer to add a prefix to only those symbols that collide but we
             #        cannot know that until symbol merge time.
             tu = add_prefix_to_internally_linked_cursors(tu, compile_commands)
         assert tu.cursor is not None
-        if valid_paths is None or Path(tu.cursor.spelling) in valid_paths:
+        if valid_paths is None or Path(tu.cursor.spelling).resolve() in valid_paths:
             ast = extract_info_c(tu)
             asts.append(ast)
     return asts
@@ -206,9 +202,7 @@ def remove_static_keyword_(tu: TranslationUnit):
 def filter_symbols(
     symbols: dict[str, Symbol],
     filter_system: bool = True,
-    filter_tag_definitions: bool = False,
     filter_function_declarations: bool = False,
-    filter_enum_constants: bool = False,
 ) -> dict[str, Symbol]:
     filtered_symbols = {}
     for name, symbol in symbols.items():
@@ -216,30 +210,12 @@ def filter_symbols(
         if filter_system and symbol.cursor.location.is_in_system_header:
             continue
 
-        # Ignore "tag definitions" that are contained with in other symbols like:
-        #   typedef enum name { value } name;
-        # This produces two ENUM cursors.
-        if filter_tag_definitions:
-            children = list(symbol.cursor.get_children())
-            if (
-                symbol.cursor.kind == CursorKind.TYPEDEF_DECL
-                and len(children) == 1
-                and children[0].kind != CursorKind.TYPE_REF
-            ):
-                contained_name = children[0].get_usr()
-                filtered_symbols.pop(contained_name, None)
-
         # Filter function declarations
         if filter_function_declarations:
             if (
                 symbol.cursor.kind == CursorKind.FUNCTION_DECL
                 and not symbol.cursor.is_definition()
             ):
-                continue
-
-        # Filter enum constants since they should be contained with an ENUM_DECL
-        if filter_enum_constants:
-            if symbol.cursor.kind == CursorKind.ENUM_CONSTANT_DECL:
                 continue
 
         filtered_symbols[name] = symbols[name]
@@ -262,9 +238,7 @@ def merge_symbols(
                 continue
 
             # If code matches, then don't bother replacing
-            global_code = get_cursor_code(global_symbols[name].cursor)
-            code = get_cursor_code(symbol.cursor)
-            if global_code == code:
+            if global_symbols[name].code == symbol.code:
                 continue
 
             global_source = Path(
@@ -313,9 +287,7 @@ def merge_complete_graphs(
 ) -> dict[str, list[str]]:
     graph: dict[str, list[str]] = {}
     for ast in asts:
-        # FIXME: Would be nice if complete_graph was a dict[str, list[str]] instead of dict[str, list[Symbol]]
-        for node, neighbor_symbols in ast.complete_graph.items():
-            neighbors = [sym.name for sym in neighbor_symbols]
+        for node, neighbors in ast.complete_graph.items():
             if node not in valid_names:
                 continue
             if node not in graph:
@@ -325,6 +297,26 @@ def merge_complete_graphs(
                     continue
                 graph[node].append(neighbor)
     return dict(graph)
+
+
+def remove_cycles_from_graph(
+    graph: dict[str, list[str]], symbols: dict[str, Symbol]
+) -> dict[str, list[str]]:
+    # Remove self-dependencies from graph: symbol -> [symbol] => symbol -> []
+    for dependent, dependencies in graph.items():
+        graph[dependent] = [
+            dependency for dependency in dependencies if dependency != dependent
+        ]
+
+    # FIXME: Add more C-specific heuristics to remove cycles from the graph
+
+    # Make sure graph is topologically sortable
+    try:
+        list(TopologicalSorter(graph).static_order())
+    except CycleError as ex:
+        logger.error(ex)
+        raise ex
+    return graph
 
 
 def reachable_subgraph(
@@ -353,23 +345,12 @@ def c14n_symbol_name(name: str, symbols: dict[str, Symbol]):
     return potential_names.pop()
 
 
-@hydra.main(version_base=None, config_name="init")
-def main(cfg: InitConfig) -> None:
+@hydra.main(version_base=None, config_name="init.consolidate")
+def main(cfg: ConsolidateConfig) -> None:
     output_dir = Path(HydraConfig.get().runtime.output_dir)
 
-    # Initialize crate
-    crate = Crate(
-        cargo_toml=output_dir / "Cargo.toml",
-        type=cfg.crate_type,  # type: ignore[reportArgumentType]
-        vcs=cfg.vcs,  # type: ignore[reportArgumentType]
-    )
-    crate.add(crate.cargo_toml)
-
-    crate.cargo_add(dep="openssl@0.10.75")
-    if cfg.crate_type == "lib":
-        with crate.cargo_toml.open("a") as f:
-            f.write('\n[lib]\ncrate-type = ["lib", "cdylib"]\n')
-        crate.invalidate_metadata()
+    # Get crate information
+    crate = Crate(cargo_toml=cfg.cargo_toml)
 
     export_symbols = None
     if isinstance(cfg.export_symbols, Path):
@@ -385,7 +366,6 @@ def main(cfg: InitConfig) -> None:
         cfg.filename,
         export_symbols=export_symbols,
         source_priority=source_priority,
-        pretty_print=cfg.pretty_print,
     )
 
     # Only run preprocess, compile, and assemble steps on C code
@@ -413,4 +393,8 @@ def main(cfg: InitConfig) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error(e)
+        raise e

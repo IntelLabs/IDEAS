@@ -144,6 +144,21 @@ class Crate:
         self.invalidate_metadata()
         return output
 
+    def cargo_feature(self, feature: str) -> None:
+        # Create section if it doesn't exist
+        if "[features]" not in self.cargo_toml.read_text():
+            with self.cargo_toml.open("a") as f:
+                f.write("\n[features]\n")
+
+        # Add the requested feature
+        # FIXME: It's user responsibility to ensure features are cross-compatible
+        self.cargo_toml.write_text(
+            self.cargo_toml.read_text().replace("[features]\n", f"[features]\n{feature}\n")
+        )
+
+        # Invalidate cached metadata
+        self.invalidate_metadata()
+
     def cargo_build(self, allow_unsafe: bool = False) -> tuple[bool, str]:
         env = os.environ.copy()
         # Disallow unsafe by default; allow when explicitly requested
@@ -221,7 +236,7 @@ def run_subprocess(
         )
         return True, result.stdout
     except subprocess.CalledProcessError as e:
-        return False, e.stderr
+        return False, e.stdout + e.stderr
 
 
 def compile_c(
@@ -252,7 +267,7 @@ def check_c(
     else:
         cmd.append("-Wall")
 
-    cmd.extend(["-x", "c"])
+    cmd.extend(["-march=native", "-x", "c"])
     cmd.append("-")
     cmd.extend(["-o", "/dev/null"])
 
