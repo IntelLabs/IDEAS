@@ -9,7 +9,10 @@ requires-python = "~=3.13.0"
 dependencies = [
     "clang==21.1.7",
     "dspy==3.1.2",
+    "kiss-agent-framework==0.2.27",
     "hydra-core==1.3.2",
+    "networkx==3.6.1",
+    "tomlkit>=0.14.0",
     "tree-sitter==0.25.2",
     "tree-sitter-rust==0.24.0",
 ]
@@ -18,12 +21,12 @@ dependencies = [
 dev = [
     "basedpyright==1.29.4",
     "pre-commit==4.2.0",
-    "pytest==8.4.0",
+    "pytest==9.0.3",
     "ruff==0.11.13",
 ]
 
 [build-system]
-requires = ["uv_build>=0.10.2,<0.11.0"]
+requires = ["uv_build>=0.10.9,<0.11.0"]
 build-backend = "uv_build"
 
 [tool.basedpyright]

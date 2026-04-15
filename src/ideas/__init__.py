@@ -7,7 +7,9 @@
 from .ast import create_translation_unit, extract_info_c, TreeResult
 from .model import ModelConfig, GenerateConfig
 from .translate_recurrent import RecurrentTranslator
-from .translate_symbol import SymbolTranslator
+from .translate_snippet import SnippetTranslator
+from .wrapper import WrapperGenerator
+from .test_symbol import SymbolTester
 from clang.cindex import Config
 
 __all__ = [
@@ -17,7 +19,9 @@ __all__ = [
     "ModelConfig",
     "GenerateConfig",
     "RecurrentTranslator",
-    "SymbolTranslator",
+    "SnippetTranslator",
+    "WrapperGenerator",
+    "SymbolTester",
 ]
 
 # NOTE: .so is *nix specific

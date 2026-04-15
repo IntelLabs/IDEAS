@@ -6,24 +6,28 @@
 
 MAKEFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
 MAKEFILE_DIR := $(realpath $(dir $(MAKEFILE_PATH)))
+PIPELINE_DIR := lib/pipeline_automation
+PIPELINE_TAG := ideas/$(shell git rev-list -1 HEAD -- ${PIPELINE_DIR})
 EXAMPLES_DIR := examples
 IDEAS_MAKEFILE := $(MAKEFILE_DIR)/IDEAS.mk
+AGENTS_MAKEFILE := $(MAKEFILE_DIR)/AGENTS.mk
 
-PROVIDER ?= hosted_vllm## Provider to use with DSPy/LiteLLM
-MODEL ?= Qwen/Qwen3-Coder-30B-A3B-Instruct## Model to use to translate
+PROVIDER ?= openrouter## Provider to use with DSPy/LiteLLM
+MODEL ?= anthropic/claude-sonnet-4.6## Model to use to translate
 REVISION ?= None## Revision of model to load in vLLM
 HOST ?= localhost
 PORT ?= 8000## Port to use for vLLM
 BASE_URL ?= http://${HOST}:${PORT}/v1## Base URL of vLLM server
-VLLM_VERSION ?= 0.13.0
-VLLM_ARGS ?= --tensor-parallel-size 8 --enable-expert-parallel --max-num-seqs 32 --max-model-len 128k## Args to pass to vllm serve
+VLLM_VERSION ?= 0.17.1
+VLLM_ARGS ?= --tensor-parallel-size 8 --enable-expert-parallel --max-num-seqs 16 --max-model-len 128k## Args to pass to vllm serve
 TRANSLATION_DIR ?= translation.$(shell git rev-parse HEAD)## Directory to put IDEAS translation
 TRANSLATE_ARGS ?= ## Args to pass to IDEAS translation
 RUSTFLAGS ?= -Awarnings## Flags to build Rust translation
 VERBOSE ?= 0## Whether to output failed/partial projects in summaries
+VCS ?= git## Whether to use version control during translation. Options: ['git', 'none']
 
-# Pass these variables to IDEAS.mk
-export MODEL BASE_URL TRANSLATION_DIR RUSTFLAGS
+# Pass these variables to other Makefiles
+export PROVIDER MODEL BASE_URL TRANSLATION_DIR RUSTFLAGS
 
 EXAMPLES ?= $(sort $(patsubst %/test_case,%,$(shell find ${EXAMPLES_DIR} -maxdepth 3 -name test_case -type d)))## List of examples to run on
 ifeq ($(EXAMPLES),)
@@ -50,10 +54,9 @@ docker/docker_build.log: docker/ideas.Dockerfile
 docker:## Mount translation Docker image
 docker: docker/docker_build.log
 	mkdir -p docker/.venv
-	test -f $(HOME)/.bashrc || touch $(HOME)/.bashrc
 	docker run -it --rm -v ".:/home/user/IDEAS" \
                     -v "./docker/.venv:/home/user/IDEAS/.venv" \
-                    -v "$(HOME)/.bashrc:/home/user/.bashrc:ro" \
+                    -e OPENROUTER_API_KEY \
                     ideas-$(shell id -u) bash
 
 
@@ -72,8 +75,8 @@ docker/build_measurements: ${PIPELINE_DIR}/evaluate_unsafe_usage/unsafety.Docker
 install: install-uv install-rust ## Install uv and Rust
 
 .PHONY: install-uv
-install-uv:## Install uv@0.9.22
-	curl -LsSf https://astral.sh/uv/0.9.22/install.sh | sh
+install-uv:## Install uv@0.10.9
+	curl -LsSf https://astral.sh/uv/0.10.9/install.sh | sh
 
 .PHONY: install-rust
 install-rust:## Install Rust@1.88.0
@@ -117,6 +120,45 @@ examples/cmake: $(addsuffix /cmake,${EXAMPLES}) ;
 examples/%/cmake:## CMake generate and build specific example
 examples/%/cmake: FORCE
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
+
+
+.PHONE: examples/testgen_argless
+examples/testgen_argless:## Generate argless tests for executable targets in all C examples
+examples/testgen_argless: $(addsuffix /testgen_argless,${EXAMPLES})
+examples/%/testgen_argless:## Generate argless tests for executable targets in a specific C example
+examples/%/testgen_argless: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) testgen_argless
+
+
+.PHONY: examples/testgen_agent
+examples/testgen_agent:## Generate test vectors for all C examples with an agent
+examples/testgen_agent: $(addsuffix /testgen_agent,${EXAMPLES})
+examples/%/testgen_agent:## Generate test vectors for specific C example with an agent
+examples/%/testgen_agent: FORCE
+	-@$(MAKE) -j1 -f $(AGENTS_MAKEFILE) -C $(@D) cmake
+	-@$(MAKE) -j1 -f $(AGENTS_MAKEFILE) -C $(@D) testgen
+
+.PHONY: examples/testgen_agent_target
+examples/testgen_agent_target:## Generate test vectors for all targets in all C examples with an agent
+examples/testgen_agent_target: $(addsuffix /testgen_agent_target,${EXAMPLES})
+examples/%/testgen_agent_target:## Generate test vectors for all targets in a specific C example with an agent
+examples/%/testgen_agent_target: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) init
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) testgen_target
+
+
+.PHONY: examples/testgen_and_translate
+examples/testgen_and_translate:## Generate tests and translate all examples
+examples/testgen_and_translate: $(addsuffix /testgen_and_translate,${EXAMPLES})
+examples/%/testgen_and_translate:## Generate tests and translate specific example
+examples/%/testgen_and_translate: FORCE
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) testgen_argless
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) init
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) testgen_target
+	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) translate
 
 
 .PHONY: examples/translate
@@ -203,10 +245,9 @@ examples/%/clean: FORCE
 
 # Global clean
 clean:
-	rm -rf docker/.venv
 	rm -rf docker/docker_build.log
-	rm -rf ${PIPELINE_DIR} examples
-	git checkout HEAD ${PIPELINE_DIR} examples
+	rm -rf examples
+	git checkout HEAD examples
 
 # help
 RESET := \033[0;0m

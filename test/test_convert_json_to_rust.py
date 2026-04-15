@@ -4,13 +4,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-import io
-import contextlib
 import pytest
 import subprocess
 from pathlib import Path
 
-from ideas import convert_tests, tools
+from ideas import convert_tests
 
 
 @pytest.fixture
@@ -37,17 +35,11 @@ def json_test_cases(fixtures_dir: Path) -> list[Path]:
 def test_convert_to_cargo_test(
     json_test_cases: list[Path], cargo_toml: Path, rust_tests_harness: Path
 ):
-    # Create a StringIO object to capture output
-    captured_output = io.StringIO()
-
-    # Temporarily redirect stdout
-    with contextlib.redirect_stdout(captured_output):
-        convert_tests.convert_tests_for_exec(json_test_cases, tools.Crate(cargo_toml))
-
-    # Write the captured Rust code to a fresh tests/test_cases.rs
+    # Write tests to tests/test_cases.rs
+    test_cases = convert_tests.convert_tests_for_exec(json_test_cases)
     original_harness = rust_tests_harness.read_text()
     with open(rust_tests_harness, "w") as f:
-        f.write(captured_output.getvalue())
+        f.write(test_cases)
 
     # Execute cargo test --test test_cases
     result = subprocess.run(

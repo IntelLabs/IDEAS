@@ -5,6 +5,7 @@
 #
 
 
+import sys
 import json
 import logging
 from dataclasses import dataclass
@@ -25,8 +26,8 @@ logger = logging.getLogger("ideas.translate")
 class ConvertConfig:
     test_vectors: list[Path] = MISSING
     output: Path = MISSING
-    crate_manifest: Path = MISSING
     timeout: int = 600000
+    vcs: str = "none"
 
     # Library-specific inputs
     runner_manifest: Path | None = None
@@ -43,7 +44,7 @@ def rustfmt(path: Path) -> None:
 
 
 def to_rust_str(string):
-    return '"' + repr(string)[1:-1] + '"'
+    return '"' + repr(string)[1:-1].replace('"', '\\"') + '"'
 
 
 def is_bin_test(test_case: Path):
@@ -51,15 +52,18 @@ def is_bin_test(test_case: Path):
     return "lib_state_in" not in test_case_json and "lib_state_out" not in test_case_json
 
 
-def convert_tests_for_exec(test_cases: list[Path], crate: Crate, timeout: int = 60000) -> str:
-    test_cases = list(filter(is_bin_test, test_cases))
-    if len(test_cases) == 0:
-        return ""
-
+def add_deps_for_exec(crate: Crate) -> None:
     # Add test dependencies
     crate.cargo_add(dep="assert_cmd@2.0.17", section="dev")
     crate.cargo_add(dep="ntest@0.9.3", section="dev")
     crate.cargo_add(dep="predicates@3.1.3", section="dev")
+    crate.invalidate_metadata()
+
+
+def convert_tests_for_exec(test_cases: list[Path], timeout: int = 60000) -> str:
+    test_cases = list(filter(is_bin_test, test_cases))
+    if len(test_cases) == 0:
+        return ""
 
     output = ""
     output += "use assert_cmd::Command;\n"
@@ -139,24 +143,27 @@ def is_lib_test(test_case: Path):
     return "lib_state_in" in test_case_json and "lib_state_out" in test_case_json
 
 
-def convert_tests_for_lib(
-    test_cases: list[Path],
-    crate: Crate,
-    runner_manifest: Path | None,
-    template_path: Path | None,
-    timeout: int = 60000,
-) -> str:
-    if template_path is None:
-        return ""
-
-    test_cases = list(filter(is_lib_test, test_cases))
-    if len(test_cases) == 0:
-        return ""
-
+def add_deps_for_lib(crate: Crate) -> None:
     # Add test dependencies
     crate.cargo_add(dep="ntest@0.9.3", section="dev")
     crate.cargo_add(dep="once_cell@1.21.3", section="dev")
     crate.cargo_add(dep="test-cdylib@1.1.0", section="dev")
+    crate.invalidate_metadata()
+
+
+def convert_tests_for_lib(
+    test_cases: list[Path],
+    runner_manifest: Path | None,
+    template_path: Path | None,
+    timeout: int = 60000,
+) -> str:
+    test_cases = list(filter(is_lib_test, test_cases))
+    if len(test_cases) == 0:
+        return ""
+
+    # Library tests need a template
+    if template_path is None:
+        raise ValueError("Template path must be specified for library tests!")
 
     # Load template
     template = template_path.read_text()
@@ -179,28 +186,47 @@ def convert_tests_for_lib(
     return template
 
 
-@hydra.main(version_base=None, config_name="convert_tests")
-def main(cfg: ConvertConfig) -> None:
+def _main(cfg: ConvertConfig) -> None:
     output_dir = Path(HydraConfig.get().runtime.output_dir)
     logger.info(f"Saving results to {output_dir}")
 
-    test_vectors = [Path(path) for path in cfg.test_vectors]
-    crate = Crate(cargo_toml=cfg.crate_manifest)
+    runner_manifest = cfg.runner_manifest.absolute() if cfg.runner_manifest else None
+    test_vectors = [Path(path).absolute() for path in cfg.test_vectors]
+    cargo_toml = output_dir / "Cargo.toml"
+    output_file = output_dir / cfg.output
 
-    exec_tests = convert_tests_for_exec(test_vectors, crate, cfg.timeout)
-    lib_tests = convert_tests_for_lib(
-        test_vectors, crate, cfg.runner_manifest, cfg.template, cfg.timeout
-    )
+    exec_tests = convert_tests_for_exec(test_vectors, cfg.timeout)
+    lib_tests = convert_tests_for_lib(test_vectors, runner_manifest, cfg.template, cfg.timeout)
     # Write and format tests
-    cfg.output.parent.mkdir(exist_ok=True, parents=True)
-    cfg.output.write_text(exec_tests + "\n" + lib_tests)
-    rustfmt(cfg.output)
+    output_file.parent.mkdir(exist_ok=True)
+    output_file.write_text(exec_tests + "\n" + lib_tests)
+    rustfmt(output_file)
 
-    # Update VCS
-    crate.add(cfg.crate_manifest)
-    crate.add(cfg.output)
+    # Add crate dependencies
+    crate = Crate(cargo_toml=cargo_toml, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
+    if exec_tests:
+        add_deps_for_exec(crate)
+    if lib_tests:
+        add_deps_for_lib(crate)
+
+    # Update crate in VCS
+    crate.vcs.add(cargo_toml)
+    crate.vcs.add(output_file)
+    if (output_subdir := HydraConfig.get().output_subdir) is not None:
+        crate.vcs.add(output_dir / output_subdir)
     crate.invalidate_metadata()
-    crate.commit("Converted JSON test vectors to Rust tests")
+    msg = "Converted JSON test vectors to Rust tests"
+    logger.info(msg)
+    crate.vcs.commit(msg)
+
+
+@hydra.main(version_base=None, config_name="convert_tests")
+def main(cfg: ConvertConfig) -> None:
+    try:
+        _main(cfg)
+    except Exception as e:
+        logger.exception(e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

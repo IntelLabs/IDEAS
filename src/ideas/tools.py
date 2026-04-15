@@ -7,7 +7,9 @@
 import os
 import json
 from json import loads as js_loads
+from textwrap import dedent as d
 
+import tomlkit
 import logging
 import subprocess
 from functools import cached_property
@@ -23,6 +25,83 @@ logger = logging.getLogger("ideas.tools")
 DEFAULT_TEST_TIMEOUT = 10.0  # seconds
 
 
+class VCS:
+    def __init__(
+        self,
+        repo_dir: Path,
+        vcs: Literal["none", "git"] = "git",
+    ):
+        self.repo_dir = repo_dir
+        self.vcs = vcs
+
+    def init(self, force_init: bool = False) -> bool:
+        if self.vcs == "none":
+            return True
+
+        ok, out = False, ""
+        if not force_init:
+            ok, out = self("rev-parse --abbrev-ref HEAD")
+        if not ok:
+            ok, out = self("init --initial-branch=main")
+        if not ok:
+            raise ValueError(f"Failed to initialize git in {self.repo_dir}!\n{out}")
+        return ok
+
+    def add(self, *paths: Path) -> bool:
+        if self.vcs == "none":
+            return True
+
+        ok = True
+        for path in paths:
+            ok, out = self(f"add {path}")
+            if not ok:
+                raise ValueError(f"Failed to add {path}!\n{out}")
+        return ok
+
+    def commit(self, message: str = "") -> bool:
+        if self.vcs == "none":
+            return True
+
+        ok, out = self("commit --allow-empty -F -", input=message)
+        if not ok:
+            raise ValueError(f"Failed to commit changes to git!\n{out}")
+        return ok
+
+    def __call__(self, cmd, *args, **kwargs) -> tuple[bool, str]:
+        if self.vcs == "none":
+            return True, ""
+
+        success, output, error, _ = run_subprocess(
+            [self.vcs, "-C", str(self.repo_dir), *cmd.split(" "), *args], **kwargs
+        )
+        return success, output + error
+
+
+class Workspace:
+    def __init__(
+        self,
+        cargo_toml: Path,
+        vcs: Literal["none", "git"] = "none",
+    ):
+        self.cargo_toml = cargo_toml
+
+        workspace_dir = self.cargo_toml.parent
+        self.vcs = VCS(repo_dir=workspace_dir, vcs=vcs)
+
+        if not self.cargo_toml.exists():
+            # Create a new workspace
+            os.makedirs(workspace_dir, exist_ok=True)
+            self.cargo_toml.write_text(
+                d("""
+                [workspace]
+                resolver = "3"
+                """).strip()
+            )
+
+        # Initialize repository if needed
+        self.vcs.init(force_init=True)
+
+
 class Crate:
     def __init__(
         self,
@@ -30,18 +109,19 @@ class Crate:
         vcs: Literal["none", "git"] = "none",
         type: Literal["bin", "lib"] | None = None,
     ):
-        self.cargo_toml: Path = cargo_toml
-        self.vcs = vcs
+        self.cargo_toml = cargo_toml
+
+        crate_dir = self.cargo_toml.parent
+        self.vcs = VCS(repo_dir=crate_dir, vcs=vcs)
 
         if not self.cargo_toml.exists():
             # Create a new crate with specified type, but without VCS
-            crate_dir = self.cargo_toml.parent
             if not type:
                 raise ValueError(
                     f"Crate at {crate_dir} does not exist; type must be specified!"
                 )
             os.makedirs(crate_dir, exist_ok=True)
-            success, output = run_subprocess(
+            success, output, error, _ = run_subprocess(
                 [
                     "cargo",
                     "init",
@@ -53,26 +133,24 @@ class Crate:
             )
             if not success:
                 raise RuntimeError(
-                    f"Failed to create new crate at {crate_dir} with error:\n\n{output}"
+                    f"Failed to create new crate at {crate_dir} with error:\n\n{output + error}"
                 )
 
-        # Initialize repository
-        if self.vcs == "git":
-            ok, out = self.git("rev-parse --abbrev-ref HEAD")
-            if not ok:
-                ok, out = self.git("init --initial-branch=main")
-            if not ok:
-                raise ValueError(
-                    f"Failed to initialize git in {self.cargo_toml.parent}!\n{out}"
-                )
+            # Add unsafe feature that allow unsafe code
+            self.cargo_feature(unsafe=[])
+
+        # Initialize repository if needed
+        self.vcs.init()
 
     @cached_property
     def metadata(self) -> dict[str, Any]:
-        success, out = run_subprocess(
+        success, out, error, _ = run_subprocess(
             ["cargo", "metadata", "--manifest-path", str(self.cargo_toml)],
         )
         if not success:
-            raise ValueError(f"Failed to get cargo metadata from {self.cargo_toml}!\n{out}")
+            raise ValueError(
+                f"Failed to get cargo metadata from {self.cargo_toml}!\n{out + error}"
+            )
         metadata = json.loads(out)
         return metadata
 
@@ -90,6 +168,14 @@ class Crate:
 
         root_package = next(filter(lambda p: p["id"] == root, self.metadata["packages"]))
         return root_package
+
+    @property
+    def workspace_root(self) -> Path:
+        workspace_root = self.metadata.get("workspace_root", None)
+        if workspace_root is None:
+            # Standalone crates without workspace metadata fall back to crate directory.
+            return self.cargo_toml.parent
+        return Path(workspace_root)
 
     @property
     def bin_targets(self) -> list[dict[str, Any]]:
@@ -123,6 +209,10 @@ class Crate:
             )
         return rust_src_path
 
+    @property
+    def c_src_path(self) -> Path:
+        return self.rust_src_path.with_suffix(".c")
+
     def cargo_add(self, dep: str, section: str | None = None) -> str:
         cmd = [
             "cargo",
@@ -134,37 +224,31 @@ class Crate:
             cmd.append(f"--{section}")
         cmd.append(dep)
 
-        success, output = run_subprocess(cmd)
+        success, output, error, _ = run_subprocess(cmd)
         if not success:
             raise RuntimeError(
-                f"Failed to add dependency {dep} to {self.cargo_toml} with error:\n\n{output}"
+                f"Failed to add dependency {dep} to {self.cargo_toml} with error:\n\n{output + error}"
             )
 
         # Invalidate cached metadata
         self.invalidate_metadata()
         return output
 
-    def cargo_feature(self, feature: str) -> None:
-        # Create section if it doesn't exist
-        if "[features]" not in self.cargo_toml.read_text():
-            with self.cargo_toml.open("a") as f:
-                f.write("\n[features]\n")
-
-        # Add the requested feature
-        # FIXME: It's user responsibility to ensure features are cross-compatible
-        self.cargo_toml.write_text(
-            self.cargo_toml.read_text().replace("[features]\n", f"[features]\n{feature}\n")
-        )
+    def cargo_feature(self, **features: list[str]) -> None:
+        # Set/overwrite new features
+        cargo_toml = tomlkit.loads(self.cargo_toml.read_text())
+        cargo_features = cargo_toml.get("features", {})
+        for name, deps in features.items():
+            cargo_features[name] = deps
+        cargo_toml["features"] = cargo_features
+        self.cargo_toml.write_text(tomlkit.dumps(cargo_toml))
 
         # Invalidate cached metadata
         self.invalidate_metadata()
 
-    def cargo_build(self, allow_unsafe: bool = False) -> tuple[bool, str]:
-        env = os.environ.copy()
-        # Disallow unsafe by default; allow when explicitly requested
-        if not allow_unsafe:
-            env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " -D unsafe-code").strip()
-
+    def cargo_build(
+        self, allow_unsafe: bool = False, fix_E0601: bool = True
+    ) -> tuple[bool, str]:
         cmd = [
             "cargo",
             "build",
@@ -172,44 +256,30 @@ class Crate:
             "--color=never",
             f"--manifest-path={self.cargo_toml}",
         ]
-        builds, output = run_subprocess(cmd, env=env)
+        if allow_unsafe:
+            cmd += ["--features=unsafe"]
+        builds, output, error, _ = run_subprocess(cmd)
 
         # Work around E0601 error "No main function was found in a binary crate."
-        if "error[E0601]" in output:
+        if fix_E0601 and "error[E0601]" in error:
             rust_src = self.rust_src_path.read_text()
             with self.rust_src_path.open("a") as f:
-                f.write('fn main() {\n    println!("Hello, world!");\n}\n')
-            builds, output = run_subprocess(cmd, env=env)
+                f.write('\n\nfn main() {\n    println!("Hello, world!");\n}\n')
+            builds, output, error, _ = run_subprocess(cmd)
             self.rust_src_path.write_text(rust_src)
 
-        return builds, output
+        return builds, output + error
 
-    def add(self, *paths: Path) -> bool:
-        if self.vcs != "git":
-            return True
-
-        ok = True
-        for path in paths:
-            ok, out = self.git(f"add {path}")
-            if not ok:
-                raise ValueError(f"Failed to add {path}!\n{out}")
-        return ok
-
-    def commit(self, message: str = "") -> bool:
-        if self.vcs != "git":
-            return True
-
-        ok, out = self.git("commit --allow-empty -F -", input=message)
-        if not ok:
-            raise ValueError(f"Failed to commit changes to git!\n{out}")
-        return ok
-
-    def git(self, cmd, *args, **kwargs) -> tuple[bool, str]:
-        if self.vcs != "git":
-            return True, ""
-
-        repo_dir = self.cargo_toml.parent
-        return run_subprocess(["git", "-C", str(repo_dir), *cmd.split(" "), *args], **kwargs)
+    def cargo_test(self) -> tuple[bool, str, str, int | Literal["timeout"]]:
+        cmd = [
+            "cargo",
+            "test",
+            "--quiet",
+            "--color=never",
+            f"--manifest-path={self.cargo_toml}",
+            "--features=unsafe",
+        ]
+        return run_subprocess(cmd)
 
     def write(self, path: Path, data, **kwargs):
         if path.is_absolute():
@@ -223,7 +293,7 @@ def run_subprocess(
     input: str | None = None,
     timeout: float | None = None,
     **kwargs,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str, int | Literal["timeout"]]:
     try:
         result = subprocess.run(
             cmd,
@@ -234,9 +304,16 @@ def run_subprocess(
             timeout=timeout,
             **kwargs,
         )
-        return True, result.stdout
+        return True, result.stdout, result.stderr, result.returncode
     except subprocess.CalledProcessError as e:
-        return False, e.stdout + e.stderr
+        return False, e.stdout, e.stderr, e.returncode
+    except subprocess.TimeoutExpired as e:
+        return (
+            False,
+            e.stdout.decode() if e.stdout else "",
+            e.stderr.decode() if e.stderr else "",
+            "timeout",
+        )
 
 
 def compile_c(
@@ -252,7 +329,8 @@ def compile_c(
     cmd.append(source_file)
     cmd.extend(["-o", output_file])
 
-    return run_subprocess(cmd)
+    success, output, error, _ = run_subprocess(cmd)
+    return success, output + error
 
 
 def check_c(
@@ -271,7 +349,8 @@ def check_c(
     cmd.append("-")
     cmd.extend(["-o", "/dev/null"])
 
-    return run_subprocess(cmd, input=code)
+    success, output, error, _ = run_subprocess(cmd, input=code)
+    return success, output + error
 
 
 def compile_rust(
@@ -292,7 +371,8 @@ def compile_rust(
     cmd.append("-")
     cmd.extend(["-o", str(output_file)])
 
-    return run_subprocess(cmd, input=code)
+    success, output, error, _ = run_subprocess(cmd, input=code)
+    return success, output + error
 
 
 def check_rust(
@@ -312,7 +392,8 @@ def check_rust(
     with TemporaryDirectory() as dirname:
         cmd.extend(["-", "--out-dir", dirname])
 
-    return run_subprocess(cmd, input=code)
+    success, output, error, _ = run_subprocess(cmd, input=code)
+    return success, output + error
 
 
 def run_clippy(
@@ -390,7 +471,8 @@ def run_test(
     stdin = "\n".join(stdin)
 
     # Run test and right-strip output of whitespace
-    return run_subprocess([str(executable), *args], stdin, timeout=timeout)
+    success, output, error, _ = run_subprocess([str(executable), *args], stdin, timeout=timeout)
+    return success, output + error
 
 
 def check_test(
@@ -427,18 +509,3 @@ def run_and_check_tests(
     for test_case in test_cases:
         success += 1 if run_and_check_test(executable, test_case, timeout=timeout) else 0
     return success
-
-
-def clang_rename_(source: Path, renames: dict[str, str], compile_commands: Path | None = None):
-    for name, new_name in renames.items():
-        logger.info(f"{source}: renaming `{name}` to `{new_name}`")
-        cmd = ["clang-refactor-21", "local-rename"]
-        if compile_commands is not None:
-            cmd.append(f"-p={str(compile_commands.absolute())}")
-        cmd.append(f"--old-qualified-name={name}")
-        cmd.append(f"--new-qualified-name={new_name}")
-        cmd.append("-i")
-        cmd.append(str(source))
-        success, output = run_subprocess(cmd)
-        if not success:
-            raise ValueError(f"`{' '.join(cmd)}` failed!\n{output}")
