@@ -21,7 +21,7 @@ from hydra.core.hydra_config import HydraConfig
 from dspy.teleprompt.gepa.gepa_utils import DSPyTrace, ScoreWithFeedback
 
 from ideas import model, ModelConfig, GenerateConfig, tools
-from ideas.translate_symbol import SymbolTranslatorSignature
+from ideas.translate_snippet import SnippetTranslatorSignature
 
 logger = logging.getLogger("ideas.learn.translate")
 
@@ -67,7 +67,7 @@ def metric(
         # Write predicted translation
         rust_srcs = []
         for name, translation in gold.crate_translation.items():
-            if name != gold.symbol_name:
+            if name != gold.snippet_name:
                 rust_srcs.append(translation)
             else:
                 rust_srcs.append(pred_translation)
@@ -80,7 +80,9 @@ def metric(
         crate.rust_src_path.write_text(rust_src)
 
         # Attempt to build and run all tests
-        success, _ = tools.run_subprocess(["cargo", "test", f"--manifest-path={cargo_toml}"])
+        success, _, _, _ = tools.run_subprocess(
+            ["cargo", "test", f"--manifest-path={cargo_toml}"]
+        )
 
     if not success:
         return ScoreWithFeedback(
@@ -117,14 +119,14 @@ def split_examples(
         for jsonl in student_jsonl.read_text().splitlines():
             student_translation = json.loads(jsonl)
             if student_translation["success"]:
-                student_success[student_translation["symbol_name"]] = True
+                student_success[student_translation["snippet_name"]] = True
 
         # Accumulate all successful teacher translations for the crate
         crate_translation = OrderedDict()
         for jsonl in teacher_jsonl.read_text().splitlines():
             teacher_translation = json.loads(jsonl)
             if teacher_translation["success"]:
-                crate_translation[teacher_translation["symbol_name"]] = teacher_translation[
+                crate_translation[teacher_translation["snippet_name"]] = teacher_translation[
                     "translation"
                 ]
 
@@ -145,7 +147,7 @@ def split_examples(
 
             # Use failed translations for validation
             if (
-                student_success[teacher_translation["symbol_name"]]
+                student_success[teacher_translation["snippet_name"]]
                 and teacher_translation["success"]
             ):
                 train_examples.append(example)
@@ -182,7 +184,7 @@ def main(cfg: TrainConfig) -> None:
         skip_perfect_score=False,
     )
 
-    program = dspy.ChainOfThought(SymbolTranslatorSignature)
+    program = dspy.ChainOfThought(SnippetTranslatorSignature)
     optimized_program = gepa.compile(
         program,
         trainset=trainset,

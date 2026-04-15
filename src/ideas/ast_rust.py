@@ -48,8 +48,10 @@ class RustFnSignature:
         return self.__repr__() == other.__repr__()
 
 
-def get_root(code: str) -> Node:
-    tree = RUST_PARSER.parse(code.encode())
+def get_root(code: str | bytes) -> Node:
+    if isinstance(code, str):
+        code = code.encode()
+    tree = RUST_PARSER.parse(code)
     return tree.root_node
 
 

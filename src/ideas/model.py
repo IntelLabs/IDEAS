@@ -23,7 +23,7 @@ class ModelConfig:
 
 @dataclass
 class GenerateConfig:
-    max_new_tokens: int = 32000
+    max_new_tokens: int = 64000
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int | None = None

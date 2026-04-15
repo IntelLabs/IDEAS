@@ -70,6 +70,9 @@ make docker
 
 This allows for isolated execution in a reproducible environment.
 
+> [!TIP]
+> If the `OPENROUTER_API_KEY` environment variable is set on the host, it will be automatically passed to the interactive session.
+
 # Basic usage with OpenRouter
 Our translation framework treats [OpenRouter](https://openrouter.ai/) as the meta-provider of choice, allowing easy switching between models.
 The `MODEL` environment variable controls which LLM will be used, and should be the model's name on OpenRouter.

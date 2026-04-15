@@ -4,35 +4,34 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import sys
 import os
 import logging
-import sys
 from pathlib import Path
-from graphlib import TopologicalSorter, CycleError
-from collections.abc import Iterable, Container
 from dataclasses import dataclass
+from itertools import combinations
+from graphlib import TopologicalSorter, CycleError
 
 import hydra
+import networkx as nx
 from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
-from clang.cindex import CompilationDatabase, TranslationUnit, CursorKind
-from clang.cindex import Rewriter, TokenKind, SourceRange
+from clang.cindex import CompilationDatabase, TranslationUnit
 from clang.cindex import TranslationUnitLoadError, Diagnostic
 
-from ideas.ast import extract_info_c, TreeResult, Symbol
-from ideas.ast import get_internally_linked_cursors
-from ideas.tools import Crate, clang_rename_, check_c
+from ideas.ast import extract_info_c, TreeResult, Symbol, clang_rename_
+from ideas.tools import Crate, check_c
 
-logger = logging.getLogger("ideas.preprocess")
+logger = logging.getLogger("ideas.init.consolidate")
 
 
 @dataclass
 class ConsolidateConfig:
     filename: Path = MISSING
     cargo_toml: Path = MISSING
+    vcs: str = "none"
 
-    export_symbols: Path | None = None
     source_priority: Path | None = None
 
 
@@ -40,62 +39,97 @@ cs = ConfigStore.instance()
 cs.store(name="init.consolidate", node=ConsolidateConfig)
 
 
-def init(
-    compile_commands: Path,
-    export_symbols: list[str] | None = None,
-    source_priority: list[Path] | None = None,
-) -> str:
-    # Get symbol table and dependencies taking into account source priority and exported symbols,
-    # and prefix internally linked declarations/references since there can be name collisions
-    # between translation units.
-    asts = get_asts(
-        compile_commands,
-        valid_paths=source_priority,
-        prefix_internally_linked=False,
-    )
-    symbols, dependencies = get_symbols_and_dependencies(asts, source_priority, export_symbols)
+def init(compile_commands: Path, source_priority: list[Path]) -> str:
+    # Get symbol table and dependencies taking into account source priority
+    asts = get_asts(compile_commands, source_priority)
+    symbols, dependencies = get_symbols_and_dependencies(asts, source_priority)
     logger.info(f"Found {len(symbols)} symbols in {compile_commands}!")
 
-    # Assemble C sources in topological order
-    includes = get_includes(symbols)
-    sources = []
-    sorted_symbol_names = list(TopologicalSorter(dependencies).static_order())
-    for symbol_name in sorted_symbol_names:
-        # Ignore function declarations
-        if symbol_name not in symbols:
-            logger.warning(f"Skipping `{symbol_name}` ...")
-            continue
-        symbol_code = symbols[symbol_name].code
-        if symbol_code in sources:
-            continue
-        sources.append(symbol_code)
-    return "\n".join(includes) + "\n\n" + "\n\n".join(sources)
+    # Consolidate C sources in topological order
+    sources = get_includes(symbols)
+    for group in TopologicalSorter(dependencies).static_order():
+        # Add forward declarations if more than one symbol in group
+        if len(group) > 1:
+            for name in group:
+                declaration = symbols[name].declaration
+                if declaration and declaration not in sources:
+                    sources.append(declaration)
+
+        # Add symbol definitions
+        for name in group:
+            definition = symbols[name].code + "\n"
+            if definition not in sources:
+                sources.append(definition)
+    return "\n".join(sources)
 
 
 def get_symbols_and_dependencies(
     asts: list[TreeResult],
     source_priority: list[Path] | None = None,
-    export_symbols: list[str] | None = None,
-) -> tuple[dict[str, Symbol], dict[str, list[str]]]:
-    asts_symbols = [filter_symbols(ast.symbols) for ast in asts]
-    global_symbols = merge_symbols(asts_symbols, source_priority=source_priority)
+    external_symbol_names: list[str] | None = None,
+) -> tuple[dict[str, Symbol], dict[tuple[str, ...], list[tuple[str, ...]]]]:
+    source_priority = source_priority or []
 
-    # Filter global symbols to create project symbols
-    project_symbols = filter_symbols(global_symbols, filter_system=True)
-    project_dependencies = merge_complete_graphs(asts, valid_names=project_symbols)
+    # Merge ASTs into non-system project dependencies
+    list_of_non_system_symbols = [
+        {n: s for n, s in ast.symbols.items() if not s.is_system} for ast in asts
+    ]
+    project_symbols = merge_symbols(list_of_non_system_symbols, source_priority)
+    project_dependencies = nx.compose_all(
+        [
+            nx.from_dict_of_lists(ast.complete_graph, create_using=nx.DiGraph)  # type: ignore
+            for ast in asts
+        ]
+    ).subgraph(project_symbols.keys())
 
-    # Use export_symbols to filter project symbols and dependencies
-    dependencies = remove_cycles_from_graph(project_dependencies, project_symbols)
-    if export_symbols is not None:
-        export_symbols = [c14n_symbol_name(name, project_symbols) for name in export_symbols]
-        dependencies = reachable_subgraph(dependencies, export_symbols)
-    symbols = filter_symbols(project_symbols, filter_function_declarations=True)
+    # Find all reachable symbols and subgraph of dependencies from symbols with global functions/variables
+    symbols = project_symbols.copy()
+    dependencies = project_dependencies.copy()
+    if external_symbol_names is None:
+        # Use global function/variables as desired external symbol names
+        external_symbol_names = [
+            name
+            for name, symbol in symbols.items()
+            if symbol.is_global and (symbol.is_function or symbol.is_variable)
+        ]
+    if external_symbol_names:
+        paths = nx.multi_source_dijkstra_path(project_dependencies, external_symbol_names)
+        symbols = {k: v for k, v in symbols.items() if k in paths}
+        dependencies = dependencies.subgraph(symbols.keys())
+    else:
+        logger.warning("No external symbols were found/specified!")
 
+    # Remove cycles from graph by combining strongly-connected components. Note that we sort
+    # members in a SCC so they are ordered lexically.
+    def symbol_lexical_key(name: str) -> tuple[int, str, int, str]:
+        sym = symbols[name]
+        loc = sym.cursor.location
+        tu_file = Path(sym.cursor.translation_unit.spelling).resolve()
+
+        loc_file = tu_file
+        if loc.file is not None:
+            loc_file = Path(loc.file.name).resolve()
+
+        file_rank = len(source_priority)
+        if loc_file in source_priority:
+            file_rank = source_priority.index(loc_file)
+        return (file_rank, str(loc_file), loc.offset, name)
+
+    C = nx.condensation(dependencies)
+    scc_map = {n: tuple(sorted(C.nodes[n]["members"], key=symbol_lexical_key)) for n in C.nodes}
+    dependencies = {scc_map[n]: [scc_map[s] for s in C.successors(n)] for n in C.nodes}
+
+    # Make sure dependencies are topologically sortable
+    try:
+        list(TopologicalSorter(dependencies).static_order())
+    except CycleError as ex:
+        logger.error(ex)
+        raise ex
     return symbols, dependencies
 
 
-def get_includes(symbols: dict[str, Symbol]) -> set[str]:
-    includes: set[str] = set()
+def get_includes(symbols: dict[str, Symbol]) -> list[str]:
+    includes: list[str] = []
     for symbol in symbols.values():
         tu = symbol.cursor.translation_unit
         for inclusion in tu.get_includes():
@@ -111,14 +145,14 @@ def get_includes(symbols: dict[str, Symbol]) -> set[str]:
                 with open(inclusion.location.file.name, "rb") as f:
                     f.seek(inclusion.location.offset)
                     include = f.readline().decode().strip()
-                includes.add(f"#include {include}")
+                include = f"#include {include}"
+                if include not in includes:
+                    includes.append(include)
     return includes
 
 
 def get_asts(
-    compile_commands: Path,
-    valid_paths: list[Path] | None = None,
-    prefix_internally_linked: bool = False,
+    compile_commands: Path, valid_paths: list[Path], rename_conflicting_symbols: bool = True
 ) -> list[TreeResult]:
     assert compile_commands.name == "compile_commands.json"
     db = CompilationDatabase.fromDirectory(compile_commands.parent)
@@ -134,100 +168,93 @@ def get_asts(
             )
         if any(d.severity >= Diagnostic.Error for d in tu.diagnostics):
             raise TranslationUnitLoadError("\n".join([d.format() for d in tu.diagnostics]))
-        if prefix_internally_linked:
-            # FIXME: It would be nicer to add a prefix to only those symbols that collide but we
-            #        cannot know that until symbol merge time.
-            tu = add_prefix_to_internally_linked_cursors(tu, compile_commands)
         assert tu.cursor is not None
-        if valid_paths is None or Path(tu.cursor.spelling).resolve() in valid_paths:
+        if not valid_paths or Path(tu.cursor.spelling).resolve() in valid_paths:
             ast = extract_info_c(tu)
             asts.append(ast)
+    if rename_conflicting_symbols:
+        original_sources = rename_conflicting_symbols_(asts)
+        if original_sources:
+            try:
+                asts = get_asts(compile_commands, valid_paths, rename_conflicting_symbols=False)
+            finally:
+                # Always restore original source code after reparsing renamed symbols.
+                for path, source in original_sources.items():
+                    path.write_bytes(source)
     return asts
 
 
-def add_prefix_to_internally_linked_cursors(
-    tu: TranslationUnit,
-    compile_commands: Path,
-) -> TranslationUnit:
-    assert tu.cursor is not None
-    cursors = get_internally_linked_cursors(tu.cursor)
-
-    # Prefix internally-linked declarations using TU stem
-    # FIXME: TU stem isn't guaranteed to be a non-clashing since folder1/stem.c
-    #        and folder2/stem.c will produce same prefix.
-    source = Path(tu.spelling)
-    prefix = source.stem + "_"
-    renames = {cursor.spelling: prefix + cursor.spelling for cursor in cursors}
-
-    # XXX: This is an in-place rename! Would be nice to have a context manager that can automatically
-    #      restore the contents of the file. We need an in-place rename because downstream code may
-    #      use tu.cursor.spelling which needs to point to a valid file.
-    source_bytes = source.read_bytes()
-    try:
-        # Remove static visibility from internally-linked cursors
-        remove_static_keyword_(tu)
-
-        # Add prefix to internally-linked declarations
-        clang_rename_(source, renames, compile_commands=compile_commands)
-        tu.reparse()
-    finally:
-        source.write_bytes(source_bytes)
-
-    # There should be no more internally linked cursors because we made them externally visible
-    assert len(get_internally_linked_cursors(tu.cursor)) == 0
-
-    return tu
-
-
-def remove_static_keyword_(tu: TranslationUnit):
-    assert tu.cursor is not None
-    cursors = get_internally_linked_cursors(tu.cursor)
-
-    rewriter = Rewriter.create(tu)
-    for cursor in cursors:
-        # Find static keyword in cursor tokens
-        tokens = list(cursor.get_tokens())
-        for i, token in enumerate(tokens):
-            if token.kind == TokenKind.KEYWORD and token.spelling == "static":
-                # Use next token's start as end of extent so we capture the spacing between the static
-                # keyword and the next token.
-                extent = SourceRange.from_locations(
-                    token.extent.start,
-                    tokens[i + 1].extent.start if i + 1 < len(tokens) else token.extent.end,
-                )
-                rewriter.remove_text(extent)
-    rewriter.overwrite_changed_files()
-
-
-def filter_symbols(
-    symbols: dict[str, Symbol],
-    filter_system: bool = True,
-    filter_function_declarations: bool = False,
-) -> dict[str, Symbol]:
-    filtered_symbols = {}
-    for name, symbol in symbols.items():
-        # Ignore "system" symbols
-        if filter_system and symbol.cursor.location.is_in_system_header:
-            continue
-
-        # Filter function declarations
-        if filter_function_declarations:
-            if (
-                symbol.cursor.kind == CursorKind.FUNCTION_DECL
-                and not symbol.cursor.is_definition()
-            ):
+def rename_conflicting_symbols_(asts: list[TreeResult]) -> dict[Path, bytes]:
+    # Gather best representative symbol per spelling per AST into a single dict
+    symbols_with_spelling: dict[str, list[Symbol]] = {}
+    for ast in asts:
+        seen: dict[str, Symbol] = {}
+        for symbol in ast.symbols.values():
+            spelling = symbol.spelling
+            if not spelling:
                 continue
+            # Save this symbol if we haven't seen it before
+            if spelling not in seen:
+                seen[spelling] = symbol
+            # Or replace it if it's a definition and existing symbol is a declaration
+            elif symbol.is_definition and not seen[spelling].is_definition:
+                seen[spelling] = symbol
+        for spelling, sym in seen.items():
+            symbols_with_spelling.setdefault(spelling, []).append(sym)
 
-        filtered_symbols[name] = symbols[name]
-    return filtered_symbols
+    # Find symbols with common spelling but different definitions across ASTs
+    tu_renames: dict[TranslationUnit, dict[str, str]] = {}
+    for spelling, symbol1, symbol2 in (
+        (spelling, *symbol_pair)
+        for spelling, symbols in symbols_with_spelling.items()
+        for symbol_pair in combinations(symbols, r=2)
+    ):
+        # Two symbols can only clash if they have same spelling but different definitions
+        if not (symbol1.is_definition and symbol2.is_definition):
+            continue
+        if symbol1.code == symbol2.code:
+            continue
+        # Rename non-global, non-system symbols using TU stem as prefix
+        for symbol in (symbol1, symbol2):
+            if symbol.is_global or symbol.is_system:
+                continue
+            path = Path(symbol.cursor.translation_unit.spelling).resolve()
+            new_spelling = path.stem + "_" + spelling
+            tu_renames.setdefault(symbol.cursor.translation_unit, {})[symbol.name] = (
+                new_spelling
+            )
+    if not tu_renames:
+        return {}
+
+    # Check that renaming won't cause clashes with existing symbols with the same spelling
+    existing_spellings = set(symbols_with_spelling.keys())
+    for renames in tu_renames.values():
+        new_spellings = set(renames.values())
+        if existing_spellings.intersection(new_spellings):
+            raise NotImplementedError(
+                "Renaming symbols would cause clashes with existing symbols with the same spelling!"
+            )
+        existing_spellings.update(new_spellings)
+
+    # Write renames to disk while keeping track of original source bytes
+    sources: dict[Path, bytes] = {}
+    try:
+        for tu, renames in tu_renames.items():
+            # Reparse translation unit in case anything has changed on disk
+            tu.reparse()
+            clang_rename_(tu, renames, sources)
+
+    except Exception:
+        # Restore original source code if renaming fails before caller can reparse.
+        for path, source in sources.items():
+            path.write_bytes(source)
+        raise
+    return sources
 
 
 def merge_symbols(
-    list_of_symbols: list[dict[str, Symbol]], source_priority: list[Path] | None = None
+    list_of_symbols: list[dict[str, Symbol]], source_priority: list[Path]
 ) -> dict[str, Symbol]:
-    if source_priority is None:
-        source_priority = []
-
     global_symbols: dict[str, Symbol] = {}
     for symbols in list_of_symbols:
         # Gather symbols
@@ -282,119 +309,53 @@ def merge_symbols(
     return global_symbols
 
 
-def merge_complete_graphs(
-    asts: list[TreeResult], valid_names: Container[str]
-) -> dict[str, list[str]]:
-    graph: dict[str, list[str]] = {}
-    for ast in asts:
-        for node, neighbors in ast.complete_graph.items():
-            if node not in valid_names:
-                continue
-            if node not in graph:
-                graph[node] = []
-            for neighbor in neighbors:
-                if neighbor not in valid_names or neighbor in graph[node]:
-                    continue
-                graph[node].append(neighbor)
-    return dict(graph)
-
-
-def remove_cycles_from_graph(
-    graph: dict[str, list[str]], symbols: dict[str, Symbol]
-) -> dict[str, list[str]]:
-    # Remove self-dependencies from graph: symbol -> [symbol] => symbol -> []
-    for dependent, dependencies in graph.items():
-        graph[dependent] = [
-            dependency for dependency in dependencies if dependency != dependent
-        ]
-
-    # FIXME: Add more C-specific heuristics to remove cycles from the graph
-
-    # Make sure graph is topologically sortable
-    try:
-        list(TopologicalSorter(graph).static_order())
-    except CycleError as ex:
-        logger.error(ex)
-        raise ex
-    return graph
-
-
-def reachable_subgraph(
-    dependencies: dict[str, list[str]], names: Iterable[str]
-) -> dict[str, list[str]]:
-    subgraph: dict[str, list[str]] = {}
-    for name in names:
-        subgraph[name] = dependencies[name]
-        subgraph.update(reachable_subgraph(dependencies, subgraph[name]))
-    return subgraph
-
-
-def c14n_symbol_name(name: str, symbols: dict[str, Symbol]):
-    if name in symbols:
-        return name
-    if f"c:@F@{name}" in symbols:
-        return f"c:@F@{name}"
-
-    # Find symbols with spelling of name
-    potential_names = {s.name for s in symbols.values() if name in s.cursor.spelling}
-    if len(potential_names) == 0:
-        symbol_names = "\n".join(symbols.keys())
-        raise ValueError(f"Unable to find {name} in symbols:\n{symbol_names}")
-    elif len(potential_names) != 1:
-        raise ValueError(f"Unable to find {name} in symbols! Found: {potential_names}")
-    return potential_names.pop()
-
-
-@hydra.main(version_base=None, config_name="init.consolidate")
-def main(cfg: ConsolidateConfig) -> None:
+def _main(cfg: ConsolidateConfig):
     output_dir = Path(HydraConfig.get().runtime.output_dir)
 
     # Get crate information
-    crate = Crate(cargo_toml=cfg.cargo_toml)
+    crate = Crate(cargo_toml=cfg.cargo_toml, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
 
-    export_symbols = None
-    if isinstance(cfg.export_symbols, Path):
-        export_symbols = cfg.export_symbols.read_text().splitlines()
+    source_priority: list[Path] = []
+    if cfg.source_priority:
+        lines = cfg.source_priority.read_text().splitlines()
+        source_priority = [Path(line.strip()).resolve() for line in lines if line.strip()]
 
-    source_priority = None
-    if isinstance(cfg.source_priority, Path):
-        source_priority = [
-            Path(path).resolve() for path in cfg.source_priority.read_text().splitlines()
-        ]
-
-    output = init(
-        cfg.filename,
-        export_symbols=export_symbols,
-        source_priority=source_priority,
-    )
+    output = init(cfg.filename, source_priority)
 
     # Only run preprocess, compile, and assemble steps on C code
     compiles, compile_errors = check_c(output, flags=["-c"])
 
     # Write C code to disk
-    crate.rust_src_path.parent.mkdir(exist_ok=True, parents=True)
-    crate.rust_src_path.with_suffix(".c").write_text(output)
-    crate.add(crate.rust_src_path.with_suffix(".c"))
+    crate.c_src_path.parent.mkdir(exist_ok=True, parents=True)
+    crate.c_src_path.write_text(output)
+    crate.vcs.add(crate.c_src_path)
 
     # Add hydra directory
     if (output_subdir := HydraConfig.get().output_subdir) is not None:
-        crate.add(output_dir / output_subdir)
+        crate.vcs.add(output_dir / output_subdir)
 
     # If the C code didn't compile, then error loudly
     name = crate.root_package["name"]
+    msg = f"Consolidated `{name}` in {output_dir}"
     if not compiles:
-        logger.error(f"Failed to compile `{name}` C code!")
-        crate.commit(
-            f"Failed to compile `{name}` C code!\n\n{' '.join(sys.argv)}\n\n{compile_errors}"
-        )
+        msg = f"Failed to consolidate `{name}` C code!"
+        msg += f"\n\n{compile_errors}"
+        logger.error(msg)
+    else:
+        logger.info(msg)
+    crate.vcs.commit(msg)
+    if not compiles:
+        raise ValueError(f"Failed to compile consolidated `{name}` C code!")
+
+
+@hydra.main(version_base=None, config_name="init.consolidate")
+def main(cfg: ConsolidateConfig):
+    try:
+        _main(cfg)
+    except Exception as e:
+        logger.exception(e)
         sys.exit(1)
-    logger.info(f"Consolidated `{name}` in {output_dir}")
-    crate.commit(f"Consolidated `{name}`\n\n{' '.join(sys.argv)}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        logger.error(e)
-        raise e
+    main()

@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import sys
 import logging
 from pathlib import Path
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from hydra.core.hydra_config import HydraConfig
 
 from ideas.tools import Crate
 
-logger = logging.getLogger("ideas.preprocess")
+logger = logging.getLogger("ideas.init.crate")
 
 
 @dataclass
@@ -34,8 +35,7 @@ cs = ConfigStore.instance()
 cs.store(name="init.crate", node=CrateConfig)
 
 
-@hydra.main(version_base=None, config_name="init.crate")
-def main(cfg: CrateConfig) -> None:
+def _main(cfg: CrateConfig) -> None:
     output_dir = Path(HydraConfig.get().runtime.output_dir)
 
     # Initialize crate
@@ -44,23 +44,37 @@ def main(cfg: CrateConfig) -> None:
         type=cfg.crate_type,  # type: ignore[reportArgumentType]
         vcs=cfg.vcs,  # type: ignore[reportArgumentType]
     )
-    crate.add(crate.cargo_toml)
+
+    # Delete default cargo init code
+    crate.rust_src_path.write_text("")
 
     # Add static dependencies and sections
     crate.cargo_add(dep="openssl@0.10.75")
+    crate.cargo_add(dep="cc@1.2.53", section="build")
     if cfg.crate_type == "lib":
         with crate.cargo_toml.open("a") as f:
             f.write('\n[lib]\ncrate-type = ["lib", "cdylib"]\n')
         crate.invalidate_metadata()
 
-    # Add hydra directory
+    # Add cargo, workspace cargo, hydra log directory to VCS
+    crate.vcs.add(crate.cargo_toml, crate.rust_src_path)
+    if crate.metadata.get("workspace_root", None):
+        crate.vcs.add(Path(crate.metadata["workspace_root"]) / "Cargo.toml")
     if (output_subdir := HydraConfig.get().output_subdir) is not None:
-        crate.add(output_dir / output_subdir)
+        crate.vcs.add(output_dir / output_subdir)
+    msg = f"Initialized crate `{crate.root_package['name']}`"
+    logger.info(msg)
+    crate.vcs.commit(msg)
+
+
+@hydra.main(version_base=None, config_name="init.crate")
+def main(cfg: CrateConfig) -> None:
+    try:
+        _main(cfg)
+    except Exception as e:
+        logger.exception(e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        logger.error(e)
-        raise e
+    main()

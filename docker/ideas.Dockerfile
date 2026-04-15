@@ -41,7 +41,7 @@ RUN ln -s /usr/bin/clang-21 /usr/bin/clang
 
 # Install uv
 ENV UV_INSTALL_DIR="/usr/local/bin"
-RUN curl -LsSf https://astral.sh/uv/0.9.22/install.sh | sh
+RUN curl -LsSf https://astral.sh/uv/0.10.9/install.sh | sh
 
 # Install Rust toolchain non-interactively
 RUN rustup default 1.88.0
@@ -68,3 +68,6 @@ ENV GIT_COMMITTER_EMAIL="ideas@ideas.local"
 # Configure Python and uv
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV UV_LINK_MODE="copy"
+
+# Shell quality-of-life for interactive use
+COPY --chown=user:ideas ideas.bashrc /home/user/.bashrc
