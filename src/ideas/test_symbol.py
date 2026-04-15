@@ -188,15 +188,6 @@ class SymbolTester(dspy.Module):
         clang_make_extern_(self.crate.c_src_path, symbol.spelling)
         self.crate.vcs.add(self.crate.c_src_path)
 
-        # Remove reference to binding since we're testing it
-        binding_path = self.crate.rust_src_path.parent / "binding.rs"
-        orig_binding_src = binding_path.read_text()
-        binding_src = orig_binding_src.replace(f"pub mod {symbol.spelling};\n", "")
-        if binding_src == orig_binding_src:
-            logger.warning(f"Unable to find `{symbol.spelling}` in binding.rs!")
-        binding_path.write_text(binding_src)
-        self.crate.vcs.add(binding_path)
-
         # Run cargo test
         passes, output = self.test()
         msg = f"Tested symbol `{symbol.name}`"
