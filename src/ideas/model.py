@@ -50,6 +50,10 @@ def get_lm(model: ModelConfig, generate: GenerateConfig) -> dspy.LM:
 
         # Deny data collection
         provider["data_collection"] = "deny"
+        if "openai" in model.name:
+            provider["order"] = ["openai", "azure"]
+        if "anthropic" in model.name:
+            provider["order"] = ["anthropic", "anthropic/2", "google-vertex/us-east5", "azure"]
 
         # Require fp8 and limit prices for qwen3-coder
         if model.name.lower().endswith("qwen/qwen3-coder"):
