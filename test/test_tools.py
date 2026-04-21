@@ -81,7 +81,8 @@ def test_compile_rust(rust_files: tuple[str, str], tmpdir: Path):
 def test_clippy(clippy_files: str):
     # All clippy calls should trigger
     all_out = tools.run_clippy(clippy_files)
-    successes, outputs = zip(*all_out)
+    successes, stdouts, stderrs, _ = zip(*all_out)
+    outputs = [o + e for o, e in zip(stdouts, stderrs)]
     assert not any(successes)
     assert not any(map(lambda out: out == "", outputs))
 
@@ -103,7 +104,7 @@ def test_structured(rust_files: tuple[str, str], clippy_files: str, tmpdir: Path
 
     # JSON dict construction should succeed
     all_out = tools.run_clippy(clippy_files, structured_output=True)
-    _, structured_outputs = zip(*all_out)
+    _, _, structured_outputs, _ = zip(*all_out)
     structured_outputs = list(structured_outputs)
 
     with does_not_raise():
@@ -112,8 +113,8 @@ def test_structured(rust_files: tuple[str, str], clippy_files: str, tmpdir: Path
 
     # Messages rendered from the JSON dict should be identical to the original render
     all_out = tools.run_clippy(clippy_files)
-    _, outputs = zip(*all_out)
-    rendered_og_all = list(outputs)
+    _, stdouts, stderrs, _ = zip(*all_out)
+    rendered_og_all = [o + e for o, e in zip(stdouts, stderrs)]
 
     rendered_reconstructed_all = tools.structured_to_rendered(as_json_all)
     assert rendered_reconstructed_all == "".join(rendered_og_all)

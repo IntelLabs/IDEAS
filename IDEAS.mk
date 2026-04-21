@@ -55,8 +55,10 @@ build-ninja/build.log: build-ninja/cmake.log
 # init
 .PHONY: init
 init: $(patsubst %,${TRANSLATION_DIR}/%/init,${TARGETS}) ;
-${TRANSLATION_DIR}/%/init: ${TRANSLATION_DIR}/%/src/lib.c | build-ninja/lib%.so.type ;
-${TRANSLATION_DIR}/%/init: ${TRANSLATION_DIR}/%/src/main.c | build-ninja/%.type ;
+${TRANSLATION_DIR}/%/init: ${TRANSLATION_DIR}/%/src/lib.c | build-ninja/lib%.so.type
+	touch ${TRANSLATION_DIR}/$*/src/lib.c
+${TRANSLATION_DIR}/%/init: ${TRANSLATION_DIR}/%/src/main.c | build-ninja/%.type
+	touch ${TRANSLATION_DIR}/$*/src/main.c
 
 # initialize workspace
 .PRECIOUS: ${TRANSLATION_DIR}/Cargo.toml
@@ -103,7 +105,7 @@ ${TRANSLATION_DIR}/%/translate: ${TRANSLATION_DIR}/%/src/lib.rs | build-ninja/li
 ${TRANSLATION_DIR}/%/translate: ${TRANSLATION_DIR}/%/src/main.rs | build-ninja/%.type ;
 
 .PRECIOUS: ${TRANSLATION_DIR}/%/src/lib.rs
-${TRANSLATION_DIR}/%/src/lib.rs: ${TRANSLATION_DIR}/%/src/lib.c ${TRANSLATION_DIR}/%/tests/test_cases.rs | ${TRANSLATION_DIR}/%/Cargo.toml
+${TRANSLATION_DIR}/%/src/lib.rs: ${TRANSLATION_DIR}/%/src/lib.c | ${TRANSLATION_DIR}/%/Cargo.toml ${TRANSLATION_DIR}/%/tests/test_assert.rs
 	-uv run python -m ideas.translate model.name=${PROVIDER}/${MODEL} \
                                  filename=${TRANSLATION_DIR}/$*/src/lib.c \
                                  cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
@@ -210,35 +212,24 @@ test_vectors/%/%.json:
 	$(error $@ not found)
 
 
-# testgen
-.PHONY: testgen_argless
-testgen_argless: $(patsubst %,test_vectors/%/testgen_argless,${TARGETS})
-test_vectors/%/testgen_argless: | build-ninja/lib%.so.type ;
-test_vectors/%/testgen_argless: test_vectors/%/argless.json | build-ninja/%.type ;
-
-.PRECIOUS: test_vectors/%/argless.json
-test_vectors/%/argless.json: | build-ninja/%.type
-	-uv run python -m ideas.testgen artifact=build-ninja/$* \
-                                  test_vector=$@ \
-                                  hydra.output_subdir=.testgen \
-                                  hydra.job.name=testgen \
-                                  hydra.run.dir=test_vectors/$*
-
 # testgen for each C target
 .PHONY: testgen_target
-testgen_target: $(patsubst %,${TRANSLATION_DIR}/%/tests/test_assert.rs,${TARGETS}) ;
+testgen_target: $(patsubst %,test_crates/%/tests/test_assert.rs,${TARGETS}) ;
 
-${TRANSLATION_DIR}/%/tests/test_assert.rs: test_crates/%/tests/test_assert.rs build-ninja/lib%.so.type
+.PRECIOUS: test_crates/%/tests/test_assert.rs
+test_crates/%/tests/test_assert.rs: | ${TRANSLATION_DIR}/%/src/lib.c build-ninja/lib%.so.type
+	-@$(MAKE) -j1 -f $(AGENTS_MAKEFILE) test_crates/$*/tests/test_assert.rs
+
+.PRECIOUS: test_crates/%/tests/test_assert.rs
+test_crates/%/tests/test_assert.rs: | ${TRANSLATION_DIR}/%/src/main.c | build-ninja/%.type
+	-@$(MAKE) -j1 -f $(AGENTS_MAKEFILE) test_crates/$*/tests/test_assert.rs
+
+${TRANSLATION_DIR}/%/tests/test_assert.rs: test_crates/%/tests/test_assert.rs | build-ninja/lib%.so.type
 	mkdir -p $(dir $@)
 	cp test_crates/$*/tests/test_assert.rs $@
 
-.PRECIOUS: test_crates/%/tests/test_assert.rs
-test_crates/%/tests/test_assert.rs:
-	-@$(MAKE) -j1 -f $(AGENTS_MAKEFILE) test_crates/$*/tests/test_assert.rs
-
-${TRANSLATION_DIR}/%/tests/test_assert.rs: build-ninja/%.type
-	mkdir -p $(dir $@)
-	touch $@
+${TRANSLATION_DIR}/%/tests/test_assert.rs: | build-ninja/%.type
+	$(error Agent cannot generate tests for binary targets yet!)
 
 
 # clean

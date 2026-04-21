@@ -287,30 +287,39 @@ DEFINITION_START_TOKEN = {CursorKind.FUNCTION_DECL: "{", CursorKind.VAR_DECL: "=
 
 def clang_make_global_(path: Path, spelling: str):
     tu = create_translation_unit(path)
-    cursor = _find_cursor(tu, spelling)
-    if cursor.kind not in DEFINITION_START_TOKEN:
-        raise ValueError(f"Unhandled cursor kind {cursor.kind}!")
-
-    tokens = list(_get_tokens(cursor))
-    assert len(tokens) > 0
-
+    tu_path = Path(tu.spelling).resolve()
     edits: dict[tuple[int, int], bytes] = {}
 
-    for i, token in enumerate(tokens):
-        # Remove storage specifiers from declaration while preserving offsets
-        if token.kind == TokenKind.KEYWORD and token.spelling in ("static", "inline"):
-            assert i + 1 < len(tokens), "storage specifier should always come before name"
-            start_offset = token.extent.start.offset
-            # Use start of next token as end offset to remove any whitespace
-            end_offset = tokens[i + 1].extent.start.offset
-            edits[(start_offset, end_offset)] = b""
-
-        # Don't change anything after definition start
-        elif (
-            token.kind == TokenKind.PUNCTUATION
-            and token.spelling == DEFINITION_START_TOKEN[cursor.kind]
+    for cursor in _find_cursors(tu, spelling):
+        # We don't handle cursors not in the provided translation unit or anything without a definition
+        if (
+            cursor.location.file is None
+            or Path(cursor.location.file.name).resolve() != tu_path
+            or Path(cursor.extent.start.file.name).resolve() != tu_path
+            or Path(cursor.extent.end.file.name).resolve() != tu_path
         ):
-            break
+            raise NotImplementedError(f"Found `{spelling}` cursor {cursor}` not in {tu_path}!")
+        if cursor.kind not in DEFINITION_START_TOKEN:
+            raise ValueError(f"Unhandled cursor kind {cursor.kind}!")
+
+        tokens = list(_get_tokens(cursor))
+        assert len(tokens) > 0
+
+        for i, token in enumerate(tokens):
+            # Remove storage specifiers from declaration while preserving offsets
+            if token.kind == TokenKind.KEYWORD and token.spelling in ("static", "inline"):
+                assert i + 1 < len(tokens), "storage specifier should always come before name"
+                start_offset = token.extent.start.offset
+                # Use start of next token as end offset to remove any whitespace
+                end_offset = tokens[i + 1].extent.start.offset
+                edits[(start_offset, end_offset)] = b""
+
+            # Don't change anything after definition start
+            elif (
+                token.kind == TokenKind.PUNCTUATION
+                and token.spelling == DEFINITION_START_TOKEN[cursor.kind]
+            ):
+                break
 
     if edits:
         _apply_edits(path, edits)
@@ -318,52 +327,61 @@ def clang_make_global_(path: Path, spelling: str):
 
 def clang_make_extern_(path: Path, spelling: str):
     tu = create_translation_unit(path)
-    cursor = _find_cursor(tu, spelling)
-    # Determine punctuation token to find based on cursor kind (function or variable)
-    if cursor.kind not in DEFINITION_START_TOKEN:
-        raise ValueError(f"Unhandled cursor kind {cursor.kind}!")
-
-    tokens = list(_get_tokens(cursor))
-    assert len(tokens) > 0
-
+    tu_path = Path(tu.spelling).resolve()
     edits: dict[tuple[int, int], bytes] = {}
-    is_extern = False
-    definition_start_token_idx = None
 
-    for i, token in enumerate(tokens):
-        # Remove storage specifiers from declaration while preserving offsets
-        if token.kind == TokenKind.KEYWORD and token.spelling in ("static", "inline"):
-            assert i + 1 < len(tokens), "storage specifier should always come before name"
-            start_offset = token.extent.start.offset
-            # Use start of next token as end offset to remove any whitespace
-            end_offset = tokens[i + 1].extent.start.offset
-            edits[(start_offset, end_offset)] = b""
-
-        # Check if extern keyword already present
-        elif token.kind == TokenKind.KEYWORD and token.spelling == "extern":
-            is_extern = True
-
-        # Record the first definition-opening token.
-        elif (
-            definition_start_token_idx is None
-            and token.kind == TokenKind.PUNCTUATION
-            and token.spelling == DEFINITION_START_TOKEN[cursor.kind]
+    for cursor in _find_cursors(tu, spelling):
+        # We don't handle cursors not in the provided translation unit or anything without a definition
+        if (
+            cursor.location.file is None
+            or Path(cursor.location.file.name).resolve() != tu_path
+            or Path(cursor.extent.start.file.name).resolve() != tu_path
+            or Path(cursor.extent.end.file.name).resolve() != tu_path
         ):
-            definition_start_token_idx = i
-            break
+            raise NotImplementedError(f"Found `{spelling}` cursor `{cursor}` not in {tu_path}!")
+        if cursor.kind not in DEFINITION_START_TOKEN:
+            raise ValueError(f"Unhandled cursor kind {cursor.kind}!")
 
-    # Replace definition portion with ';'
-    if definition_start_token_idx is not None:
-        assert definition_start_token_idx > 0
-        # Use end of prior token as end offset to remove any whitespace
-        start_pos = tokens[definition_start_token_idx - 1].extent.end.offset
-        end_pos = cursor.extent.end.offset
-        edits[(start_pos, end_pos)] = b";"
+        tokens = list(_get_tokens(cursor))
+        assert len(tokens) > 0
 
-    # Add 'extern ' prefix if not already present
-    if not is_extern:
-        extern_insert_pos = cursor.extent.start.offset
-        edits[(extern_insert_pos, extern_insert_pos)] = b"extern "
+        is_extern = False
+        definition_start_token_idx = None
+
+        for i, token in enumerate(tokens):
+            # Remove storage specifiers from declaration while preserving offsets
+            if token.kind == TokenKind.KEYWORD and token.spelling in ("static", "inline"):
+                assert i + 1 < len(tokens), "storage specifier should always come before name"
+                start_offset = token.extent.start.offset
+                # Use start of next token as end offset to remove any whitespace
+                end_offset = tokens[i + 1].extent.start.offset
+                edits[(start_offset, end_offset)] = b""
+
+            # Check if extern keyword already present
+            elif token.kind == TokenKind.KEYWORD and token.spelling == "extern":
+                is_extern = True
+
+            # Record the first definition-opening token.
+            elif (
+                definition_start_token_idx is None
+                and token.kind == TokenKind.PUNCTUATION
+                and token.spelling == DEFINITION_START_TOKEN[cursor.kind]
+            ):
+                definition_start_token_idx = i
+                break
+
+        # Replace definition portion with ';'
+        if definition_start_token_idx is not None:
+            assert definition_start_token_idx > 0
+            # Use end of prior token as end offset to remove any whitespace
+            start_pos = tokens[definition_start_token_idx - 1].extent.end.offset
+            end_pos = cursor.extent.end.offset
+            edits[(start_pos, end_pos)] = b";"
+
+        # Add 'extern ' prefix if not already present
+        if not is_extern:
+            extern_insert_pos = cursor.extent.start.offset
+            edits[(extern_insert_pos, extern_insert_pos)] = b"extern "
 
     if edits:
         _apply_edits(path, edits)
@@ -391,9 +409,8 @@ def _get_tokens(cursor: Cursor):
     yield from tu.get_tokens(extent=extent)
 
 
-def _find_cursor(tu: TranslationUnit, spelling: str) -> Cursor:
-    definition: Cursor | None = None
-    declaration: Cursor | None = None
+def _find_cursors(tu: TranslationUnit, spelling: str) -> list[Cursor]:
+    candidates: list[Cursor] = []
 
     assert tu.cursor is not None
     for cursor in tu.cursor.walk_preorder():
@@ -401,16 +418,38 @@ def _find_cursor(tu: TranslationUnit, spelling: str) -> Cursor:
             continue
         if cursor.spelling != spelling:
             continue
-        if cursor.is_definition():
-            definition = cursor
-            break
-        if declaration is None:
-            declaration = cursor
+        if cursor.semantic_parent is None:
+            continue
+        if cursor.semantic_parent.kind != CursorKind.TRANSLATION_UNIT:
+            continue
+        if cursor.location.is_in_system_header:
+            continue
+        candidates.append(cursor)
 
-    target = definition or declaration
-    if target is None:
+    if len(candidates) == 0:
         raise ValueError(f"Unable to find function or variable with spelling `{spelling}`")
-    return target
+
+    definitions = [cursor for cursor in candidates if cursor.is_definition()]
+    definition_usrs = {cursor.get_usr() for cursor in definitions if cursor.get_usr()}
+    if len(definition_usrs) > 1:
+        raise ValueError(
+            f"Ambiguous symbol `{spelling}` with multiple definitions: {sorted(definition_usrs)}"
+        )
+
+    if len(definition_usrs) == 1:
+        target_usr = next(iter(definition_usrs))
+    else:
+        declaration_usrs = {cursor.get_usr() for cursor in candidates if cursor.get_usr()}
+        if len(declaration_usrs) > 1:
+            raise ValueError(
+                f"Ambiguous symbol `{spelling}` with multiple declarations: {sorted(declaration_usrs)}"
+            )
+        target_usr = next(iter(declaration_usrs)) if len(declaration_usrs) == 1 else ""
+
+    if not target_usr:
+        return candidates
+
+    return [cursor for cursor in candidates if cursor.get_usr() == target_usr]
 
 
 def _apply_edits(path: Path, edits: dict[tuple[int, int], bytes]):

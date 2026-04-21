@@ -13,7 +13,7 @@ import dspy
 import networkx as nx
 
 from .ast import Symbol
-from .tools import Crate
+from .tools import Crate, STATIC_TRANSLATIONS
 
 logger = logging.getLogger("ideas.translate_recurrent")
 
@@ -90,7 +90,7 @@ class RecurrentTranslator(dspy.Module):
 
             # Use static translation for any symbol that a variable depends on
             static_translation = ""
-            if any(
+            if STATIC_TRANSLATIONS and any(
                 nx.has_path(G, group_with_variable, symbol_names)
                 for group_with_variable in symbol_names_with_variable
             ):
@@ -137,6 +137,11 @@ class RecurrentTranslator(dspy.Module):
         prior_translation, feedback = "", ""
         pred = dspy.Prediction()
         for i in range(max(self.max_iters, 1)):
+            # Save these in case translation fails
+            orig_c_src = self.crate.c_src_path.read_bytes()
+            orig_rust_src = self.crate.rust_src_path.read_bytes()
+            orig_wrappers_src = self._snapshot_wrappers()
+
             # Attempt translation and exit early on success
             pred = self.translate(
                 reference_code,
@@ -148,6 +153,11 @@ class RecurrentTranslator(dspy.Module):
             )
             if pred.success:
                 break
+
+            # Restore to original state since translation failed
+            self.crate.c_src_path.write_bytes(orig_c_src)
+            self.crate.rust_src_path.write_bytes(orig_rust_src)
+            self._restore_wrappers(orig_wrappers_src)
 
             # On failure log a diff against prior translation
             name = " ".join([f"`{s.name}`" for s in symbols])
@@ -169,44 +179,29 @@ class RecurrentTranslator(dspy.Module):
 
             # Create feedback for next iteration
             prior_translation = pred.translation.code
-            feedback = "Carefully compare the Rust translation in `prior_translation` with the C `snippet` and find where any mis-translations happen. Then use this knowledge to generate a correct Rust `translation` of the C `snippet`. You should treat the C `snippet` as correct, so if the C `snippet` has a bug, you should replicate that bug in the Rust `translation` too."
+            feedback = pred.feedback
         return pred
 
-    def _snapshot_wrapper_files(self) -> tuple[dict[Path, str], set[Path]]:
-        wrapper_paths: dict[Path, str] = {}
+    def _snapshot_wrappers(self) -> dict[Path, bytes]:
+        wrappers: dict[Path, bytes] = {}
+
+        path = self.crate.rust_src_path.parent / "wrapper.rs"
+        if path.exists() and path.is_file():
+            wrappers[path] = path.read_bytes()
+
         wrapper_dir = self.crate.rust_src_path.parent / "wrapper"
-        wrapper_mod = self.crate.rust_src_path.parent / "wrapper.rs"
-
-        if wrapper_mod.exists():
-            wrapper_paths[wrapper_mod] = wrapper_mod.read_text()
-
-        existing_wrapper_files: set[Path] = set()
         if wrapper_dir.exists():
-            existing_wrapper_files = set(
-                path for path in wrapper_dir.rglob("*.rs") if path.is_file()
-            )
-            for path in existing_wrapper_files:
-                wrapper_paths[path] = path.read_text()
+            for path in wrapper_dir.glob("*.rs"):
+                if path.exists() and path.is_file():
+                    wrappers[path] = path.read_bytes()
 
-        return wrapper_paths, existing_wrapper_files
+        return wrappers
 
-    def _restore_wrapper_files(
-        self, original_wrapper_src: dict[Path, str], existing_wrapper_files: set[Path]
-    ) -> None:
-        wrapper_dir = self.crate.rust_src_path.parent / "wrapper"
-        wrapper_mod = self.crate.rust_src_path.parent / "wrapper.rs"
-
-        if wrapper_mod.exists() and wrapper_mod not in original_wrapper_src:
-            wrapper_mod.unlink()
-
-        if wrapper_dir.exists():
-            for path in (path for path in wrapper_dir.rglob("*.rs") if path.is_file()):
-                if path not in existing_wrapper_files:
-                    path.unlink()
-
-        for path, src in original_wrapper_src.items():
+    def _restore_wrappers(self, wrappers: dict[Path, bytes]) -> None:
+        for path, src in wrappers.items():
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(src)
+            path.write_bytes(src)
+            self.crate.vcs.add(path)
 
     def translate(
         self,
@@ -217,9 +212,6 @@ class RecurrentTranslator(dspy.Module):
         feedback: str = "",
         translation: str = "",
     ) -> dspy.Prediction:
-        orig_rust_src = self.crate.rust_src_path.read_text()
-        original_wrapper_src, existing_wrapper_files = self._snapshot_wrapper_files()
-
         # Translate symbols and save it if successful
         pred = self.translate_symbol(
             name=" ".join(symbol.name for symbol in symbols),
@@ -245,6 +237,9 @@ class RecurrentTranslator(dspy.Module):
             # We can only hybrid build-test functions and variables
             if not (symbol.is_function and symbol.is_definition) and not symbol.is_variable:
                 continue
+            # If we can't test symbols, then only wrap globals
+            if self.test_symbol is None and not symbol.is_global:
+                continue
 
             # Wrap function or annotate variable
             wrapper = self.wrap_symbol(symbol, reference_code, unsafe_translation)
@@ -257,21 +252,21 @@ class RecurrentTranslator(dspy.Module):
             # If wrapping failed exit early
             if not wrapper.success:
                 pred.success = False
+                pred.feedback = wrapper.feedback
                 break
 
             # Try testing symbol and exit early if it fails
-            if self.test_symbol and not self.test_symbol(symbol):
+            if not self.test_symbol:
+                continue
+            test = self.test_symbol(symbol)
+            if not test.success:
                 pred.success = False
+                pred.feedback = test.feedback
                 break
 
+        # Cache successful translation and wrappers
         if pred.success:
-            # Write successful translation and wrappers to cache
             self.translate_symbol.write_cache(pred)
             for wrapper in wrappers:
                 self.wrap_symbol.write_cache(wrapper)
-        else:
-            # Restore Rust source and wrapper files to original state since translation failed
-            self.crate.rust_src_path.write_text(orig_rust_src)
-            self._restore_wrapper_files(original_wrapper_src, existing_wrapper_files)
-
         return pred

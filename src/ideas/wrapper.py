@@ -24,7 +24,7 @@ from ideas import create_translation_unit, extract_info_c
 from ideas.adapters import Code
 from ideas.init.consolidate import get_symbols_and_dependencies
 from ideas.ast_rust import get_nodes, get_root, validate_changes
-from ideas.ast import Symbol
+from ideas.ast import Symbol, clang_make_global_
 
 logger = logging.getLogger("ideas.wrapper")
 CodeRust = Code["rust"]
@@ -73,22 +73,29 @@ class Signature(dspy.Signature):
     wrapper: CodeRust = dspy.OutputField()
 
 
-def generate_unimplemented_wrapper(crate: Crate, symbol_name: str) -> str:
-    # unsafe extern "C" {
-    #     pub fn helloworld() -> ::std::os::raw::c_int;
-    # }
-    ok, bindgen_wrapper, error, _ = run_subprocess(
-        [
-            "bindgen",
-            "--disable-header-comment",
-            "--no-doc-comments",
-            "--no-layout-tests",
-            "--sort-semantically",
-            str(crate.c_src_path),
-            "--allowlist-function",
-            symbol_name,
-        ]
-    )
+def generate_unimplemented_wrapper(path: Path, symbol_name: str) -> str:
+    orig_src = path.read_bytes()
+    try:
+        # Make sure symbol is global, this is why we save original bytes
+        clang_make_global_(path, symbol_name)
+
+        # unsafe extern "C" {
+        #     pub fn helloworld() -> ::std::os::raw::c_int;
+        # }
+        ok, bindgen_wrapper, error, _ = run_subprocess(
+            [
+                "bindgen",
+                "--disable-header-comment",
+                "--no-doc-comments",
+                "--no-layout-tests",
+                "--sort-semantically",
+                str(path),
+                "--allowlist-function",
+                symbol_name,
+            ]
+        )
+    finally:
+        path.write_bytes(orig_src)
     if not ok:
         raise ValueError(
             f"Bindgen failed to generate wrapper for `{symbol_name}`!\nError:\n{error}"
@@ -142,9 +149,9 @@ class WrapperGenerator(dspy.Module):
         sync_path.write_text((Path(__file__).parent / "sync.rs").read_text())
         self.crate.vcs.add(sync_path)
 
-        # Make sure wrapper module exists
+        # Make sure wrapper module is in known state (i.e., empty)
         self.wrapper_path = crate.rust_src_path.parent / "wrapper.rs"
-        self.wrapper_path.touch()
+        self.wrapper_path.write_text("")
 
     def forward(self, symbol: Symbol, reference_code: str, translation: str) -> dspy.Prediction:
         if symbol.is_function and symbol.is_definition:
@@ -152,22 +159,25 @@ class WrapperGenerator(dspy.Module):
         elif symbol.is_variable:
             return self.annotate_variable(symbol, reference_code, translation)
         else:
-            logger.info(f"Skipping wrap of symbol `{symbol.name}`")
-            return dspy.Prediction()
+            raise NotImplementedError
 
     def annotate_variable(
         self, symbol: Symbol, reference_code: str, translation: str
     ) -> dspy.Prediction:
         logger.info(f"Adding export_name attribute to variable `{symbol.name}` ...")
-        orig_rust_src = self.crate.rust_src_path.read_text()
-        assert translation in orig_rust_src, "translation must be on disk!"
-        rust_src = orig_rust_src
+        rust_src = self.crate.rust_src_path.read_text()
+        if translation not in rust_src:
+            raise RuntimeError("Translation must be on disk!")
 
         # Add export_name attribute to symbol translation
         new_translation = export_first_unannotated_variable(translation, symbol.spelling)
         if new_translation is None:
             logger.error(f"Failed to add export_name attribute to variable `{symbol.name}`")
-            return dspy.Prediction(success=False, translation=translation)
+            return dspy.Prediction(
+                success=False,
+                translation=translation,
+                feedback=f"Could not find a Rust variable named `{symbol.name}` in the translation!",
+            )
 
         # Update Rust source with export_name attribute
         rust_src = rust_src.replace(translation, new_translation)
@@ -200,18 +210,16 @@ class WrapperGenerator(dspy.Module):
 
         logger.info(f"Generating wrapper for function `{symbol.name}` ...")
 
-        # Write blank wrapper and ensure only that blank wrapper is referenced since we're going to build
+        # Use bindgen to generate unimplemented wrapper and write to disk to make sure we can actually build
+        unimplemented_wrapper = generate_unimplemented_wrapper(
+            self.crate.c_src_path, symbol.spelling
+        )
         symbol_wrapper_path = self.wrapper_path.parent / "wrapper" / f"{symbol.spelling}.rs"
         symbol_wrapper_path.parent.mkdir(exist_ok=True, parents=True)
-        symbol_wrapper_path.write_text("")
-
-        # Try building the crate with an empty wrapper and if it fails then just return the unimplemented wrapper
-        max_iters = max(1, self.max_iters) if self._build(symbol.spelling) == (True, "") else 0
-
-        # Use bindgen to generate unimplemented wrapper and write to disk. Note the unimplemented
-        # wrapper contains unsafe code!
-        unimplemented_wrapper = generate_unimplemented_wrapper(self.crate, symbol.spelling)
         symbol_wrapper_path.write_text(unimplemented_wrapper)
+        success, build_feedback = self._build(symbol.spelling)
+        if not success:
+            raise RuntimeError(f"The crate does not build!\n\n{build_feedback}")
 
         # Prefer supplied wrapper, crate cache, then read-only cache.
         wrapper = (
@@ -236,7 +244,7 @@ class WrapperGenerator(dspy.Module):
         dspy_exception = None
         scope_feedback: OrderedDict[str, str] = OrderedDict()
         pred = dspy.Prediction()
-        for i in range(max_iters):
+        for i in range(max(self.max_iters, 1)):
             # Use the wrapper from the prior iteration as feedback for the next iteration
             if i > 0:
                 prior_wrapper = wrapper
@@ -283,31 +291,26 @@ class WrapperGenerator(dspy.Module):
             success = success and not build_feedback and not scope_feedback
 
             if success:
+                # Reference successful symbol wrapper in wrapper module
+                with self.wrapper_path.open("a") as f:
+                    f.write(f"pub mod {symbol.spelling};\n")
+                self.crate.vcs.add(self.wrapper_path)
+
+                # Log and commit success
                 msg = f"Wrapped function `{symbol.name}`"
                 logger.info(msg)
                 if "reasoning" in pred:
                     msg += f"\n\n# Reasoning\n{pred.reasoning}"
+                self.crate.vcs.commit(msg)
                 break
 
-            msg = f"Failed to wrap function `{symbol.name}` ({i + 1}/{max_iters})"
+            # Log and commit failure
+            msg = f"Failed to wrap function `{symbol.name}` ({i + 1}/{self.max_iters})"
             logger.error(msg)
             msg += f"\n\n# Reasoning\n{pred.reasoning}" if "reasoning" in pred else ""
             msg += f"\n\n# Build feedback\n{build_feedback}"
             msg += f"\n\n# Scope Feedback\n{scope_feedback}"
             self.crate.vcs.commit(msg)
-
-        # Reference symbol wrapper in wrapper module
-        with self.wrapper_path.open("a") as f:
-            f.write(f"pub mod {symbol.spelling};\n")
-        self.crate.vcs.add(self.wrapper_path)
-
-        # Write unimplemented wrapper to disk if generation failed
-        if not success:
-            symbol_wrapper_path.write_text(unimplemented_wrapper)
-            self.crate.vcs.add(symbol_wrapper_path)
-            msg = f"Wrote unimplemented wrapper for `{symbol.name}`"
-            logger.warning(msg)
-        self.crate.vcs.commit(msg)
 
         # All iterations failed because of DSPy exceptions
         if dspy_exception:
@@ -321,11 +324,14 @@ class WrapperGenerator(dspy.Module):
         pred.prior_wrapper = prior_wrapper
         pred.build_feedback = build_feedback
         pred.scope_feedback = "\n\n".join(scope_feedback.values())
+        if not success:
+            # Feedback for translator
+            pred.feedback = "It was difficult to generate a C-compatible FFI wrapper for the translation. Regenerate the translation with clear, explicit, wrapper-friendly Rust function boundaries and straightforward ownership, while keeping the translation fully memory-safe and free of unsafe constructs."
         return pred
 
     def _build(self, symbol_spelling: str) -> tuple[bool, str]:
-        orig_rust_src = self.crate.rust_src_path.read_text()
-        orig_wrapper_src = self.wrapper_path.read_text()
+        orig_rust_src = self.crate.rust_src_path.read_bytes()
+        orig_wrapper_src = self.wrapper_path.read_bytes()
 
         # Reference wrapper module in Rust source
         with self.crate.rust_src_path.open("a") as f:
@@ -341,8 +347,8 @@ class WrapperGenerator(dspy.Module):
         success, feedback = self.crate.cargo_build(allow_unsafe=True)
 
         # Restore original source
-        self.crate.rust_src_path.write_text(orig_rust_src)
-        self.wrapper_path.write_text(orig_wrapper_src)
+        self.crate.rust_src_path.write_bytes(orig_rust_src)
+        self.wrapper_path.write_bytes(orig_wrapper_src)
 
         return success, feedback
 

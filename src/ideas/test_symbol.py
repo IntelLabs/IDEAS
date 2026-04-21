@@ -12,7 +12,7 @@ from pathlib import Path
 import dspy
 
 from .tools import Crate, run_subprocess
-from .ast import Symbol, clang_make_global_, clang_make_extern_
+from .ast import Symbol, clang_make_extern_
 
 logger = logging.getLogger("ideas.test_symbol")
 
@@ -25,21 +25,25 @@ class SymbolTester(dspy.Module):
         # Write a build script to compile C code as a static library and link to it
         self.write_build_script_()
 
-        # Rewrite C code to make each function global. Then generate a Rust binding for it
-        # to force the Rust linker to include that C function in the Rust artifact.
+        # Generate a Rust binding for any global function since we need to force the Rust
+        # linker to include that C function in the Rust artifact.
         # FIXME: If we ever test variables we should generate bindings for those here too!
+        binding_path = self.crate.rust_src_path.parent / "binding.rs"
+        binding_path.write_text("")
         self.main_function = ""
         for symbol in symbols:
-            if not (symbol.is_function and symbol.is_definition):
+            if not (symbol.is_function and symbol.is_definition and symbol.is_global):
                 continue
             if self.crate.is_bin and symbol.spelling == "main":
                 # main requires special handling because we must bind to it as _main and
                 # statically create a Rust main that calls it
                 self.main_function = self.write_main_binding()
             else:
-                clang_make_global_(self.crate.c_src_path, symbol.spelling)
                 self.write_symbol_binding_(symbol.spelling)
-        self.crate.vcs.add(self.crate.c_src_path)
+
+        # These files are modified by test
+        orig_binding_src = binding_path.read_bytes()
+        orig_rust_src = self.crate.rust_src_path.read_bytes()
 
         # Check whether all of the changes compile and commit them
         passes, output = self.test()
@@ -47,6 +51,10 @@ class SymbolTester(dspy.Module):
         if not passes:
             msg = f"Failed to prepare `{self.crate.root_package['name']}` for symbol testing!"
         self.crate.vcs.commit(msg)
+
+        # Restore originals
+        binding_path.write_bytes(orig_binding_src)
+        self.crate.rust_src_path.write_bytes(orig_rust_src)
 
         # Error loudly if changes don't build
         if not passes:
@@ -121,65 +129,50 @@ class SymbolTester(dspy.Module):
             )
 
     def test(self) -> tuple[bool, str]:
-        orig_rust_src = self.crate.rust_src_path.read_text()
-        rust_src = orig_rust_src
+        rust_src = self.crate.rust_src_path.read_text()
 
         # Remove forbid unsafe from Rust source
-        rust_src = re.sub(re.escape("#![forbid(unsafe_code)]"), "", rust_src)
+        rust_src = rust_src.replace("#![forbid(unsafe_code)]", "")
 
         # Replace Rust Mutex with C ABI-compatible Mutex in Rust source
         RUST_MUTEX = "use std::sync::{Mutex, MutexGuard};"
         C_ABI_MUTEX = "mod sync;\nuse crate::sync::{Mutex, MutexGuard};"
-        rust_src = re.sub(
-            f"^{re.escape(RUST_MUTEX)}$", C_ABI_MUTEX, rust_src, flags=re.MULTILINE
-        )
+        rust_src = rust_src.replace(RUST_MUTEX, C_ABI_MUTEX)
 
         # Reference wrapper module in Rust source
         WRAPPER_MOD = "pub mod wrapper;"
-        wrapper_src_path = self.crate.rust_src_path.parent / "wrapper.rs"
-        wrapper_src_path.touch()
-        self.crate.vcs.add(wrapper_src_path)
-        if not re.search(f"^{re.escape(WRAPPER_MOD)}$", rust_src, flags=re.MULTILINE):
+        if WRAPPER_MOD not in rust_src:
             rust_src += WRAPPER_MOD + "\n"
+        wrapper_path = self.crate.rust_src_path.parent / "wrapper.rs"
+        wrapper_path.touch()
 
         # Reference binding module in Rust source
         BINDING_MOD = "pub mod binding;"
-        binding_src_path = self.crate.rust_src_path.parent / "binding.rs"
-        binding_src_path.touch()
-        orig_binding_src = binding_src_path.read_text()
-        binding_src = orig_binding_src
-        if not re.search(f"^{re.escape(BINDING_MOD)}$", rust_src, flags=re.MULTILINE):
+        if BINDING_MOD not in rust_src:
             rust_src += BINDING_MOD + "\n"
-
-        binding_src_path.write_text(binding_src)
-        self.crate.vcs.add(binding_src_path)
+        binding_path = self.crate.rust_src_path.parent / "binding.rs"
+        binding_path.touch()
 
         self.crate.rust_src_path.write_text(rust_src)
-        self.crate.vcs.add(self.crate.rust_src_path)
 
-        # Try building the crate, which should always works, before testing and detect
-        # if we need to insert a main
+        # Try building the crate to detect if we need to insert a main
         builds, feedback = self.crate.cargo_build(allow_unsafe=True, fix_E0601=False)
         if "error[E0601]" in feedback and self.main_function:
-            binding_src += "pub mod main;\n"
-            binding_src_path.write_text(binding_src)
-            self.crate.vcs.add(binding_src_path)
+            with binding_path.open("a+") as f:
+                f.write("pub mod main;\n")
+            with self.crate.rust_src_path.open("a+") as f:
+                f.write(self.main_function)
 
-            rust_src += self.main_function
-            self.crate.rust_src_path.write_text(rust_src)
-            self.crate.vcs.add(self.crate.rust_src_path)
+        self.crate.vcs.add(wrapper_path, binding_path, self.crate.rust_src_path)
+
+        # Make sure the crate builds before testing
         builds, feedback = self.crate.cargo_build(allow_unsafe=True, fix_E0601=False)
         if not builds:
             raise RuntimeError(f"Crate does not build!\n{feedback}")
         passes, output, error, _ = self.crate.cargo_test()
-
-        # Restore originals
-        binding_src_path.write_text(orig_binding_src)
-        self.crate.rust_src_path.write_text(orig_rust_src)
-
         return passes, output + error
 
-    def forward(self, symbol: Symbol) -> bool:
+    def forward(self, symbol: Symbol) -> dspy.Prediction:
         logger.info(f"Testing symbol `{symbol.name}` ....")
 
         # Overwrite C symbol to reference extern symbol that we will link to the Rust symbol.
@@ -188,16 +181,30 @@ class SymbolTester(dspy.Module):
         clang_make_extern_(self.crate.c_src_path, symbol.spelling)
         self.crate.vcs.add(self.crate.c_src_path)
 
+        # These files are modified by test
+        binding_path = self.crate.rust_src_path.parent / "binding.rs"
+        orig_binding_src = binding_path.read_bytes()
+        orig_rust_src = self.crate.rust_src_path.read_bytes()
+
         # Run cargo test
-        passes, output = self.test()
+        passes, feedback = self.test()
         msg = f"Tested symbol `{symbol.name}`"
         if not passes:
+            feedback = "Running `cargo test` fails!\n" + feedback
             msg = f"Failed to test symbol `{symbol.name}`"
             logger.error(msg)
-            msg += f"\n\n{output}"
+            msg += f"\n\n{feedback}"
         self.crate.vcs.commit(msg)
 
-        return passes
+        # Restore originals
+        binding_path.write_bytes(orig_binding_src)
+        self.crate.rust_src_path.write_bytes(orig_rust_src)
+
+        pred = dspy.Prediction(success=passes)
+        if not passes:
+            # FIXME: Use test feedback?
+            pred.feedback = "Carefully compare the Rust translation in `prior_translation` with the C `snippet` and find where any mis-translations happen. Then use this knowledge to generate a correct Rust `translation` of the C `snippet`. You should treat the C `snippet` as correct, so if the C `snippet` has a bug, you should replicate that bug in the Rust `translation` too."
+        return pred
 
 
 def get_linked_binding(function_name: str, c_src_path: Path, *bindgen_args: str) -> str:

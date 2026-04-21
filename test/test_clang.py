@@ -668,3 +668,46 @@ def test_enum_in_struct():
             """
         ).strip()
     )
+
+
+def test_clang_make_extern_multiple_declarations(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            static int f(int x);
+            int f(int x);
+            static int f(int x) {
+                return x + 1;
+            }
+            """
+        )
+    )
+
+    ast.clang_make_extern_(c_path, "f")
+    transformed = c_path.read_text()
+
+    assert transformed.count("extern int f(int x);") == 3
+    assert "static int f" not in transformed
+    assert "{" not in transformed
+
+
+def test_clang_make_global_multiple_declarations(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            static int v;
+            extern int v;
+            static int v = 42;
+            """
+        )
+    )
+
+    ast.clang_make_global_(c_path, "v")
+    transformed = c_path.read_text()
+
+    assert "static int v" not in transformed
+    assert "int v = 42;" in transformed
+    assert "extern int v;" in transformed
+    assert transformed.count("int v;") == 2
