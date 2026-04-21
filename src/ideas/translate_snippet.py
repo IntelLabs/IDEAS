@@ -83,7 +83,7 @@ class SnippetTranslator(dspy.Module):
             or _read_cache(self.cache, name, snippet)
             or _read_cache(self.readonly_cache, name, snippet)
         )
-        orig_rust_src = self.crate.rust_src_path.read_text()
+        orig_rust_src = self.crate.rust_src_path.read_bytes()
         pred = dspy.Prediction()
         builds = False
         dspy_exception = None
@@ -149,7 +149,7 @@ class SnippetTranslator(dspy.Module):
             msg += f"\n\n# Reasoning\n{pred.reasoning}" if "reasoning" in pred else ""
             msg += f"\n\n# Feedback\n{feedback}" if feedback else ""
             self.crate.vcs.commit(msg)
-        self.crate.rust_src_path.write_text(orig_rust_src)
+        self.crate.rust_src_path.write_bytes(orig_rust_src)
         # All iterations failed because of DSPy exceptions
         if dspy_exception:
             raise dspy_exception

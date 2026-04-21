@@ -509,3 +509,12 @@ def run_and_check_tests(
     for test_case in test_cases:
         success += 1 if run_and_check_test(executable, test_case, timeout=timeout) else 0
     return success
+
+
+def _in_env(var_name: str, default: bool = True) -> bool:
+    value = os.getenv(var_name, str(default))
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+HYBRID_BUILD = _in_env("HYBRID_BUILD", default=True)
+STATIC_TRANSLATIONS = HYBRID_BUILD or _in_env("STATIC_TRANSLATIONS", default=True)

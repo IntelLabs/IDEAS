@@ -99,6 +99,12 @@ kill:## Kill all vLLM servers
 .PHONY: FORCE
 FORCE:
 
+.PHONY: examples
+examples:## Print out examples
+examples: $(addsuffix /print,${EXAMPLES}) ;
+examples/%/print: FORCE
+	@if [ -d "$(@D)" ]; then echo "$(@D)"; fi
+
 .PHONY: examples/init
 examples/init:## Initialize all examples
 examples/init: $(addsuffix /init,${EXAMPLES}) ;
@@ -122,15 +128,6 @@ examples/%/cmake: FORCE
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 
 
-.PHONE: examples/testgen_argless
-examples/testgen_argless:## Generate argless tests for executable targets in all C examples
-examples/testgen_argless: $(addsuffix /testgen_argless,${EXAMPLES})
-examples/%/testgen_argless:## Generate argless tests for executable targets in a specific C example
-examples/%/testgen_argless: FORCE
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) testgen_argless
-
-
 .PHONY: examples/testgen_agent
 examples/testgen_agent:## Generate test vectors for all C examples with an agent
 examples/testgen_agent: $(addsuffix /testgen_agent,${EXAMPLES})
@@ -145,20 +142,7 @@ examples/testgen_agent_target: $(addsuffix /testgen_agent_target,${EXAMPLES})
 examples/%/testgen_agent_target:## Generate test vectors for all targets in a specific C example with an agent
 examples/%/testgen_agent_target: FORCE
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) init
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) testgen_target
-
-
-.PHONY: examples/testgen_and_translate
-examples/testgen_and_translate:## Generate tests and translate all examples
-examples/testgen_and_translate: $(addsuffix /testgen_and_translate,${EXAMPLES})
-examples/%/testgen_and_translate:## Generate tests and translate specific example
-examples/%/testgen_and_translate: FORCE
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) testgen_argless
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) init
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) testgen_target
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) translate
 
 
 .PHONY: examples/translate

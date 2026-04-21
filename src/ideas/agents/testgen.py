@@ -125,8 +125,9 @@ class TestgenInstructions:
         Write a `{rs_crate_path}/build.rs` that:
         1. Uses `cc::Build::new()` with `.compiler("clang")` to compile **all** C source files discovered in Step 1.
         2. Adds the correct include directories so the C headers are found.
-        3. Links any extra system libraries the C project requires (e.g. `println!("cargo::rustc-link-lib=m");`).
-        4. Passes `-w` (suppress warnings) and `-std=c99`.
+        3. Uses `.warnings(false)` to suppress warnings.
+        4. Uses `.std("c99")` to specify the C standard.
+        5. Links any extra system libraries the C project requires (e.g. `println!("cargo::rustc-link-lib=m");`).
         """
     )
 
@@ -351,7 +352,7 @@ class TestgenInstructions:
            JSON file.
            - For floating-point fields use an epsilon comparison:
              ```rust
-             assert!((actual - expected).abs() < 1e-4,
+             assert!((actual - expected).abs() / expected.abs() < 1e-3,
                      "field `<name>`: expected {{expected}}, got {{actual}}");
              ```
            - For integer / bool fields use `assert_eq!`.
@@ -442,9 +443,7 @@ def _main(cfg: TestgenConfig) -> None:
     logger_trajectory.addHandler(fh)
     # Simultaneous print and log to file
     printer = LoggingConsolePrinter(logger=logger_trajectory)
-
-    name = "C library test vector generator"
-    agent = RelentlessAgent(name=name)
+    agent = RelentlessAgent(name="C library test vector generator")
 
     project_name = cfg.project_name
     work_dir = Path(tempfile.mkdtemp()) / project_name
