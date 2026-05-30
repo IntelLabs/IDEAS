@@ -10,6 +10,10 @@ from ideas import ast
 from clang.cindex import TranslationUnit, CursorKind
 
 
+def parse_c(code: str) -> TranslationUnit:
+    return ast.create_translation_unit(ast.CodeC(code))
+
+
 def test_basic_fns():
     code = dedent(
         """
@@ -27,7 +31,7 @@ def test_basic_fns():
         """
     )
 
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert len(tr.symbols) == 4
@@ -56,7 +60,7 @@ def test_detailed_complete_graph():
         """
     )
 
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert len(tr.symbols) == 3
@@ -104,7 +108,7 @@ def test_basic_types():
         """
     )
 
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     # 3 data structures + 3 enumerators + main
@@ -127,17 +131,17 @@ def test_basic_types():
 def test_forward_declaration():
     code = dedent(
         """
-        void print_message(const char* msg);
-        void print_message(const char* msg) {
-            printf("%s\\n", msg);
+        int return_stuff(int input);
+        int return_stuff(int input) {
+            return input + 1;
         }
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert len(tr.symbols) == 1
-    assert "c:@F@print_message" in tr.symbols
+    assert "c:@F@return_stuff" in tr.symbols
 
 
 def test_fake_quotes_unicode():
@@ -154,11 +158,11 @@ def test_fake_quotes_unicode():
         }
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert (
-        tr.symbols["c:@F@main"].code
+        tr.symbols["c:@F@main"].code.code
         == dedent(
             r"""
             int main() {
@@ -167,6 +171,7 @@ def test_fake_quotes_unicode():
             }
             """
         ).strip()
+        + "\n"
     )
 
 
@@ -177,7 +182,7 @@ def test_declaration_after_definition():
         static const int a[10];
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert len(tr.symbols) == 1
@@ -186,7 +191,7 @@ def test_declaration_after_definition():
 
 def test_empty_statement():
     code = ";"
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
     assert len(tr.symbols) == 0
     assert len(tr.complete_graph) == 0
@@ -215,7 +220,7 @@ def test_nested_structs():
         }
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert len(tr.symbols) == 4
@@ -250,13 +255,13 @@ def test_forward_typedef_struct():
         };
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert "c:@S@s" in tr.symbols
     assert "c:@S@s" in tr.complete_graph
     assert (
-        tr.symbols["c:@S@s"].code
+        tr.symbols["c:@S@s"].code.code
         == dedent(
             """
             struct s {
@@ -264,17 +269,19 @@ def test_forward_typedef_struct():
             };
             """
         ).strip()
+        + "\n"
     )
 
     assert "c:file.c@T@s_t" in tr.symbols
     assert "c:file.c@T@s_t" in tr.complete_graph
     assert (
-        tr.symbols["c:file.c@T@s_t"].code
+        tr.symbols["c:file.c@T@s_t"].code.code
         == dedent(
             """
             typedef struct s s_t;
             """
         ).strip()
+        + "\n"
     )
 
     assert len(tr.complete_graph["c:@S@s"]) == 1
@@ -292,13 +299,13 @@ def test_backward_typedef_struct():
         typedef struct s s_t;
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert "c:@S@s" in tr.symbols
     assert "c:@S@s" in tr.complete_graph
     assert (
-        tr.symbols["c:@S@s"].code
+        tr.symbols["c:@S@s"].code.code
         == dedent(
             """
             struct s {
@@ -306,17 +313,19 @@ def test_backward_typedef_struct():
             };
             """
         ).strip()
+        + "\n"
     )
 
     assert "c:file.c@T@s_t" in tr.symbols
     assert "c:file.c@T@s_t" in tr.complete_graph
     assert (
-        tr.symbols["c:file.c@T@s_t"].code
+        tr.symbols["c:file.c@T@s_t"].code.code
         == dedent(
             """
             typedef struct s s_t;
             """
         ).strip()
+        + "\n"
     )
 
     assert len(tr.complete_graph["c:@S@s"]) == 1
@@ -333,13 +342,13 @@ def test_tag_typedef_struct():
         } s_t;
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert "c:@S@s" in tr.symbols
     assert "c:@S@s" in tr.complete_graph
     assert (
-        tr.symbols["c:@S@s"].code
+        tr.symbols["c:@S@s"].code.code
         == dedent(
             """
             typedef struct s {
@@ -347,12 +356,13 @@ def test_tag_typedef_struct():
             } s_t;
             """
         ).strip()
+        + "\n"
     )
 
     assert "c:file.c@T@s_t" in tr.symbols
     assert "c:file.c@T@s_t" in tr.complete_graph
     assert (
-        tr.symbols["c:file.c@T@s_t"].code
+        tr.symbols["c:file.c@T@s_t"].code.code
         == dedent(
             """
             typedef struct s {
@@ -360,6 +370,7 @@ def test_tag_typedef_struct():
             } s_t;
             """
         ).strip()
+        + "\n"
     )
 
     assert len(tr.complete_graph["c:@S@s"]) == 1
@@ -401,7 +412,7 @@ def test_local_struct():
         }
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert len(tr.symbols) == 4
@@ -429,7 +440,7 @@ def test_complex_typedef():
         };
        """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert len(tr.symbols) == 3
@@ -487,12 +498,12 @@ def test_struct_var():
         };
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert "c:@var" in tr.symbols
     assert (
-        tr.symbols["c:@var"].code
+        tr.symbols["c:@var"].code.code
         == dedent(
             """
             struct S {
@@ -500,6 +511,7 @@ def test_struct_var():
             } var[] = {{0}};
             """
         ).strip()
+        + "\n"
     )
 
 
@@ -513,12 +525,12 @@ def test_anonymous_struct_var():
         };
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert "c:@var" in tr.symbols
     assert (
-        tr.symbols["c:@var"].code
+        tr.symbols["c:@var"].code.code
         == dedent(
             """
             struct {
@@ -526,6 +538,7 @@ def test_anonymous_struct_var():
             } var[] = {{0}};
             """
         ).strip()
+        + "\n"
     )
 
 
@@ -543,13 +556,13 @@ def test_anonymous_struct_function_pointer_var():
         } var[] = {{fn}};
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert "c:@var" in tr.complete_graph
     assert "c:@S@S" in tr.complete_graph["c:@var"]
     assert "c:@F@fn" in tr.complete_graph["c:@var"]
-    assert tr.symbols["c:@S@S2"].code == tr.symbols["c:@var"].code
+    assert tr.symbols["c:@S@S2"].code.code == tr.symbols["c:@var"].code.code
     assert "c:@S@S" in tr.complete_graph["c:@S@S2"]
     assert "c:@F@fn" in tr.complete_graph["c:@S@S2"]
 
@@ -566,12 +579,12 @@ def test_struct_in_param():
         }
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert "c:@F@test" in tr.symbols
     assert (
-        tr.symbols["c:@F@test"].code
+        tr.symbols["c:@F@test"].code.code
         == dedent(
             """
             void test(struct S s) {
@@ -579,6 +592,7 @@ def test_struct_in_param():
             }
             """
         ).strip()
+        + "\n"
     )
 
 
@@ -593,14 +607,14 @@ def test_enum_constant():
         }
        """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert "c:@E@E" in tr.symbols
     assert "c:@E@E" in tr.complete_graph
     assert len(tr.complete_graph["c:@E@E"]) == 0
     assert (
-        tr.symbols["c:@E@E"].code
+        tr.symbols["c:@E@E"].code.code
         == dedent(
             """
             enum E {
@@ -608,12 +622,13 @@ def test_enum_constant():
             };
             """
         ).strip()
+        + "\n"
     )
 
     assert "c:@E@E@EC" in tr.symbols
     assert "c:@E@E@EC" in tr.complete_graph
     assert len(tr.complete_graph["c:@E@E@EC"]) == 0
-    assert tr.symbols["c:@E@E@EC"].code == tr.symbols["c:@E@E"].code
+    assert tr.symbols["c:@E@E@EC"].code.code == tr.symbols["c:@E@E"].code.code
 
     assert "c:@F@main" in tr.symbols
     assert "c:@F@main" in tr.complete_graph
@@ -630,7 +645,7 @@ def test_anonymous_enum():
         int var[] = { EC };
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     # Find anonymous enum constant EC
@@ -652,11 +667,11 @@ def test_enum_in_struct():
         int i = EC;
         """
     )
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     tr = ast.extract_info_c(tu)
 
     assert (
-        tr.symbols["c:@S@S"].code
+        tr.symbols["c:@S@S"].code.code
         == dedent(
             """
             struct S {
@@ -667,6 +682,7 @@ def test_enum_in_struct():
             };
             """
         ).strip()
+        + "\n"
     )
 
 
@@ -711,3 +727,75 @@ def test_clang_make_global_multiple_declarations(tmp_path):
     assert "int v = 42;" in transformed
     assert "extern int v;" in transformed
     assert transformed.count("int v;") == 2
+
+
+def test_clang_make_bindable_function_multiple_declarations(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            static int f(int x);
+            int f(int x);
+            static int f(int x) {
+                return x + 1;
+            }
+            """
+        )
+    )
+
+    ast.clang_make_bindable_(c_path, "f")
+    transformed = c_path.read_text()
+
+    assert transformed.count("extern int f(int x);") == 3
+    assert "static int f" not in transformed
+    assert "{" not in transformed
+
+
+def test_clang_make_bindable_variable_with_initializer(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text("static int j = 0;\n")
+
+    ast.clang_make_bindable_(c_path, "j")
+    transformed = c_path.read_text()
+
+    assert transformed == "extern int j;\nint j = 0;\n"
+
+
+def test_clang_make_bindable_variable_without_initializer(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text("static int j;\n")
+
+    ast.clang_make_bindable_(c_path, "j")
+    transformed = c_path.read_text()
+
+    assert transformed == "extern int j;\nint j;\n"
+
+
+def test_clang_make_bindable_variable_already_extern(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text("extern int j;\n")
+
+    ast.clang_make_bindable_(c_path, "j")
+    transformed = c_path.read_text()
+
+    assert transformed == "extern int j;\n"
+
+
+def test_clang_make_bindable_variable_array_with_initializer(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text("static int arr[3] = {1, 2, 3};\n")
+
+    ast.clang_make_bindable_(c_path, "arr")
+    transformed = c_path.read_text()
+
+    assert transformed == "extern int arr[3];\nint arr[3] = {1, 2, 3};\n"
+
+
+def test_clang_make_bindable_variable_array_without_initializer(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text("int array[3];\n")
+
+    ast.clang_make_bindable_(c_path, "array")
+    transformed = c_path.read_text()
+
+    assert transformed == "extern int array[3];\nint array[3];\n"

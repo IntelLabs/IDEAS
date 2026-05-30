@@ -6,8 +6,6 @@
 
 MAKEFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
 MAKEFILE_DIR := $(realpath $(dir $(MAKEFILE_PATH)))
-PIPELINE_DIR := lib/pipeline_automation
-PIPELINE_TAG := ideas/$(shell git rev-list -1 HEAD -- ${PIPELINE_DIR})
 EXAMPLES_DIR := examples
 IDEAS_MAKEFILE := $(MAKEFILE_DIR)/IDEAS.mk
 AGENTS_MAKEFILE := $(MAKEFILE_DIR)/AGENTS.mk
@@ -25,9 +23,11 @@ TRANSLATE_ARGS ?= ## Args to pass to IDEAS translation
 RUSTFLAGS ?= -Awarnings## Flags to build Rust translation
 VERBOSE ?= 0## Whether to output failed/partial projects in summaries
 VCS ?= git## Whether to use version control during translation. Options: ['git', 'none']
+CC ?= clang## C compiler to use for translation and building
+EVALUATION_TEST ?= test_cases## Evaluation test directory/name to run; defaults to `test_cases`
 
 # Pass these variables to other Makefiles
-export PROVIDER MODEL BASE_URL TRANSLATION_DIR RUSTFLAGS
+export PROVIDER MODEL BASE_URL TRANSLATION_DIR RUSTFLAGS CC EVALUATION_TEST
 
 EXAMPLES ?= $(sort $(patsubst %/test_case,%,$(shell find ${EXAMPLES_DIR} -maxdepth 3 -name test_case -type d)))## List of examples to run on
 ifeq ($(EXAMPLES),)
@@ -60,27 +60,21 @@ docker: docker/docker_build.log
                     ideas-$(shell id -u) bash
 
 
-.PHONY: docker/build_measurements
-docker/build_measurements:## Build measurement Docker images
-docker/build_measurements: ${PIPELINE_DIR}/evaluate_unsafe_usage/unsafety.Dockerfile \
-       ${PIPELINE_DIR}/idiomaticity/idiomaticity_measurements.Dockerfile
-	docker build -t ${PIPELINE_TAG}/unsafety \
-                 -f ${PIPELINE_DIR}/evaluate_unsafe_usage/unsafety.Dockerfile \
-                 ${PIPELINE_DIR}/evaluate_unsafe_usage/
-	docker build -t ${PIPELINE_TAG}/idiomaticity \
-                 -f ${PIPELINE_DIR}/idiomaticity/idiomaticity_measurements.Dockerfile \
-                 ${PIPELINE_DIR}/idiomaticity/
-
 .PHONY: install
 install: install-uv install-rust ## Install uv and Rust
 
 .PHONY: install-uv
-install-uv:## Install uv@0.10.9
-	curl -LsSf https://astral.sh/uv/0.10.9/install.sh | sh
+install-uv:## Install uv@0.11.13
+	curl -LsSf https://astral.sh/uv/0.11.13/install.sh | sh
 
 .PHONY: install-rust
-install-rust:## Install Rust@1.88.0
+install-rust:## Install Rust@1.88.0 and tools
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain 1.88.0
+	rustup component add rustfmt
+	rustup component add llvm-tools-preview --toolchain 1.88.0-x86_64-unknown-linux-gnu
+	cargo install bindgen-cli --version 0.72.1
+	cargo install cargo-llvm-cov --version 0.8.6
+	cargo install cargo-nextest --version 0.9.114 --locked
 
 .PHONY: install-clang
 install-clang:## Install Clang-21, must be sudo
@@ -88,6 +82,10 @@ install-clang:## Install Clang-21, must be sudo
 	chmod +x llvm.sh
 	-./llvm.sh 21 all
 	rm ./llvm.sh
+
+.PHONY: install-sys-deps
+install-sys-deps:## Install system dependencies, must be sudo
+	apt install libpcre3-dev
 
 .PHONY: serve
 serve:## Start vLLM server
@@ -129,20 +127,12 @@ examples/%/cmake: FORCE
 
 
 .PHONY: examples/testgen_agent
-examples/testgen_agent:## Generate test vectors for all C examples with an agent
+examples/testgen_agent:## Generate test vectors for all targets in all C examples with an agent
 examples/testgen_agent: $(addsuffix /testgen_agent,${EXAMPLES})
-examples/%/testgen_agent:## Generate test vectors for specific C example with an agent
+examples/%/testgen_agent:## Generate test vectors for all targets in a specific C example with an agent
 examples/%/testgen_agent: FORCE
-	-@$(MAKE) -j1 -f $(AGENTS_MAKEFILE) -C $(@D) cmake
-	-@$(MAKE) -j1 -f $(AGENTS_MAKEFILE) -C $(@D) testgen
-
-.PHONY: examples/testgen_agent_target
-examples/testgen_agent_target:## Generate test vectors for all targets in all C examples with an agent
-examples/testgen_agent_target: $(addsuffix /testgen_agent_target,${EXAMPLES})
-examples/%/testgen_agent_target:## Generate test vectors for all targets in a specific C example with an agent
-examples/%/testgen_agent_target: FORCE
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) testgen_target
+	-@$(MAKE) -j1 -f $(AGENTS_MAKEFILE) -C $(@D) testgen_agent
 
 
 .PHONY: examples/translate
@@ -157,15 +147,6 @@ examples/%/translate:## Translate specific example
 examples/%/translate: FORCE
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) translate
-
-
-.PHONY: examples/wrapper
-examples/wrapper:## Generate C FFI wrappers for all examples
-examples/wrapper: $(addsuffix /wrapper,${EXAMPLES})
-examples/%/wrapper:## Generate C FFI wrappers for specific example
-examples/%/wrapper: FORCE
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
-	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) wrapper
 
 
 .PHONY: examples/build
@@ -187,6 +168,7 @@ examples/%/build: FORCE
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) cmake
 	-@$(MAKE) -j1 -f $(IDEAS_MAKEFILE) -C $(@D) build
 
+
 .PHONY: examples/test
 examples/test:## Test all translated examples
 examples/test: $(addsuffix /test,${EXAMPLES})
@@ -201,18 +183,18 @@ ifneq (${VERBOSE},0)
 	@echo ""
 endif
 	@echo "--- Project Completion Count ---"
-	@find ${EXAMPLES} -path '*/${TRANSLATION_DIR}/cargo_test.log' -exec ./scripts/test_log_stats.sh {} \; | cut -d" " -f1 | sort | uniq -c
+	@find ${EXAMPLES} -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.log' -exec ./scripts/test_log_stats.sh {} \; | cut -d" " -f1 | sort | uniq -c
 	@echo ""
 ifneq (${VERBOSE},0)
-	@find ${EXAMPLES} -path '*/${TRANSLATION_DIR}/cargo_test.log' -exec ./scripts/test_log_stats.sh {} \; | egrep "PARTIAL" | sort | sed -e "s/${TRANSLATION_DIR}.*//gi" | sed -e 's/^/    /'
+	@find ${EXAMPLES} -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.log' -exec ./scripts/test_log_stats.sh {} \; | egrep "PARTIAL" | sort | sed -e "s/${TRANSLATION_DIR}.*//gi" | sed -e 's/^/    /'
 	@echo ""
-	@find ${EXAMPLES} -path '*/${TRANSLATION_DIR}/cargo_test.log' -exec ./scripts/test_log_stats.sh {} \; | egrep "MISSING" | sort | sed -e "s/${TRANSLATION_DIR}.*//gi" | sed -e 's/^/    /'
+	@find ${EXAMPLES} -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.log' -exec ./scripts/test_log_stats.sh {} \; | egrep "MISSING" | sort | sed -e "s/${TRANSLATION_DIR}.*//gi" | sed -e 's/^/    /'
 	@echo ""
-	@find ${EXAMPLES} -path '*/${TRANSLATION_DIR}/cargo_test.log' -exec ./scripts/test_log_stats.sh {} \; | egrep "FAILED" | sort | sed -e "s/${TRANSLATION_DIR}.*//gi" | sed -e 's/^/    /'
+	@find ${EXAMPLES} -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.log' -exec ./scripts/test_log_stats.sh {} \; | egrep "FAILED" | sort | sed -e "s/${TRANSLATION_DIR}.*//gi" | sed -e 's/^/    /'
 	@echo ""
 endif
 	@echo "--- Aggregated Test Count ---"
-	@find ${EXAMPLES} -path '*/${TRANSLATION_DIR}/cargo_test.log' | xargs cat | grep -aE "^test \S+ ... \S+$$" | cut -d" " -f4 | sort | uniq -c
+	@find ${EXAMPLES} -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.log' | xargs cat | grep -aE "^test \S+ ... \S+$$" | cut -d" " -f4 | sort | uniq -c
 	@echo "\`\`\`"
 examples/%/test:## Test specific translated example
 examples/%/test: FORCE

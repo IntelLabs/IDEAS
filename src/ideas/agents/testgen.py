@@ -10,6 +10,7 @@ import os
 import logging
 import tempfile
 import textwrap
+import time
 import shutil
 from pathlib import Path
 from dataclasses import dataclass
@@ -19,212 +20,119 @@ from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 
+from ideas.tools import Crate
 from ideas.agents.printer import ConsoleTee, LoggingConsolePrinter
-from ideas.tools import run_subprocess
+from ideas.agents.build import strip_instrumentation
+from ideas.agents.utils import (
+    NEXTEST_DUMMY_TEST,
+    nextest_config,
+    write_coverage_script,
+    write_collect_script,
+    write_extract_json_script,
+)
 
 from kiss.agents.sorcar.useful_tools import UsefulTools
 from kiss.core.relentless_agent import RelentlessAgent
+from kiss.core.kiss_error import KISSError
 
 logger = logging.getLogger("ideas.agents.testgen")
 
 
 @dataclass
 class TestgenConfig:
+    cargo_toml: Path = MISSING
     model: str = MISSING
     c_code: Path = MISSING
     project_name: str = MISSING
-    test_vectors_out: Path = MISSING
     test_crate_out: Path = MISSING
 
-    num_vectors: int = 3
-    desired_symbols: int = 3
+    guarantee_assert_tests: bool = False
+    collect_to_assert: bool = False
+    target_coverage: int = 90
 
     def __post_init__(self):
-        if not self.c_code.exists():
-            raise ValueError(
-                f"c_code must be a directory containing a CMake C project or a single C file, got: {self.c_code}"
-            )
+        if not self.c_code.is_file():
+            raise ValueError(f"c_code must be a single C file, got: {self.c_code}")
 
 
 @dataclass
 class TestgenInstructions:
-    analyze_dir: str = textwrap.dedent(
-        """
-        ## Step 1 – Analyze the C project ##
-        Carefully read and understand the C project rooted at `{c_proj_path}`.
-
-        Inspect the CMakeLists.txt to learn:
-        - the project / library name
-        - all source files and include directories
-        - any required link libraries (e.g. `-lm`)
-
-        List **all** top-level (exported / non-static) library functions declared in the
-        public header(s) under `{c_proj_path}/include`.
-        Write only their function names (no declaration or body) to `{c_proj_path}/functions.lst`,
-        newline separated.
-        """
-    )
-
     analyze_file: str = textwrap.dedent(
         """
         ## Step 1 – Analyze the standalone C file ##
         Carefully read and understand the single C source file at
-        `{c_proj_path}/{c_filename}`.
+        `{c_proj_path}/lib.c`.
+        This is a **standalone** C library file that should **never** be edited.
 
-        This is a **standalone** C file (no CMake project, no separate headers).
-        All declarations and definitions live in this one file.
-
-        List **all** non-static functions defined in the file.
-        Write only their function names (no declaration or body) to `{c_proj_path}/functions.lst`,
-        newline separated.
-        """
-    )
-
-    analyze_select: str = textwrap.dedent(
-        """
-        From that list, select **up to {desired_symbols}** functions that are the best
-        candidates for black-box testing.
-
-        The selected functions **must** have all their dependencies defined in the project.
-        If they reference functions that are **only declared**, they **cannot** be tested.
-
-        Only select fewer than {desired_symbols} if there are not
-        that many functions. Prefer functions that:
-        - are **high-level entry points** (i.e. they orchestrate significant portions
-          of the code's logic rather than being small utility helpers)
-        - accept rich input (structs, arrays, multiple parameters) so that a single
-          call exercises many internal code-paths
-        - together give broad coverage of the public API
-        Write only their function names (no declaration or body) to `{c_proj_path}/selected.lst`,
-        newline separated.
-
-        For each of the selected functions analyze: which parameters are **input-only**,
-        which are **output-only** (written by the callee), and which are **in/out** to understand
+        For each exported function analyze: which parameters are **input-only**,
+        which are **output-only** (written by the callee), and which are **modified in-place** to understand
         how to set up its test data and collect its outputs.
+
+        **Infinite looping:** If any function (including static ones) loops infinitely,
+        identify all relevant paths and their trigger conditions.
+
+        **Undefined behavior:** Carefully analyze the C code for possible undefined behavior (UB).
         """
     )
 
     build_rs: str = textwrap.dedent(
         """
-        ## Step 2 – Create a Rust crate with a `build.rs` that compiles and links the C project ##
-        Initialize a new Rust **library** crate at `{rs_crate_path}`:
-        ```bash
-        cargo init --lib --edition=2024 --vcs none --name=<c-project-name> {rs_crate_path}
-        ```
+        ## Step 2 – Analyze test crate ##
+        The directory at {rs_crate_path} contains a Rust crate that links the C code
+        and has **no** code of its own.
 
-        Add the `cc` build dependency and the following dev-dependencies to `Cargo.toml`:
-        ```toml
-        [build-dependencies]
-        cc = "1.2.59"
+        Analyze the `Cargo.toml` file and the `build.rs` files, and understand how they link the C code.
+        The crate is a **library** crate, and all exported functions have pre-generated C FFI bindings.
 
-        [dev-dependencies]
-        serde = {{ version = "1", features = ["derive"] }}
-        serde_json = "1"
-        ```
+        These bindings have been generated by `bindgen` and placed in the `src/binding` directory, one file per function.
+        They are **correct** and **definitive** and their interfaces should **never** be changed.
 
-        Write a `{rs_crate_path}/build.rs` that:
-        1. Uses `cc::Build::new()` with `.compiler("clang")` to compile **all** C source files discovered in Step 1.
-        2. Adds the correct include directories so the C headers are found.
-        3. Uses `.warnings(false)` to suppress warnings.
-        4. Uses `.std("c99")` to specify the C standard.
-        5. Links any extra system libraries the C project requires (e.g. `println!("cargo::rustc-link-lib=m");`).
-        """
-    )
+        The `build.rs` and `bindings` modules can **never** be modified, no matter the circumstances.
 
-    bindgen_dir: str = textwrap.dedent(
-        """
-        ### Obtain the exact FFI API with `bindgen` ###
-        Before populating the crate sources, use `bindgen` on the shell to generate the
-        correct Rust FFI declarations for the selected functions from Step 1.
-
-        Run a **separate** `bindgen` invocation for each function and **redirect each
-        output directly** into its own binding module file:
-        ```bash
-        mkdir -p {rs_crate_path}/src/binding
-        BINDGEN_EXTRA_CLANG_ARGS="-I<path-to-include-dir>" bindgen \
-            --disable-header-comment --no-doc-comments --no-layout-tests \
-            <c-header-file> \
-            --allowlist-function <function_name> \
-            > {rs_crate_path}/src/binding/<function_name>.rs
-        ```
-
-        Where you must properly identify:
-        - `<path-to-include-dir>` – one or more `-I<dir>` arguments pointing to the
-          C include directories discovered in Step 1.  If multiple header directories
-          are needed, list them all as space-separated `-I<dir>` arguments inside
-          `BINDGEN_EXTRA_CLANG_ARGS`.
-        - `<c-header-file>` – the public header that declares the function.
-        - `<function_name>` – the exact C function name (one per invocation).
-        """
-    )
-
-    bindgen_file: str = textwrap.dedent(
-        """
-        ### Obtain the exact FFI API with `bindgen` ###
-        Before populating the crate sources, use `bindgen` on the shell to generate the
-        correct Rust FFI declarations for the selected functions from Step 1.
-
-        Since this is a standalone C file with no separate headers, run `bindgen`
-        directly on the source file.  Run a **separate** invocation for each function
-        and redirect each output directly into its own binding module file:
-        ```bash
-        mkdir -p {rs_crate_path}/src/binding
-        bindgen \
-            --disable-header-comment --no-doc-comments --no-layout-tests \
-            {c_proj_path}/{c_filename} \
-            --allowlist-function <function_name> \
-            > {rs_crate_path}/src/binding/<function_name>.rs
-        ```
-
-        Where `<function_name>` is the exact C function name (one per invocation).
-        """
-    )
-
-    build_rs_librs: str = textwrap.dedent(
-        """
-        ### Critical: crate module layout ###
-        The crate **must** use a modular layout that keeps each symbol's bindgen output
-        in its own file.  Create the following structure:
-
-        1. **`{rs_crate_path}/src/lib.rs`** – contains **only**:
-           ```rust
-           pub mod binding;
-           ```
-
-        2. **`{rs_crate_path}/src/binding.rs`** – contains one `pub mod <function_name>;`
-           line for **each** selected function.  Example (if the selected functions are
-           `foo` and `bar`):
-           ```rust
-           pub mod foo;
-           pub mod bar;
-           ```
-
-        3. **`{rs_crate_path}/src/binding/<function_name>.rs`** – each file is the
-           **exact, unmodified** output of the corresponding `bindgen` invocation from
-           the previous step (already written there by the shell redirects above).
-           Do **not** hand-edit these files.
-
+        ### Working directory ###
+        Execute `cd {rs_crate_path}` to enter the crate directory before any `cargo` command.
         Build using `cargo build` to confirm the C code compiles and links.
+
+        ### Test framework ###
+        The crate uses `cargo nextest` as the test framework exclusively.
+        This **guarantees** that all tests are run in parallel and that no test can rely on side effects from another test.
+        You **must** use `cargo nextest` to run tests, and you **must not** write any test that relies on shared state or side effects.
         """
     )
 
-    gen_data_collection_tests: str = textwrap.dedent(
+    coverage_script: str = textwrap.dedent(
+        """
+        ### Measuring coverage ###
+        The crate is set up to measure source-based coverage of the C code with LLVM's sanitizers and coverage tools.
+        Understand how this is done by analyzing the `build.rs` file and the `Cargo.toml`.
+
+        The script `{rs_crate_path}/measure_coverage.sh` is used to run tests and measure C code coverage of the tests that will be written.
+        This script must be run at any time to get an updated coverage report and identify untested code paths.
+
+        This is the **only** way to measure coverage, so do not attempt to use other tools or methods.
+        Instead write any relevant experiments as collection tests, as indicated in Step 3 below.
+        """
+    )
+
+    write_collect_tests: str = textwrap.dedent(
         """
         ## Step 3 – Generate a data-collection test harness ##
-        Create `{rs_crate_path}/tests/test_collect.rs`.
+        Based on the C program analysis, design input tests that achieve high coverage of the program.
 
-        ### 3a – FFI linkage (critical!) ###
-        **Do NOT** declare `unsafe extern "C"` blocks in the test file.
-        Instead, import the FFI functions through the binding modules using
+        Each test must be **independent** and **self-contained**: it must set up its own input data,
+        call the function under test, and capture all relevant output data without
+        relying on any shared state or side effects from other tests.
+        Because of `cargo nextest`'s parallel execution, clean-up on exit is **not** required.
+
+        ### 3a – FFI linkage ###
+        Import the FFI functions through the binding modules using
         **absolute crate paths**.  The crate name is derived from the `name` field in
         `Cargo.toml` (with hyphens replaced by underscores).  Import like this:
         ```rust
         use <crate_name>::binding::<function_name>::<function_name>;
         ```
         This is **mandatory** because the C static library is attached to the
-        library crate by `build.rs`.  If the test declares its own `extern "C"`
-        block the linker will NOT find the C symbols and you will get
-        `undefined symbol` errors.
+        library crate by `build.rs`.
 
         ### 3b – `#[repr(C)]` struct mirrors ###
         Import the `#[repr(C)]` struct types through the binding modules (they were
@@ -232,6 +140,11 @@ class TestgenInstructions:
         ```rust
         use <crate_name>::binding::<function_name>::<StructName>;
         ```
+
+        If multiple functions use **exactly** the same struct type,
+        it will be generated in each relevant binding module with the exact name and layout,
+        so you can import it **only once** from any of them.
+
         Then add `#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]` to
         **local** wrapper types or re-definitions of those structs that you need for
         JSON serialization.  Because `serde` derives cannot be added to a type imported
@@ -268,8 +181,7 @@ class TestgenInstructions:
         ```
 
         ### 3d – Data-collection test functions ###
-        For each set of representative input values you choose (at least {num_vectors}
-        distinct sets), write a `#[test]` function named `collect_vector_<N>` that:
+        For each set of input values, write a `#[test]` function named `collect_vector_<N>` that:
         1. Constructs a `LibState` with the chosen inputs (and outputs / return field zeroed).
         2. Clones it into `lib_state_in`.
         3. Calls the C function through `unsafe`, using the symbol imported from the
@@ -283,39 +195,98 @@ class TestgenInstructions:
            println!("{{}}",  serde_json::to_string_pretty(&vector).unwrap());
            ```
 
-        The chosen inputs should exercise a variety of code-paths in the C function:
-        - a zeroed / default / neutral input
-        - a "normal" input with representative non-trivial values
-        - an edge-case or boundary input
+        The chosen inputs **cannot exercise undefined behavior (UB)**!
+        If they do, instrumentation will make `cargo nextest run` output a
+        failed test and return an error, and test generation should be re-attempted.
+        If issues are identified, do **not** give up early.
 
-        Build and run tests in the crate with:
-        ```bash
-        cargo test --manifest-path {rs_crate_path}/Cargo.toml --quiet -- --nocapture
-        ```
-        Verify that all tests pass and JSON is printed.
+        The chosen inputs should exercise a variety of code-paths in the C function, including:
+        - zeroed / default / neutral input
+        - "normal" inputs with representative non-trivial values
+
+        The tests generated in this step are not meant to **assert** outputs, but only collect them
+        and they should **not** assume any state in the test file.
+        They are only meant to be a harness to collect input/output data and coverage information.
+
+        ### NUL-terminated strings in C ###
+        If the C function takes string inputs, remember that they must be NUL-terminated.
+        Not respecting this will cause silent memory corruption and make it impossible to collect meaningful data!
+        To create a NUL-terminated string in Rust, you can create a `Vec<u8>` with the string bytes and a trailing `0`,
+        and then pass a pointer to its first element.
+
+        ### Non-persistence ###
+        **All** collection tests must be designed to be run repeatedly without any clean-up,
+        and they must not rely on any side effects or shared state.
+
+        ### Portable, self-contained tests ###
+        If the C code relies on pre-existing files on disk (e.g., through hardcoded paths),
+        you must ensure that all tests **locally** create any required files with the expected content before calling the function under test,
+        and that they do not rely on any pre-existing state on disk.
+        If multiple tests reference **exactly** the same file, place a safe Lock around all accesses to that file to
+        prevent race conditions; `cargo nextest` handles parallel execution by default otherwise.
+        You **cannot** rely on files on-disk: the goal is for the test file to be moved to some other crate and still work.
+
+        If the C code relies on network access, you must ensure that all tests mock the network interactions locally
+        and do not rely on any external network state or connectivity.
+        """
+    )
+
+    coverage_improvement: str = textwrap.dedent(
+        """
+        ### The coverage metric ###
+        Use **branch coverage** to identify and exercise untested code paths.
+
+        To improve branch coverage, generate interesting combinations of input arguments
+        with special attention to edge cases and boundary conditions.
+
+        Ensure the new input values exercise **well-defined** code paths that improve branch coverage.
+        Exercising UB will be caught and rejected by the sanitizers!
+
+        Aim to achieve branch coverage of at least {target_coverage}%%.
+        If this is not possible because of unreachable static functions, a lower coverage is acceptable.
+        After **three** consecutive attempts where branch coverage has not improved by at least 1 percentage point,
+        you may stop trying to improve coverage and proceed to the next step.
+
+        Verify that all tests pass and JSON is correctly printed for **all** of them,
+        including tests on new symbols added for improving coverage.
+        """
+    )
+
+    analyze_data_collection_tests: str = textwrap.dedent(
+        """
+        ## Step 3 – Analyze the data-collection tests ##
+        The crate already contains some data-collection tests in `tests/test_collect.rs`
+        designed to print JSON outputs by running them and capturing their stdout.
+
+        Carefully analyze the `tests/test_collect.rs` file and understand how it imports the FFI symbols,
+        how it defines the `LibState` struct and the `collect_vector_<N>` tests, and how it prints the JSON output.
+
+        Execute `cargo nextest run --test test_collect --nocapture 2>/dev/null`
+        to run the tests and see the JSON output they print on the `stdout` channel.
+        Validate **all** collection tests run successfully and print valid JSON with the expected structure.
+
+        If tests pass **do NOT** modify them in any way at this stage.
+        If tests exercise UB or trip sanitizers, you must remove them.
+        If tests fail functionally, attempt to fix them until they pass and print the expected JSON.
         """
     )
 
     write_test_vectors: str = textwrap.dedent(
         """
-        ## Step 4 – Save test vectors as JSON files ##
+        ## Step 4 – Save outputs as JSON files ##
         Create the directory `{test_vectors_path}`.
 
         Run each data-collection test **individually** and capture its stdout.
         Write the JSON output of each `collect_vector_<N>` test to
         `{test_vectors_path}/<N>.json`, where `<N>` is the 1-based index.
 
-        Use `uv` to extract the JSON reliably – do NOT rely on grep/sed:
+        You **must** collect data from **all** tests, not just the initial
+        ones.
+
+        Use the provided `extract_json.py` script to extract the JSON reliably – do NOT rely on grep/sed:
         ```bash
-        cargo test collect_vector_<N> -- --nocapture 2>/dev/null | \
-            uv run python -c "
-        import sys, json
-        buf = sys.stdin.read()
-        start = buf.index('{{')
-        end = buf.rindex('}}') + 1
-        obj = json.loads(buf[start:end])
-        print(json.dumps(obj, indent=2))
-        " > {test_vectors_path}/<N>.json
+        cargo nextest run --nocapture -- collect_vector_<N> --exact 2>/dev/null | \
+            uv run extract_json.py > {test_vectors_path}/<N>.json
         ```
 
         Verify each file is valid JSON with the expected `lib_state_in` / `lib_state_out`
@@ -338,13 +309,18 @@ class TestgenInstructions:
         use <crate_name>::binding::<function_name>::<StructName>;
         ```
 
-        **Important**: `test_assert.rs` must **not** depend on `serde` or `serde_json`.
+        ### Plaintext literals and no serde ###
+        `test_assert.rs` must **not** depend on `serde` or `serde_json`.
         Because the crate's types are exact `bindgen` output (no serde derives), the
         assert tests reconstruct all values as **plain Rust literals** taken from the
         JSON files saved in Step 4.  Do **not** `#[derive(Serialize, Deserialize)]` on
         any type in this file and do **not** add `use serde*` or `use serde_json*`.
 
-        For **each** JSON test vector saved in Step 4, write a `#[test]` function named
+        You **must** write an assertion test for each collection test, no matter
+        how many collection tests are there!
+        Write them one-by-one if there are too many.
+
+        For **each** JSON output saved in Step 4, write a `#[test]` function named
         `test_vector_<N>` that:
         1. Reconstructs the `lib_state_in` values from the JSON file as Rust literals.
         2. Calls the C function through `unsafe` using the imported symbol.
@@ -358,57 +334,45 @@ class TestgenInstructions:
            - For integer / bool fields use `assert_eq!`.
            - For pointer-typed output fields, dereference the pointer (inside `unsafe`)
              and compare the pointed-to value rather than the pointer address itself.
+           - Focus on writing meaningful assertions that compare relevant output fields,
+             rather than writing minimal assertions that only check a few fields or non-null pointers.
 
         Once done, run:
         ```bash
-        cargo test --manifest-path {rs_crate_path}/Cargo.toml --quiet --test test_assert
+        cargo nextest run --test test_assert --cargo-quiet
         ```
-        All tests **must** pass.
-        """
-    )
-
-    deny_dependencies: str = textwrap.dedent(
-        """
-        ## External dependencies ##
-        Apart from `cc` (build-dependency), `serde`, and `serde_json` (dev-dependencies),
-        do not add any other dependencies to the Cargo.toml file.
+        All tests **must** pass and not exercise any undefined behavior.
         """
     )
 
     simple_exit: str = textwrap.dedent(
         """
-        Once all assert tests pass and JSON files are written, finish the task and exit.
+        Once the task is complete, exit immediately.
         Do not over-verify or generate extensive reports.
         """
     )
 
     @classmethod
-    def dir_task_description(cls) -> str:
+    def coverage_based(cls) -> str:
         return (
-            cls.analyze_dir
-            + cls.analyze_select
+            cls.analyze_file
             + cls.build_rs
-            + cls.bindgen_dir
-            + cls.build_rs_librs
-            + cls.gen_data_collection_tests
+            + cls.coverage_script
+            + cls.write_collect_tests
+            + cls.coverage_improvement
             + cls.write_test_vectors
             + cls.write_assert_tests
-            + cls.deny_dependencies
             + cls.simple_exit
         )
 
     @classmethod
-    def file_task_description(cls) -> str:
+    def collect_to_assert(cls) -> str:
         return (
             cls.analyze_file
-            + cls.analyze_select
             + cls.build_rs
-            + cls.bindgen_file
-            + cls.build_rs_librs
-            + cls.gen_data_collection_tests
+            + cls.analyze_data_collection_tests
             + cls.write_test_vectors
             + cls.write_assert_tests
-            + cls.deny_dependencies
             + cls.simple_exit
         )
 
@@ -438,84 +402,113 @@ def _main(cfg: TestgenConfig) -> None:
     # Separately log the complete trajectory
     logger_trajectory = logging.getLogger("ideas.testgen.trajectory")
     logger_trajectory.propagate = False
-    fh = logging.FileHandler(output_dir / "testgen_trajectory.log")
+    fh = logging.FileHandler(output_dir / f"testgen_trajectory-{int(time.time())}.log")
     fh.setFormatter(ConsoleTee.StripANSIFormatter("%(asctime)s %(message)s"))
     logger_trajectory.addHandler(fh)
     # Simultaneous print and log to file
     printer = LoggingConsolePrinter(logger=logger_trajectory)
-    agent = RelentlessAgent(name="C library test vector generator")
+    agent = RelentlessAgent(name="C library test generator")
 
-    project_name = cfg.project_name
-    work_dir = Path(tempfile.mkdtemp()) / project_name
-    os.makedirs(work_dir)
+    # Generate helper scripts and files in the crate
+    crate = Crate(output_dir / "Cargo.toml")
+    nextest_config(crate)
+    if not cfg.collect_to_assert:
+        write_coverage_script(crate)
+        write_collect_script(crate)
+    write_extract_json_script(crate)
 
-    # Copy the C project into the working directory
-    c_proj_path = work_dir / "test_case"
-    is_single_file = Path(cfg.c_code).is_file()
-    if is_single_file:
-        # Coherent /tmp and on-disk paths
-        c_proj_path = work_dir / cfg.c_code.parent
-        os.makedirs(c_proj_path)
-        shutil.copy(cfg.c_code, c_proj_path / cfg.c_code.name)
-    else:
-        shutil.copytree(cfg.c_code, c_proj_path, dirs_exist_ok=True)
+    # Workspace
+    work_dir = Path(tempfile.mkdtemp())
+    workspace_dir = work_dir / "test_crates"
+    shutil.copytree("test_crates", workspace_dir)
+
+    # Remove all log files
+    for log_file in workspace_dir.glob("**/*.log"):
+        log_file.unlink()
 
     # Paths the agent will populate
-    rs_crate_path = work_dir / (cfg.test_crate_out if is_single_file else "testgen_crate")
-    test_vectors_path = work_dir / "test_vectors"
+    rs_crate_path = work_dir / cfg.test_crate_out
+    test_vectors_path = rs_crate_path / "json"
+
+    # If assertion tests already exist, they must be correct
+    if (rs_crate_path / "tests" / "test_assert.rs").is_file():
+        crate = Crate(rs_crate_path / "Cargo.toml")
+        ok, output, error, _ = crate.cargo_test("test_assert", quiet=True)
+        if not ok:
+            raise RuntimeError(
+                "Existing assertion tests failed to pass, previous agent did not clean them up!"
+            )
+        logger.info(
+            f"Assertion tests already exist at {rs_crate_path / 'tests/test_assert.rs'}, skipping agent!"
+        )
+        return
+
+    # Hide instrumentation from conversion agent
+    if cfg.collect_to_assert:
+        strip_instrumentation(crate)
 
     # Build the task prompt
     task_description = (
-        TestgenInstructions.file_task_description()
-        if is_single_file
-        else TestgenInstructions.dir_task_description()
+        TestgenInstructions.collect_to_assert()
+        if cfg.collect_to_assert
+        else TestgenInstructions.coverage_based()
     )
     arguments = {
-        "c_proj_path": c_proj_path.relative_to(work_dir),
+        "c_proj_path": cfg.c_code.parent,
         "rs_crate_path": rs_crate_path.relative_to(work_dir),
         "test_vectors_path": test_vectors_path.relative_to(work_dir),
-        "num_vectors": cfg.num_vectors,
-        "desired_symbols": cfg.desired_symbols,
+        "target_coverage": cfg.target_coverage,
     }
-    if is_single_file:
-        arguments["c_filename"] = cfg.c_code.name
     task_description = task_description.format(**arguments)
 
     # Run agent in the work directory
-    original_dir = os.getcwd()
     os.chdir(work_dir)
+    try:
+        agent.run(
+            model_name=cfg.model,
+            prompt_template=task_description,
+            max_steps=100,
+            max_budget=4,
+            max_sub_sessions=1,
+            work_dir=str(work_dir),
+            tools=get_tools(),
+            printer=printer,
+            verbose=True,
+        )
+    except KISSError as e:
+        logger.warning(f"Agent claims it failed with error: {e}. Clean-up will continue.")
 
-    agent.run(
-        model_name=cfg.model,
-        system_instructions="",
-        prompt_template=task_description,
-        max_steps=100,
-        max_budget=4,
-        max_sub_sessions=1,
-        work_dir=str(work_dir),
-        tools=get_tools(),
-        printer=printer,
-        verbose=True,
-    )
-    # Verify that assertion tests pass
-    cargo_toml = work_dir / cfg.test_crate_out / "Cargo.toml"
-    ok, output, error, returncode = run_subprocess(
-        ["cargo", "test", "--manifest-path", str(cargo_toml), "--test", "test_assert"],
-        timeout=60,
-    )
+    # Verify that collection tests exist
+    if not (rs_crate_path / "tests" / "test_collect.rs").is_file():
+        raise RuntimeError(
+            f"Data collection tests were not found at {rs_crate_path / 'tests/test_collect.rs'}!"
+        )
+
+    # Strip instrumentation to ensure tests are correct and do not rely on it
+    crate = Crate(rs_crate_path / "Cargo.toml")
+    strip_instrumentation(crate)
+    ok, output, error, _ = crate.cargo_test("test_collect", quiet=True)
     if not ok:
         raise RuntimeError(
-            f"Assert tests failed for target {project_name}: {error}! Tests will not be used during hybrid build!"
+            f"Data collection tests failed to pass without instrumentation! Output:\n{output}\nError:\n{error}"
         )
-    os.chdir(original_dir)
 
-    # Copy test vectors
-    shutil.copytree(test_vectors_path, cfg.test_vectors_out, dirs_exist_ok=True)
-    # Copy test crate
-    shutil.copytree(rs_crate_path, cfg.test_crate_out, dirs_exist_ok=True)
-    # Copy C analysis results
-    shutil.copy(c_proj_path / "functions.lst", cfg.test_crate_out / "functions.lst")
-    shutil.copy(c_proj_path / "selected.lst", cfg.test_crate_out / "selected.lst")
+    # Check if assertion tests pass
+    ok, output, error, _ = crate.cargo_test("test_assert", quiet=True)
+    if not ok:
+        logger.error(f"Assertion tests failed to pass! Output:\n{output}\nError:\n{error}")
+        # Remove incomplete assertion tests, if any
+        if (rs_crate_path / "tests" / "test_assert.rs").is_file():
+            (rs_crate_path / "tests" / "test_assert.rs").unlink()
+
+            # And replace with an always-passing test (nextest does not allow empty test files)
+            if cfg.guarantee_assert_tests:
+                logger.warning("Writing dummy test_assert.rs that always passes")
+                (rs_crate_path / "tests" / "test_assert.rs").write_text(NEXTEST_DUMMY_TEST)
+
+    # Clean the crate and copy it back to the project directory
+    crate.cargo_clean()
+    shutil.copytree(rs_crate_path, output_dir, dirs_exist_ok=True)
 
 
 if __name__ == "__main__":

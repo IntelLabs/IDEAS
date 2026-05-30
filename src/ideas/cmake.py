@@ -6,6 +6,7 @@
 
 import sys
 import os
+import json
 import logging
 import shutil
 
@@ -16,7 +17,7 @@ import hydra
 from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
 
-from .tools import run_subprocess
+from .tools import run_subprocess, LARGE_PROJECT
 
 logger = logging.getLogger("ideas.cmake")
 
@@ -31,6 +32,23 @@ cs = ConfigStore.instance()
 cs.store(name="cmake", node=CmakeConfig)
 
 
+def _normalize_isystem(compile_commands_path: Path) -> None:
+    """Replace -isystem with -I in compile_commands.json"""
+    if not compile_commands_path.exists():
+        return
+    db = json.loads(compile_commands_path.read_text())
+    for entry in db:
+        if "command" in entry:
+            entry["command"] = entry["command"].replace("-isystem", "-I")
+
+        if "arguments" in entry:
+            entry["arguments"] = [
+                "-I" + arg[len("-isystem") :] if arg.startswith("-isystem") else arg
+                for arg in entry["arguments"]
+            ]
+    compile_commands_path.write_text(json.dumps(db, indent=2))
+
+
 def configure(
     source_dir: Path,
     build_dir: Path,
@@ -41,6 +59,7 @@ def configure(
 
     flags = [
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        "-DCMAKE_C_COMPILER=clang",
     ]
     if extract_info_cmake := os.environ.get("EXTRACT_INFO_CMAKE"):
         flags.append(f"-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES={extract_info_cmake}")
@@ -55,6 +74,11 @@ def configure(
     success, output, error, _ = run_subprocess(cmd)
     if not success:
         raise RuntimeError(f"CMake configuration failed:{' '.join(cmd)}\n{output + error}")
+
+    # Replace -isystem with -I in compile_commands.json so that all project
+    # headers get consistent USRs regardless of CMake SYSTEM keyword usage.
+    if LARGE_PROJECT:
+        _normalize_isystem(build_dir / "compile_commands.json")
 
 
 def build(build_dir: Path, preset: str | None = None) -> None:

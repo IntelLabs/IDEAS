@@ -4,23 +4,24 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import re
 import logging
 from pathlib import Path
 from collections import defaultdict
 from collections.abc import Iterable
-from functools import cached_property
 from dataclasses import dataclass, field
 
 from clang.cindex import TranslationUnit, TranslationUnitLoadError, Diagnostic
 from clang.cindex import Cursor, CursorKind, SourceRange, TokenKind
-from clang.cindex import PrintingPolicy, PrintingPolicyProperty, LinkageKind
+from clang.cindex import PrintingPolicy, PrintingPolicyProperty, LinkageKind, StorageClass
 from clang.cindex import conf, SourceLocation
 from ctypes import pointer, c_size_t, c_char_p
 
-from .tools import run_subprocess
+from .adapters import Code
 
 logger = logging.getLogger("ideas.ast")
 FILENAME = "file.c"
+CodeC = Code["c"]
 
 
 @dataclass(frozen=True)
@@ -39,11 +40,43 @@ class Symbol:
         return self.cursor.kind
 
     @property
-    def declaration(self) -> str | None:
-        return get_cursor_code(self.decl) if self.decl else None
+    def llm_context_declaration(self) -> str:
+        # Synthesize forward declaration from cursor
+        if self.cursor.kind == CursorKind.FUNCTION_DECL:
+            result_type = (
+                self.cursor.result_type.spelling if self.cursor.result_type else "void"
+            )
+            params = ", ".join(
+                p.type.spelling + (" " + p.spelling if p.spelling else "")  # type: ignore[reportOptionalMemberAccess]
+                for p in self.cursor.get_arguments()
+            )
+            return f"{result_type} {self.cursor.spelling}({params});"
+        elif self.cursor.kind in (
+            CursorKind.STRUCT_DECL,
+            CursorKind.UNION_DECL,
+            CursorKind.ENUM_DECL,
+        ):
+            kind_name = {
+                CursorKind.STRUCT_DECL: "struct",
+                CursorKind.UNION_DECL: "union",
+                CursorKind.ENUM_DECL: "enum",
+            }[self.cursor.kind]
+            return f"{kind_name} {self.cursor.spelling};"
+        elif self.cursor.kind == CursorKind.TYPEDEF_DECL:
+            underlying = self.cursor.underlying_typedef_type.spelling
+            return f"typedef {underlying} {self.cursor.spelling};"
+        elif self.cursor.kind == CursorKind.VAR_DECL:
+            return f"{self.cursor.type.spelling} {self.cursor.spelling};"
+
+        # Fallback: return full code
+        return self.code.text
 
     @property
-    def code(self) -> str:
+    def declaration(self) -> CodeC | None:
+        return get_cursor_code(self.decl, pretty_print=True) if self.decl else None
+
+    @property
+    def code(self) -> CodeC:
         return get_cursor_code(self.parent or self.cursor, pretty_print=True)
 
     @property
@@ -66,36 +99,9 @@ class Symbol:
     def is_system(self) -> bool:
         return self.cursor.location.is_in_system_header
 
-    @cached_property
-    def static_translation(self) -> str:
-        # FIXME: Handle VAR_DECL via c2rust?
-        # Ignore non-containers
-        if self.kind not in (
-            CursorKind.STRUCT_DECL,
-            CursorKind.UNION_DECL,
-            CursorKind.ENUM_DECL,
-            CursorKind.TYPEDEF_DECL,
-        ):
-            return ""
-
-        # Ignore anonymous containers
-        symbol_name = (self.parent or self.cursor).spelling
-        if not symbol_name:
-            return ""
-
-        # Generate translation of container
-        bindgen = [
-            "bindgen",
-            "--disable-header-comment",
-            "--no-doc-comments",
-            "--no-layout-tests",
-            "--no-recursive-allowlist",
-            "--allowlist-item",
-            symbol_name,
-            self.cursor.translation_unit.spelling,
-        ]
-        ok, output, _, _ = run_subprocess(bindgen)
-        return output if ok else ""
+    @property
+    def source_path(self) -> Path:
+        return Path(self.cursor.translation_unit.spelling).resolve()
 
     def with_declaration(self, decl: Cursor) -> "Symbol":
         return Symbol(self.name, self.cursor, self.parent, decl=decl)
@@ -109,10 +115,11 @@ class TreeResult:
     )
 
 
-def create_translation_unit(path_or_code: Path | str) -> TranslationUnit:
+def create_translation_unit(path_or_code: Path | CodeC) -> TranslationUnit:
     # Parse the code using clang
-    if isinstance(path_or_code, str):
-        tu = TranslationUnit.from_source(FILENAME, unsaved_files=[(FILENAME, path_or_code)])
+    if isinstance(path_or_code, CodeC):
+        code = path_or_code
+        tu = TranslationUnit.from_source(FILENAME, unsaved_files=[(FILENAME, code.text)])
     else:
         tu = TranslationUnit.from_source(str(path_or_code.resolve()))
     if any(d.severity >= Diagnostic.Error for d in tu.diagnostics):
@@ -169,10 +176,17 @@ def extract_symbol_info_c(node: Cursor, parent: Cursor | None = None) -> dict[st
                 symbols[child_name] = child_symbol.with_declaration(symbols[child_name].cursor)
             elif symbols[child_name].is_definition and not child_symbol.is_definition:
                 if not symbols[child_name].is_system or not child_symbol.is_system:
-                    logger.warning(f"Ignoring declaration after definition of `{child_name}`")
+                    logger.debug(f"Ignoring declaration after definition of `{child_name}`")
             elif not symbols[child_name].is_definition and not child_symbol.is_definition:
-                if not symbols[child_name].is_system or not child_symbol.is_system:
-                    logger.warning(f"Ignoring re-declaration of `{child_name}`")
+                if (
+                    child_symbol.cursor.kind == CursorKind.VAR_DECL
+                    and symbols[child_name].cursor.storage_class == StorageClass.EXTERN
+                    and child_symbol.cursor.storage_class != StorageClass.EXTERN
+                ):
+                    # Prefer non-extern variable declaration (e.g. tentative definition) over extern one
+                    symbols[child_name] = child_symbol
+                elif not symbols[child_name].is_system or not child_symbol.is_system:
+                    logger.debug(f"Ignoring re-declaration of `{child_name}`")
     return symbols
 
 
@@ -201,7 +215,7 @@ def extract_referenced_symbols(node: Cursor, global_symbols: Iterable[str]) -> l
 
 def get_code_from_tu_range(
     tu: TranslationUnit, source_range: SourceRange, encoding: str = "utf-8"
-) -> str:
+) -> CodeC:
     assert source_range.start.file == source_range.end.file, (
         f"{source_range.start.file} != {source_range.end.file}"
     )
@@ -209,10 +223,10 @@ def get_code_from_tu_range(
     length = pointer(c_size_t())
     code = conf.lib.clang_getFileContents(tu, source_range.start.file, length)
     assert code is not None
-    return code[source_range.start.offset : source_range.end.offset].decode(encoding)
+    return CodeC(code[source_range.start.offset : source_range.end.offset].decode(encoding))
 
 
-def get_cursor_prettyprinted(cursor: Cursor) -> str:
+def get_cursor_prettyprinted(cursor: Cursor) -> CodeC:
     # Include tag definition when:
     #    node is not struct/enum/union
     #    and any child is a struct/enum/union definition
@@ -226,10 +240,10 @@ def get_cursor_prettyprinted(cursor: Cursor) -> str:
 
     policy = PrintingPolicy.create(cursor)
     policy.set_property(PrintingPolicyProperty.IncludeTagDefinition, include_tag_definition)
-    return cursor.pretty_printed(policy).rstrip()
+    return CodeC(cursor.pretty_printed(policy))
 
 
-def get_cursor_code(cursor: Cursor, pretty_print: bool = False) -> str:
+def get_cursor_code(cursor: Cursor, pretty_print: bool = False) -> CodeC:
     if pretty_print:
         code = get_cursor_prettyprinted(cursor)
     else:
@@ -237,7 +251,7 @@ def get_cursor_code(cursor: Cursor, pretty_print: bool = False) -> str:
 
     # Non-function definitions require statement terminations
     if cursor.kind != CursorKind.FUNCTION_DECL or not cursor.is_definition():
-        code += ";"
+        code = CodeC(code.text.rstrip() + ";")
 
     return code
 
@@ -387,6 +401,124 @@ def clang_make_extern_(path: Path, spelling: str):
         _apply_edits(path, edits)
 
 
+def clang_make_bindable_(path: Path, spelling: str):
+    source = path.read_bytes()
+    tu = create_translation_unit(path)
+    tu_path = Path(tu.spelling).resolve()
+    edits: dict[tuple[int, int], bytes] = {}
+    cursors = _find_cursors(tu, spelling)
+    has_variable_initializer_definition = any(
+        cursor.kind == CursorKind.VAR_DECL
+        and any(
+            token.kind == TokenKind.PUNCTUATION and token.spelling == "="
+            for token in _get_tokens(cursor)
+        )
+        for cursor in cursors
+    )
+    inserted_fallback_variable_extern = False
+
+    for cursor in cursors:
+        # We don't handle cursors not in the provided translation unit or anything without a definition
+        if (
+            cursor.location.file is None
+            or Path(cursor.location.file.name).resolve() != tu_path
+            or Path(cursor.extent.start.file.name).resolve() != tu_path
+            or Path(cursor.extent.end.file.name).resolve() != tu_path
+        ):
+            raise NotImplementedError(f"Found `{spelling}` cursor `{cursor}` not in {tu_path}!")
+        if cursor.kind not in DEFINITION_START_TOKEN:
+            raise ValueError(f"Unhandled cursor kind {cursor.kind}!")
+
+        tokens = list(_get_tokens(cursor))
+        assert len(tokens) > 0
+
+        is_extern = False
+        definition_start_token_idx = None
+
+        for i, token in enumerate(tokens):
+            # Remove storage specifiers from declaration while preserving offsets
+            if token.kind == TokenKind.KEYWORD and token.spelling in ("static", "inline"):
+                assert i + 1 < len(tokens), "storage specifier should always come before name"
+                start_offset = token.extent.start.offset
+                # Use start of next token as end offset to remove any whitespace
+                end_offset = tokens[i + 1].extent.start.offset
+                edits[(start_offset, end_offset)] = b""
+
+            # Check if extern keyword already present
+            elif token.kind == TokenKind.KEYWORD and token.spelling == "extern":
+                is_extern = True
+
+            # Record the first definition-opening token.
+            elif (
+                definition_start_token_idx is None
+                and token.kind == TokenKind.PUNCTUATION
+                and token.spelling == DEFINITION_START_TOKEN[cursor.kind]
+            ):
+                definition_start_token_idx = i
+                break
+
+        # clang_make_bindable_ matches clang_make_extern_ behavior for functions.
+        if cursor.kind == CursorKind.FUNCTION_DECL:
+            # Replace definition portion with ';'
+            if definition_start_token_idx is not None:
+                assert definition_start_token_idx > 0
+                # Use end of prior token as end offset to remove any whitespace
+                start_pos = tokens[definition_start_token_idx - 1].extent.end.offset
+                end_pos = cursor.extent.end.offset
+                edits[(start_pos, end_pos)] = b";"
+
+            # Add 'extern ' prefix if not already present
+            if not is_extern:
+                extern_insert_pos = cursor.extent.start.offset
+                edits[(extern_insert_pos, extern_insert_pos)] = b"extern "
+            continue
+
+        # For variables, keep the definition and insert an extern declaration before it.
+        assert cursor.kind == CursorKind.VAR_DECL
+
+        declaration_end_idx = None
+        for i, token in enumerate(tokens):
+            if token.kind != TokenKind.PUNCTUATION:
+                continue
+            if token.spelling in ("=", ";"):
+                declaration_end_idx = i
+                break
+        if declaration_end_idx is None:
+            declaration_end_idx = len(tokens)
+
+        declaration_tokens = [
+            token
+            for token in tokens[:declaration_end_idx]
+            if not (
+                token.kind == TokenKind.KEYWORD
+                and token.spelling in ("static", "inline", "extern")
+            )
+        ]
+        if len(declaration_tokens) == 0:
+            continue
+
+        should_insert_extern = definition_start_token_idx is not None
+        if (
+            not should_insert_extern
+            and not has_variable_initializer_definition
+            and not is_extern
+            and not inserted_fallback_variable_extern
+        ):
+            should_insert_extern = True
+            inserted_fallback_variable_extern = True
+
+        if should_insert_extern:
+            declaration_start = declaration_tokens[0].extent.start.offset
+            declaration_end = declaration_tokens[-1].extent.end.offset
+            declaration = source[declaration_start:declaration_end].decode().rstrip()
+            extern_decl = f"extern {declaration};\n".encode()
+            extern_insert_pos = cursor.extent.start.offset
+            edits[(extern_insert_pos, extern_insert_pos)] = extern_decl
+
+    if edits:
+        _apply_edits(path, edits)
+
+
 def _get_tokens(cursor: Cursor):
     # Use get_tokens if it actually returns a non-empty list
     tokens = list(cursor.get_tokens())
@@ -460,3 +592,58 @@ def _apply_edits(path: Path, edits: dict[tuple[int, int], bytes]):
         source = source[:start] + replacement + source[end:]
 
     path.write_bytes(source)
+
+
+def get_system_macro_undefs(includes: list[str], code: str) -> list[str]:
+    if not includes:
+        return []
+
+    # Parse the includes to enumerate system macros
+    include_text = "\n".join(includes) + "\n"
+    tu = TranslationUnit.from_source(
+        "undefs.c",
+        unsaved_files=[("undefs.c", include_text)],
+        options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
+    )
+
+    self_ref_macros: set[str] = set()
+    assert tu.cursor is not None
+    for cursor in tu.cursor.get_children():
+        if cursor.kind != CursorKind.MACRO_DEFINITION:
+            continue
+        if not cursor.location.is_in_system_header:
+            continue
+        tokens = list(cursor.get_tokens())
+        # Function-like macros have '(' immediately after the name token
+        if len(tokens) >= 2 and tokens[1].spelling == "(":
+            continue
+        # FIXME: This needs to be stronger and not detect #define stuff mystuff
+        # as self-referencing.
+        # We should ideally only check the replacement list tokens,
+        # but clang does not provide a way to get just those.
+        name = cursor.spelling
+        if any(tok.spelling == name for tok in tokens[1:]):
+            self_ref_macros.add(name)
+
+    if not self_ref_macros:
+        return []
+
+    # Only #undef self-referencing macros whose name appears in the code
+    # FIXME: Would be nice if we had an AST list of already-expanded macros across all TUs
+    code_identifiers = set(re.findall(r"\b([A-Za-z_]\w*)\b", code))
+    conflicting = self_ref_macros & code_identifiers
+
+    return [f"#undef {name}" for name in sorted(conflicting)]
+
+
+def mangle(name: str) -> str:
+    name = name.replace(" ", "_")
+    name = name.replace(".", "_")
+    name = name.replace(":", "_")
+    name = name.replace("-", "_")
+
+    # Cannot start with a digit
+    if name and name[0].isdigit():
+        name = "_" + name
+
+    return name
