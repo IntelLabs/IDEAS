@@ -38,48 +38,107 @@ else
 	RUN_SUFFIX =
 endif
 
-
-# test generation from project
-.PHONY: testgen
-testgen: test_crate/tests/test_assert.rs ;
-
-.PRECIOUS: test_crate/tests/test_assert.rs
-test_crate/tests/test_assert.rs:
-	$(RUN_PREFIX) \
-        uv run python -m ideas.agents.testgen model=$(if $(AGENT_PROVIDER),${AGENT_PROVIDER}/,)${AGENT_MODEL} \
-            c_code=test_case \
-            project_name=$(notdir $(CURDIR)) \
-            test_vectors_out=test_vectors/agent \
-            test_crate_out=test_crate \
-            hydra.output_subdir=.testgen \
-            hydra.job.name=testgen \
-            hydra.run.dir=test_vectors \
-    $(RUN_SUFFIX)
-    # Agent is not guaranteed to write file
-	[ -f test_crate/tests/test_assert.rs ] || { echo "ERROR: Agent failed to generate test_crate/tests/test_assert.rs"; exit 1; }
+TARGETS_LIB ?= $(shell [ -d build-ninja ] && find build-ninja -maxdepth 1 -type f -executable -exec basename {} \; | cut -d. -f1 | grep -E "^lib" | sed -e "s/^lib//gi")
+TARGETS_BIN ?= $(shell [ -d build-ninja ] && find build-ninja -maxdepth 1 -type f -executable -exec basename {} \; | cut -d. -f1 | grep -vE "^lib")
+TARGETS ?= $(TARGETS_BIN) $(TARGETS_LIB)
+ifeq (${TARGETS},)
+ifeq ($(filter cmake clean,$(MAKECMDGOALS)),)
+$(error No TARGETS found! You need to run cmake!)
+endif
+endif
 
 
-# library targets: generate tests from the consolidated lib.c
+.PRECIOUS: test_crates/%/Cargo.toml
+.PRECIOUS: test_crates/%/src/lib.c
+.PRECIOUS: test_crates/%/src/main.c
+.PRECIOUS: test_crates/%/build.rs
+
+test_crates/%/Cargo.toml \
+test_crates/%/src/lib.c \
+test_crates/%/build.rs: | build-ninja/lib%.so.sources
+	uv run python -m ideas.init.crate crate_type=lib \
+                                  reexport_lib=false \
+                                  hydra.output_subdir=null \
+                                  hydra.run.dir=test_crates/$*
+	uv run python -m ideas.init.consolidate filename=build-ninja/compile_commands.json \
+                                        cargo_toml=test_crates/$*/Cargo.toml \
+                                        source_priority=build-ninja/lib$*.so.sources \
+                                        hydra.output_subdir=null \
+                                        hydra.run.dir=test_crates/$*
+	uv run python -m ideas.agents.build instrumentation=coverage \
+                                    hydra.output_subdir=null \
+                                    hydra.job.name=init.build \
+                                    hydra.run.dir=test_crates/$*
+
+test_crates/%/Cargo.toml \
+test_crates/%/src/main.c \
+test_crates/%/build.rs: | build-ninja/%.sources
+	uv run python -m ideas.init.crate crate_type=bin \
+                                  hydra.output_subdir=null \
+                                  hydra.run.dir=test_crates/$*
+	uv run python -m ideas.init.consolidate filename=build-ninja/compile_commands.json \
+                                        cargo_toml=test_crates/$*/Cargo.toml \
+                                        source_priority=build-ninja/$*.sources \
+                                        hydra.output_subdir=null \
+                                        hydra.run.dir=test_crates/$*
+	uv run python -m ideas.agents.build instrumentation=coverage \
+                                    hydra.output_subdir=null \
+                                    hydra.job.name=init.build \
+                                    hydra.run.dir=test_crates/$*
+
+
+.PHONY: testgen_agent
+testgen_agent: $(patsubst %,test_crates/%/tests/test_assert.rs,${TARGETS}) ;
+
 .PRECIOUS: test_crates/%/tests/test_assert.rs
-test_crates/%/tests/test_assert.rs: ${TRANSLATION_DIR}/%/src/lib.c | build-ninja/lib%.so.type
-    # Copy lib.c into test_crates/<target>/src/ so
-    # build.rs can use ../../test_crates/<target>/src/lib.c
-    # both in Docker /tmp and on disk
-	mkdir -p test_crates/$*/src
-	cp ${TRANSLATION_DIR}/$*/src/lib.c test_crates/$*/src/lib.c
+test_crates/%/tests/test_assert.rs: test_crates/%/Cargo.toml test_crates/%/src/lib.c | build-ninja/lib%.so.sources
 	$(RUN_PREFIX) \
         uv run python -m ideas.agents.testgen model=$(if $(AGENT_PROVIDER),${AGENT_PROVIDER}/,)${AGENT_MODEL} \
+            cargo_toml=test_crates/$*/Cargo.toml \
             c_code=test_crates/$*/src/lib.c \
             project_name=$* \
-            test_vectors_out=test_vectors/$*/agent \
             test_crate_out=test_crates/$* \
-            hydra.output_subdir=.testgen \
+            hydra.output_subdir=null \
             hydra.job.name=testgen \
-            hydra.run.dir=test_vectors/$* \
+            hydra.run.dir=test_crates/$* \
     $(RUN_SUFFIX)
-    # Agent is not guaranteed to write file
+	$(RUN_PREFIX) \
+        uv run python -m ideas.agents.testgen model=$(if $(AGENT_PROVIDER),${AGENT_PROVIDER}/,)${AGENT_MODEL} \
+            guarantee_assert_tests=true \
+            collect_to_assert=true \
+            cargo_toml=test_crates/$*/Cargo.toml \
+            c_code=test_crates/$*/src/lib.c \
+            project_name=$* \
+            test_crate_out=test_crates/$* \
+            hydra.output_subdir=null \
+            hydra.job.name=assert_writer \
+            hydra.run.dir=test_crates/$* \
+    $(RUN_SUFFIX)
+    # Agents are not guaranteed to produce the file
 	[ -f test_crates/$*/tests/test_assert.rs ] || { echo "ERROR: Agent failed to generate test_crates/$*/tests/test_assert.rs"; exit 1; }
 
-# executable targets: do nothing
-test_crates/%/tests/test_assert.rs: ${TRANSLATION_DIR}/%/src/main.c | build-ninja/%.type
-	$(error Agent cannot generate tests for binary targets yet!)
+test_crates/%/tests/test_assert.rs: test_crates/%/Cargo.toml test_crates/%/src/main.c | build-ninja/%.sources
+	$(RUN_PREFIX) \
+        uv run python -m ideas.agents.testgen_bin model=$(if $(AGENT_PROVIDER),${AGENT_PROVIDER}/,)${AGENT_MODEL} \
+            cargo_toml=test_crates/$*/Cargo.toml \
+            c_code=test_crates/$*/src/main.c \
+            project_name=$* \
+            test_crate_out=test_crates/$* \
+            hydra.output_subdir=null \
+            hydra.job.name=testgen \
+            hydra.run.dir=test_crates/$* \
+    $(RUN_SUFFIX)
+	$(RUN_PREFIX) \
+        uv run python -m ideas.agents.testgen_bin model=$(if $(AGENT_PROVIDER),${AGENT_PROVIDER}/,)${AGENT_MODEL} \
+            guarantee_assert_tests=true \
+            collect_to_assert=true \
+            cargo_toml=test_crates/$*/Cargo.toml \
+            c_code=test_crates/$*/src/main.c \
+            project_name=$* \
+            test_crate_out=test_crates/$* \
+            hydra.output_subdir=null \
+            hydra.job.name=assert_writer \
+            hydra.run.dir=test_crates/$* \
+    $(RUN_SUFFIX)
+    # Agents are not guaranteed to produce the file
+	[ -f test_crates/$*/tests/test_assert.rs ] || { echo "ERROR: Agent failed to generate test_crates/$*/tests/test_assert.rs"; exit 1; }

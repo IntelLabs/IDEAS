@@ -22,14 +22,20 @@ def i_code(fixtures_dir: Path) -> str:
     return (fixtures_dir / "formatting.c.i").read_text()
 
 
+def parse_c(code: str):
+    return ast.create_translation_unit(ast.CodeC(code=code))
+
+
 def test_all_code_from_tu(i_code: str):
     # Parse the code using clang
-    tu = ast.create_translation_unit(i_code)
+    tu = parse_c(i_code)
     result = ast.extract_info_c(tu)
+
+    assert isinstance(result.symbols["c:@F@foo"].code, ast.CodeC)
 
     # Check for exact formatting
     assert (
-        result.symbols["c:@F@foo"].code
+        result.symbols["c:@F@foo"].code.code
         == d(
             """
             void foo() {
@@ -44,16 +50,17 @@ def test_all_code_from_tu(i_code: str):
             }
             """
         ).strip()
+        + "\n"
     )
 
 
 def test_newline():
     code = "int main(int argc, char **argv) { return 0;\r\n}"
-    tu = ast.create_translation_unit(code)
+    tu = parse_c(code)
     result = ast.extract_info_c(tu)
 
     assert (
-        result.symbols["c:@F@main"].code
+        result.symbols["c:@F@main"].code.code
         == d(
             """
             int main(int argc, char **argv) {
@@ -61,4 +68,5 @@ def test_newline():
             }
             """
         ).strip()
+        + "\n"
     )

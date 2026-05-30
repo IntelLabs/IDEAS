@@ -5,66 +5,96 @@
 #
 
 import re
-import sys
 import sqlite3
 import logging
+import textwrap
 from pathlib import Path
 from collections import OrderedDict
-from dataclasses import dataclass, field
 
 import dspy
-import hydra
-from omegaconf import MISSING
-from hydra.core.config_store import ConfigStore
-from hydra.core.hydra_config import HydraConfig
+from dspy.utils.exceptions import AdapterParseError
+from dspy.utils.usage_tracker import track_usage
+from dspy.dsp.utils.settings import settings
 
-from ideas import adapters, model, ModelConfig, GenerateConfig
-from ideas.tools import Crate, check_rust, run_subprocess
-from ideas import create_translation_unit, extract_info_c
-from ideas.adapters import Code
-from ideas.init.consolidate import get_symbols_and_dependencies
-from ideas.ast_rust import get_nodes, get_root, validate_changes
-from ideas.ast import Symbol, clang_make_global_
+from ideas.tools import Crate, check_rust, run_subprocess, LARGE_PROJECT
+from ideas.ast_rust import CodeRust, validate_changes, mangle
+from ideas.ast import CodeC, Symbol
+from ideas.ast import clang_make_global_, clang_make_extern_, clang_make_bindable_
+from ideas.model import format_usage
 
 logger = logging.getLogger("ideas.wrapper")
-CodeRust = Code["rust"]
-
-
-@dataclass
-class WrapperConfig:
-    filename: Path = MISSING
-    model: ModelConfig = field(default_factory=ModelConfig)
-    generate: GenerateConfig = field(default_factory=GenerateConfig)
-
-    cargo_toml: Path = MISSING
-
-    max_iters: int = 5
-    readonly_cache: Path | None = None
-
-    vcs: str = "none"
-
-
-cs = ConfigStore.instance()
-cs.store(name="wrapper", node=WrapperConfig)
 
 
 class Signature(dspy.Signature):
     """
-    Output a C-compatible FFI wrapper for `crate::{symbol_name}`.
-    Use `example_wrapper` as a template for the `wrapper` and replace the `unimplemented!()` part with an implementation.
-    The implementation for `crate::{symbol_name}` is in a crate that was read from "{crate_path}".
-    Assume the types in `crate::wrapper::` do not have the same memory layout as those in `crate::`.
-    The wrapper should properly convert between `crate::wrapper::` and `crate::` types by copying the values from the wrapper type to the crate type before calling `crate::{symbol_name}`.
-    After this conversion, the wrapper should call the Rust function `crate::{symbol_name}`.
-    After the call to `crate::{symbol_name}`, the wrapper should convert back the `crate::` types to `crate::wrapper::` types.
-    The wrapper will be written to "{wrapper_path}".
-    You will receive feedback about a `prior_wrapper` attempt that should be fixed, if any.
-    Use the `build_feedback` from `cargo build` about possible build errors.
-    Use the `scope_feedback` about possible deviations from the templated `example_wrapper`.
+    Generate a C-compatible FFI wrapper for `crate::{symbol_name}`.
+
+    # Goal
+
+    Produce a `wrapper` that callers of the original C symbol can link against unchanged. The implementation of `crate::{symbol_name}` lives in the crate at "{crate_path}"; the wrapper will be written to "{wrapper_path}".
+
+    # Template
+
+    - Use `example_wrapper` as the template for `wrapper`. Preserve its function signature, attributes, and module structure exactly.
+    - Replace only the `unimplemented!()` body with an implementation that calls `crate::{symbol_name}`.
+
+    # Type conversions
+
+    Types in `crate::wrapper::` (bindgen-generated, C-compatible layout) are *not* layout-compatible with those in `crate::` (idiomatic Rust). The wrapper must:
+
+    1. Copy field values from each `crate::wrapper::` argument into a fresh `crate::` value before the call.
+    2. Call `crate::{symbol_name}` with the converted values.
+    3. Copy result/output values back from `crate::` types into the `crate::wrapper::` types the C ABI expects.
+
+    Use `support_code` to recover the original C types behind opaque or erased Rust types (notably `void*`, `*mut c_void`, and untyped byte buffers) so each field is converted at its true C type.
+
+    # Raw pointer handling
+
+    - Null-check every raw pointer parameter before its first dereference. On null, return the same value the C function returns for null input (typically an error code, `false`, `-1`, or `null`) — never dereference and panic. Use `support_code` to determine the correct null-input sentinel.
+    - Treat every mutable raw pointer parameter as in-out unless `support_code` clearly proves it is read-only.
+    - For every out / in-out pointer parameter, write the converted result back through the raw pointer after the Rust call. Struct and array out-parameters require full field/element write-back.
+    - Do not route pointer-identity comparisons through detached clones/copies; identity must survive the boundary.
+
+    # Mutable `char*` / byte buffers
+
+    Reproduce C buffer-mutation semantics exactly:
+
+    - If the Rust function computes a normalized or truncated value, write it back into the caller's buffer.
+    - Classify each pointer+length input by C semantics before conversion: if the C code treats it as a string (`strcmp`, `strlen`, `%s`, token parsing, command dispatch, pattern matching), normalize at ingress by truncating at the first `\0`; if it is a fixed-length or binary buffer, preserve embedded `\0` bytes and use the explicit length.
+    - Apply the same normalization policy to all operands in the same logical operation. Do not compare a length-decoded string that still contains trailing `\0` against a C-string-decoded operand that was truncated at `\0`.
+    - When both pointer and length are present for string-style data, use length only as a safety bound for reads; derive semantic content from C string termination and stop at the first `\0`.
+    - Preserve NUL termination wherever C expects it; never write past the C-implied capacity.
+    - When C truncates a buffer by writing `'\0'` at a position found by a search (e.g., `strstr`, `strchr`, or a manual scan), the wrapper must re-derive that same offset from the raw buffer and write the NUL byte explicitly — even if the Rust function has internalized the truncation and does not expose the offset. Use `support_code` to recover the exact search function, offset, and capacity assumptions the C original relied on.
+    - Treat in-place buffer mutations as **primary observable effects**. Callers (and tests) assert them directly; omitting them silently fails every assertion on the buffer regardless of the parsed return values.
+
+    # Panic safety at the ABI boundary
+
+    Wrap every call into Rust code that could panic in `std::panic::catch_unwind`. On a caught panic, return the appropriate C error value for the return type (`0`, `false`, `-1`, `null`, ...). Letting a panic cross an `extern "C"` boundary is undefined behavior and aborts the process in practice. Omit `catch_unwind` only when the called Rust code provably cannot panic.
+
+    # Calling libc / system functions
+
+    The crate already depends on the `libc` crate. When the wrapper needs to call a C standard library or POSIX function (e.g. `fdopen`, `close`, `malloc`, `free`, `memcpy`, `strlen`, `open`, `read`, `write`, `fopen`, `fclose`, ...), call it through the `libc` crate (`unsafe {{ ::libc::fdopen(fd, mode) }}`).
+
+    - **Do not** emit `extern "C" {{ ... }}` (or `unsafe extern "C" {{ ... }}`) blocks declaring libc / POSIX / system functions, and do not emit `#[link(name = "c")]` (or similar) link attributes for libc symbols.
+    - The only `extern "C"` items permitted in generated wrapper code are those already present in `example_wrapper`; do not introduce any new `extern "C"` items.
+    - If a needed symbol is not available in `libc`, prefer a safe Rust equivalent from `std` (e.g. `std::ptr`, `std::ffi::CStr`, `std::fs`, `std::io`). If neither is available, do not declare a new foreign function; explain the limitation in your reasoning.
+
+    # Hard constraints
+
+    - Do not relax behavior, skip write-backs, or use placeholder/stub logic.
+    - Do not declare libc / POSIX functions in `extern "C"` blocks; call them via the `libc` crate.
+
+    # Inputs and feedback
+
+    - `support_code`: the original C source that was translated to Rust.
+    - `prior_wrapper`: a previous attempt to fix, if any.
+    - `build_feedback`: errors from `cargo build`. Address them.
+    - `scope_feedback`: deviations from the `example_wrapper` template. Address them.
     """
 
     # FIXME: Move crate and example_wrapper into instructions?
     crate: CodeRust = dspy.InputField()
+    support_code: CodeC = dspy.InputField()
     example_wrapper: CodeRust = dspy.InputField()
     prior_wrapper: CodeRust = dspy.InputField()
     build_feedback: str = dspy.InputField()
@@ -73,52 +103,113 @@ class Signature(dspy.Signature):
     wrapper: CodeRust = dspy.OutputField()
 
 
-def generate_unimplemented_wrapper(path: Path, symbol_name: str) -> str:
-    orig_src = path.read_bytes()
-    try:
-        # Make sure symbol is global, this is why we save original bytes
-        clang_make_global_(path, symbol_name)
+class HybridSignature(Signature):
+    """
+    Generate a C-compatible FFI wrapper for `crate::{symbol_name}` in a hybrid C/Rust build where C globals and the Rust port must stay in sync.
 
-        # unsafe extern "C" {
-        #     pub fn helloworld() -> ::std::os::raw::c_int;
-        # }
-        ok, bindgen_wrapper, error, _ = run_subprocess(
-            [
-                "bindgen",
-                "--disable-header-comment",
-                "--no-doc-comments",
-                "--no-layout-tests",
-                "--sort-semantically",
-                str(path),
-                "--allowlist-function",
-                symbol_name,
-            ]
-        )
-    finally:
-        path.write_bytes(orig_src)
-    if not ok:
-        raise ValueError(
-            f"Bindgen failed to generate wrapper for `{symbol_name}`!\nError:\n{error}"
-        )
+    # Goal
 
-    if bindgen_wrapper.strip() == "":
-        raise ValueError(f"Bindgen generated an empty wrapper for `{symbol_name}`!")
+    Produce a `wrapper` that callers of the original C symbol can link against unchanged. The implementation of `crate::{symbol_name}` lives in the crate at "{crate_path}"; the wrapper will be written to "{wrapper_path}".
 
-    # #[unsafe(export_name="helloworld")]
-    # pub extern "C" fn helloworld() -> ::std::os::raw::c_int {
+    # Template
+
+    - Use `example_wrapper` as the template for `wrapper`. Preserve its function signature, attributes, and module structure exactly.
+    - Replace only the `unimplemented!()` body with an implementation that calls `crate::{symbol_name}`.
+
+    # Type conversions
+
+    Types in `crate::wrapper::` (bindgen-generated, C-compatible layout) are *not* layout-compatible with those in `crate::` (idiomatic Rust). The wrapper must:
+
+    1. Copy field values from each `crate::wrapper::` argument into a fresh `crate::` value before the call.
+    2. Call `crate::{symbol_name}` with the converted values.
+    3. Copy result/output values back from `crate::` types into the `crate::wrapper::` types the C ABI expects.
+
+    Use `support_code` to recover the original C types behind opaque or erased Rust types (notably `void*`, `*mut c_void`, and untyped byte buffers) so each field is converted at its true C type.
+
+    # Global synchronization
+
+    If `crate::{symbol_name}` reads or writes globals, synchronize them in the wrapper:
+
+    - Before the call, copy each readable global from the bindgen-generated extern `crate::wrapper::{{var_name}}::{{var_name}}` into the Rust global `crate::{{var_name}}`.
+    - After the call, copy each writable global from `crate::{{var_name}}` back to `crate::wrapper::{{var_name}}::{{var_name}}`.
+
+    # Raw pointer handling
+
+    - Null-check every raw pointer parameter before its first dereference. On null, return the same value the C function returns for null input (typically an error code, `false`, `-1`, or `null`) — never dereference and panic. Use `support_code` to determine the correct null-input sentinel.
+    - Treat every mutable raw pointer parameter as in-out unless `support_code` clearly proves it is read-only.
+    - For every out / in-out pointer parameter, write the converted result back through the raw pointer after the Rust call. Struct and array out-parameters require full field/element write-back.
+    - Do not route pointer-identity comparisons through detached clones/copies; identity must survive the boundary.
+
+    # Mutable `char*` / byte buffers
+
+    Reproduce C buffer-mutation semantics exactly:
+
+    - If the Rust function computes a normalized or truncated value, write it back into the caller's buffer.
+    - Classify each pointer+length input by C semantics before conversion: if the C code treats it as a string (`strcmp`, `strlen`, `%s`, token parsing, command dispatch, pattern matching), normalize at ingress by truncating at the first `\0`; if it is a fixed-length or binary buffer, preserve embedded `\0` bytes and use the explicit length.
+    - Apply the same normalization policy to all operands in the same logical operation. Do not compare a length-decoded string that still contains trailing `\0` against a C-string-decoded operand that was truncated at `\0`.
+    - When both pointer and length are present for string-style data, use length only as a safety bound for reads; derive semantic content from C string termination and stop at the first `\0`.
+    - Preserve NUL termination wherever C expects it; never write past the C-implied capacity.
+    - When C truncates a buffer by writing `'\0'` at a position found by a search (e.g., `strstr`, `strchr`, or a manual scan), the wrapper must re-derive that same offset from the raw buffer and write the NUL byte explicitly — even if the Rust function has internalized the truncation and does not expose the offset. Use `support_code` to recover the exact search function, offset, and capacity assumptions the C original relied on.
+    - Treat in-place buffer mutations as **primary observable effects**. Callers (and tests) assert them directly; omitting them silently fails every assertion on the buffer regardless of the parsed return values.
+
+    # Panic safety at the ABI boundary
+
+    Wrap every call into Rust code that could panic in `std::panic::catch_unwind`. On a caught panic, return the appropriate C error value for the return type (`0`, `false`, `-1`, `null`, ...). Letting a panic cross an `extern "C"` boundary is undefined behavior and aborts the process in practice. Omit `catch_unwind` only when the called Rust code provably cannot panic.
+
+    # Calling libc / system functions
+
+    The crate already depends on the `libc` crate. When the wrapper needs to call a C standard library or POSIX function (e.g. `fdopen`, `close`, `malloc`, `free`, `memcpy`, `strlen`, `open`, `read`, `write`, `fopen`, `fclose`, ...), call it through the `libc` crate (`unsafe {{ ::libc::fdopen(fd, mode) }}`).
+
+    - **Do not** emit `extern "C" {{ ... }}` (or `unsafe extern "C" {{ ... }}`) blocks declaring libc / POSIX / system functions, and do not emit `#[link(name = "c")]` (or similar) link attributes for libc symbols.
+    - The only `extern "C"` items permitted in generated wrapper code are those already present in `example_wrapper`; do not introduce any new `extern "C"` items.
+    - If a needed symbol is not available in `libc`, prefer a safe Rust equivalent from `std` (e.g. `std::ptr`, `std::ffi::CStr`, `std::fs`, `std::io`). If neither is available, do not declare a new foreign function; explain the limitation in your reasoning.
+
+    # Hard constraints
+
+    - Do not relax behavior, skip write-backs, or use placeholder/stub logic.
+    - Do not declare libc / POSIX functions in `extern "C"` blocks; call them via the `libc` crate.
+
+    # Inputs and feedback
+
+    - `support_code`: the original C source that was translated to Rust.
+    - `prior_wrapper`: a previous attempt to fix, if any.
+    - `build_feedback`: errors from `cargo build`. Address them.
+    - `scope_feedback`: deviations from the `example_wrapper` template. Address them.
+    """
+
+
+def generate_unimplemented_wrapper(path: Path, symbol_name: str) -> CodeRust:
+    # unsafe extern "C" {
+    #     #[link_name = "\u{1}match"]
+    #     pub fn match_(
+    #         threshold: f64,
+    #     ) -> ::std::os::raw::c_int;
+    # }
+    bindgen_wrapper = bindgen(path, symbol_name)
+
+    # #[unsafe(export_name="match")]
+    # pub extern "C" fn match_(
+    #     threshold: f64,
+    # ) -> ::std::os::raw::c_int {
     #     unimplemented!();
     # }
     unimplemented_wrapper = re.sub(
-        r'unsafe extern "C" {\s+pub fn (.*);\s+}',
+        r'unsafe extern "C" {\s*.*\s+pub fn (.*);\s+}',
         rf'#[unsafe(export_name="{symbol_name}")]\npub extern "C" fn \1 {{\n    unimplemented!();\n}}',
-        bindgen_wrapper,
+        bindgen_wrapper.text,
         flags=re.DOTALL,
     )
-    if unimplemented_wrapper == bindgen_wrapper:
+    if unimplemented_wrapper == bindgen_wrapper.text:
         raise ValueError(
             f"Failed to convert bindgen output to function for `{symbol_name}`!\nWrapper:\n{unimplemented_wrapper}"
         )
-    unimplemented_wrapper = unimplemented_wrapper.rstrip()
+
+    # Format unimplemented wrapper using rustfmt
+    ok, unimplemented_wrapper, error, _ = run_subprocess(
+        ["rustfmt"], input=unimplemented_wrapper
+    )
+    if not ok:
+        raise ValueError(f"rustfmt failed!\n{error}")
 
     # Validate the template
     success, output = check_rust(
@@ -128,7 +219,7 @@ def generate_unimplemented_wrapper(path: Path, symbol_name: str) -> str:
         raise ValueError(
             f"Failed to validate wrapper template for `{symbol_name}`!\nWrapper:\n{unimplemented_wrapper}\nError:\n{output}"
         )
-    return unimplemented_wrapper.strip() + "\n"
+    return CodeRust(unimplemented_wrapper)
 
 
 class WrapperGenerator(dspy.Module):
@@ -136,76 +227,83 @@ class WrapperGenerator(dspy.Module):
         self,
         crate: Crate,
         max_iters: int,
-        readonly_cache: Path | None = None,
     ) -> None:
         super().__init__()
         self.crate = crate
         self.max_iters = max_iters
-        self.readonly_cache = readonly_cache
         self.cache = _init_cache(crate.workspace_root / "cache.db")
-
-        # Add sync module to crate
-        sync_path = crate.rust_src_path.parent / "sync.rs"
-        sync_path.write_text((Path(__file__).parent / "sync.rs").read_text())
-        self.crate.vcs.add(sync_path)
 
         # Make sure wrapper module is in known state (i.e., empty)
         self.wrapper_path = crate.rust_src_path.parent / "wrapper.rs"
         self.wrapper_path.write_text("")
 
-    def forward(self, symbol: Symbol, reference_code: str, translation: str) -> dspy.Prediction:
+    def forward(
+        self,
+        symbol: Symbol,
+        reference_code: CodeRust,
+        translation: CodeRust,
+        prior_wrapper: CodeRust | None = None,
+        wrapper: CodeRust | None = None,
+        support_code: CodeC | None = None,
+    ) -> dspy.Prediction:
         if symbol.is_function and symbol.is_definition:
-            return self.wrap_function(symbol, reference_code, translation)
+            return self.wrap_function(
+                symbol,
+                reference_code,
+                translation,
+                prior_wrapper=prior_wrapper,
+                wrapper=wrapper,
+                support_code=support_code,
+            )
         elif symbol.is_variable:
-            return self.annotate_variable(symbol, reference_code, translation)
+            self.wrap_variable_(symbol)
+            return dspy.Prediction(success=True, translation=translation)
         else:
             raise NotImplementedError
 
-    def annotate_variable(
-        self, symbol: Symbol, reference_code: str, translation: str
-    ) -> dspy.Prediction:
-        logger.info(f"Adding export_name attribute to variable `{symbol.name}` ...")
-        rust_src = self.crate.rust_src_path.read_text()
-        if translation not in rust_src:
-            raise RuntimeError("Translation must be on disk!")
+    def wrap_variable_(self, symbol: Symbol):
+        logger.info(f"Generating wrapper for variable `{symbol.name}` ...")
 
-        # Add export_name attribute to symbol translation
-        new_translation = export_first_unannotated_variable(translation, symbol.spelling)
-        if new_translation is None:
-            logger.error(f"Failed to add export_name attribute to variable `{symbol.name}`")
-            return dspy.Prediction(
-                success=False,
-                translation=translation,
-                feedback=f"Could not find a Rust variable named `{symbol.name}` in the translation!",
-            )
+        # Variable wrappers are just bindings to C symbols
+        rust_spelling = mangle(symbol.spelling)
+        wrapper = bindgen(self.crate.c_src_path, symbol.spelling)
+        symbol_wrapper_path = self.wrapper_path.parent / "wrapper" / f"{rust_spelling}.rs"
+        symbol_wrapper_path.parent.mkdir(exist_ok=True, parents=True)
+        symbol_wrapper_path.write_text(wrapper.text)
+        self.crate.vcs.add(symbol_wrapper_path)
 
-        # Update Rust source with export_name attribute
-        rust_src = rust_src.replace(translation, new_translation)
-        self.crate.rust_src_path.write_text(rust_src)
-        self.crate.vcs.add(self.crate.rust_src_path)
+        success, output = self._build(symbol)
+        if not success:
+            raise RuntimeError(f"Failed to build crate!\n{output}")
 
-        # Replace Rust Mutex with C ABI-compatible Mutex
-        RUST_MUTEX = "use std::sync::{Mutex, MutexGuard};"
-        C_ABI_MUTEX = "mod sync;\nuse crate::sync::{Mutex, MutexGuard};"
-        if RUST_MUTEX in rust_src:
-            rust_src = rust_src.replace(RUST_MUTEX, C_ABI_MUTEX)
-            self.crate.rust_src_path.write_text(rust_src)
-            self.crate.vcs.add(self.crate.rust_src_path)
+        # Permanently make variable global
+        clang_make_global_(self.crate.c_src_path, symbol.spelling)
+        self.crate.vcs.add(self.crate.c_src_path)
 
-        self.crate.vcs.commit(f"Added export_name attribute to variable `{symbol.name}` ...")
+        # Reference symbol wrapper in wrapper module.
+        with self.wrapper_path.open("a") as f:
+            f.write(f"pub mod {rust_spelling};\n")
+        self.crate.vcs.add(self.wrapper_path)
 
-        return dspy.Prediction(success=True, translation=new_translation)
+        msg = f"Wrapped variable `{symbol.name}`"
+        logger.info(msg)
+        self.crate.vcs.commit(msg)
 
     def wrap_function(
         self,
         symbol: Symbol,
-        reference_code: str,
-        translation: str,
-        wrapper: str = "",
-        prior_wrapper: str = "",
+        reference_code: CodeRust,
+        translation: CodeRust,
+        prior_wrapper: CodeRust | None = None,
+        wrapper: CodeRust | None = None,
+        support_code: CodeC | None = None,
     ) -> dspy.Prediction:
         # Don't bother wrapping main in binary crates
         if symbol.spelling == "main" and self.crate.is_bin:
+            # Permanently make main function extern
+            clang_make_extern_(self.crate.c_src_path, symbol.spelling)
+            self.crate.vcs.add(self.crate.c_src_path)
+            self.crate.vcs.commit(f"Made function `{symbol.name}` extern")
             return dspy.Prediction(success=True, translation=translation)
 
         logger.info(f"Generating wrapper for function `{symbol.name}` ...")
@@ -214,23 +312,24 @@ class WrapperGenerator(dspy.Module):
         unimplemented_wrapper = generate_unimplemented_wrapper(
             self.crate.c_src_path, symbol.spelling
         )
-        symbol_wrapper_path = self.wrapper_path.parent / "wrapper" / f"{symbol.spelling}.rs"
+        rust_spelling = mangle(symbol.spelling)
+        symbol_wrapper_path = self.wrapper_path.parent / "wrapper" / f"{rust_spelling}.rs"
         symbol_wrapper_path.parent.mkdir(exist_ok=True, parents=True)
-        symbol_wrapper_path.write_text(unimplemented_wrapper)
-        success, build_feedback = self._build(symbol.spelling)
+        symbol_wrapper_path.write_text(unimplemented_wrapper.text)
+        success, build_feedback = self._build(symbol)
         if not success:
             raise RuntimeError(f"The crate does not build!\n\n{build_feedback}")
 
-        # Prefer supplied wrapper, crate cache, then read-only cache.
-        wrapper = (
-            wrapper
-            or _read_cache(self.cache, symbol.spelling, unimplemented_wrapper)
-            or _read_cache(self.readonly_cache, symbol.spelling, unimplemented_wrapper)
-        )
+        # Use cache when no wrapper nor prior wrapper
+        if wrapper is None and prior_wrapper is None:
+            wrapper = _read_cache(self.cache, symbol.spelling, unimplemented_wrapper)
+        else:
+            logger.info("Ignoring wrapper cache...")
 
         # Generate dynamic signature and module for symbol
-        signature = Signature.with_instructions(
-            Signature.instructions.format(
+        signature_class = HybridSignature if not LARGE_PROJECT else Signature
+        signature = signature_class.with_instructions(
+            signature_class.instructions.format(
                 symbol_name=symbol.spelling,
                 crate_path=self.crate.rust_src_path.relative_to(self.crate.cargo_toml.parent),
                 wrapper_path=symbol_wrapper_path.relative_to(self.crate.cargo_toml.parent),
@@ -238,10 +337,14 @@ class WrapperGenerator(dspy.Module):
         )
         generate_wrapper = dspy.ChainOfThought(signature)
 
+        # Construct crate context for generate_wrapper and format it
+        crate = (
+            reference_code + translation + self.gather_wrappers(exclude_wrapper=rust_spelling)
+        )
+
         # Try generating wrapper up to max_iter times
         msg = ""
         success, build_feedback = False, ""
-        dspy_exception = None
         scope_feedback: OrderedDict[str, str] = OrderedDict()
         pred = dspy.Prediction()
         for i in range(max(self.max_iters, 1)):
@@ -250,54 +353,61 @@ class WrapperGenerator(dspy.Module):
                 prior_wrapper = wrapper
 
             try:
-                if i == 0 and wrapper:
-                    pred = dspy.Prediction(wrapper=CodeRust(code=wrapper))
-                else:
-                    pred = generate_wrapper(
-                        crate=CodeRust(code=reference_code + "\n" + translation),
-                        example_wrapper=CodeRust(code=unimplemented_wrapper),
-                        prior_wrapper=CodeRust(code=prior_wrapper),
-                        build_feedback=build_feedback,
-                        scope_feedback="\n\n".join(scope_feedback.values()),
-                    )
-                dspy_exception = None
-            except Exception as e:
+                pred = self.generate(
+                    generate_wrapper,
+                    crate,
+                    support_code,
+                    unimplemented_wrapper,
+                    prior_wrapper,
+                    build_feedback,
+                    "\n\n".join(scope_feedback.values()),
+                    wrapper if i == 0 else None,
+                )
+            except AdapterParseError:
                 logger.exception(
                     f"DSPy exception while generating wrapper for `{symbol.name}` on iteration {i + 1}/{self.max_iters}!"
                 )
-                dspy_exception = e
-                # Attempt again before any build logic
+                # If this is the last iteration, raise
+                if i == max(self.max_iters, 1) - 1:
+                    raise
+                # Otherwise attempt again before any build logic
                 continue
 
             # Reset scope feedback
             scope_feedback.clear()
 
-            if pred.wrapper is None:
+            if "wrapper" not in pred or not isinstance(pred.wrapper, CodeRust):
                 scope_feedback["no_wrapper"] = (
                     "No wrapper was generated. You must respect the template and instructions **exactly**!"
                 )
                 wrapper = unimplemented_wrapper
             else:
-                wrapper = pred.wrapper.code.strip() + "\n"
+                wrapper = pred.wrapper
                 # Validate that changes are in scope
                 scope_feedback.update(validate_changes(wrapper, unimplemented_wrapper))
 
                 # TODO: Check for a single crate function call in scope
 
             # Write wrapper to disk and check if we build with unsafe code since wrappers can use unsafe code
-            symbol_wrapper_path.write_text(wrapper)
+            symbol_wrapper_path.write_text(wrapper.text)
             self.crate.vcs.add(symbol_wrapper_path)
-            success, build_feedback = self._build(symbol.spelling)
+            success, build_feedback = self._build(symbol)
             success = success and not build_feedback and not scope_feedback
 
+            usage = format_usage(pred)
+
             if success:
+                # Permanently make function extern
+                clang_make_extern_(self.crate.c_src_path, symbol.spelling)
+                self.crate.vcs.add(self.crate.c_src_path)
+
                 # Reference successful symbol wrapper in wrapper module
                 with self.wrapper_path.open("a") as f:
-                    f.write(f"pub mod {symbol.spelling};\n")
+                    f.write(f"pub mod {rust_spelling};\n")
                 self.crate.vcs.add(self.wrapper_path)
 
                 # Log and commit success
-                msg = f"Wrapped function `{symbol.name}`"
+                msg = f"Wrapped function `{symbol.name}`: {usage}"
                 logger.info(msg)
                 if "reasoning" in pred:
                     msg += f"\n\n# Reasoning\n{pred.reasoning}"
@@ -305,23 +415,19 @@ class WrapperGenerator(dspy.Module):
                 break
 
             # Log and commit failure
-            msg = f"Failed to wrap function `{symbol.name}` ({i + 1}/{self.max_iters})"
+            msg = f"Failed to wrap function `{symbol.name}` ({i + 1}/{self.max_iters}): {usage}"
             logger.error(msg)
             msg += f"\n\n# Reasoning\n{pred.reasoning}" if "reasoning" in pred else ""
             msg += f"\n\n# Build feedback\n{build_feedback}"
             msg += f"\n\n# Scope Feedback\n{scope_feedback}"
             self.crate.vcs.commit(msg)
 
-        # All iterations failed because of DSPy exceptions
-        if dspy_exception:
-            raise dspy_exception
-
         pred.success = success
         pred.name = symbol.spelling
         pred.translation = translation
         pred.wrapper = wrapper
         pred.bindgen_template = unimplemented_wrapper
-        pred.prior_wrapper = prior_wrapper
+        pred.prior_wrapper = prior_wrapper or CodeRust()
         pred.build_feedback = build_feedback
         pred.scope_feedback = "\n\n".join(scope_feedback.values())
         if not success:
@@ -329,30 +435,122 @@ class WrapperGenerator(dspy.Module):
             pred.feedback = "It was difficult to generate a C-compatible FFI wrapper for the translation. Regenerate the translation with clear, explicit, wrapper-friendly Rust function boundaries and straightforward ownership, while keeping the translation fully memory-safe and free of unsafe constructs."
         return pred
 
-    def _build(self, symbol_spelling: str) -> tuple[bool, str]:
+    def generate(
+        self,
+        generate_wrapper: dspy.ChainOfThought,
+        crate: CodeRust,
+        support_code: CodeC | None,
+        example_wrapper: CodeRust,
+        prior_wrapper: CodeRust | None,
+        build_feedback: str,
+        scope_feedback: str,
+        wrapper: CodeRust | None,
+    ) -> dspy.Prediction:
+        """Generate a wrapper prediction, using cached wrapper or calling the LLM."""
+        parent_usage_tracker = settings.usage_tracker
+        if wrapper is not None:
+            pred = dspy.Prediction(wrapper=wrapper)
+            if parent_usage_tracker is not None:
+                pred.set_lm_usage({})
+        else:
+            if parent_usage_tracker is None:
+                pred = generate_wrapper(
+                    crate=crate,
+                    support_code=support_code or CodeC(),
+                    example_wrapper=example_wrapper,
+                    prior_wrapper=prior_wrapper or CodeRust(),
+                    build_feedback=build_feedback,
+                    scope_feedback=scope_feedback,
+                )
+            else:
+                with track_usage() as local_usage_tracker:
+                    pred = generate_wrapper(
+                        crate=crate,
+                        support_code=support_code or CodeC(),
+                        example_wrapper=example_wrapper,
+                        prior_wrapper=prior_wrapper or CodeRust(),
+                        build_feedback=build_feedback,
+                        scope_feedback=scope_feedback,
+                    )
+                lm_usage = local_usage_tracker.get_total_tokens()
+                pred.set_lm_usage(lm_usage)
+                for lm_name, usage_entry in lm_usage.items():
+                    parent_usage_tracker.add_usage(lm_name, usage_entry)
+        return pred
+
+    def gather_wrappers(self, exclude_wrapper: str = "") -> CodeRust:
+        wrapper_dir = self.wrapper_path.parent / "wrapper"
+        if not wrapper_dir.is_dir():
+            return CodeRust()
+
+        modules: OrderedDict[str, str] = OrderedDict()
+        for symbol_wrapper_path in sorted(wrapper_dir.glob("*.rs")):
+            rust_spelling = symbol_wrapper_path.stem
+            if exclude_wrapper and rust_spelling == exclude_wrapper:
+                continue
+            if rust_spelling in modules:
+                continue
+
+            wrapper_src = symbol_wrapper_path.read_text().strip()
+            if not wrapper_src:
+                continue
+
+            modules[rust_spelling] = (
+                f"pub mod {rust_spelling} {{\n" + textwrap.indent(wrapper_src, "    ") + "\n}"
+            )
+
+        if not modules:
+            return CodeRust()
+
+        return CodeRust(
+            "pub mod wrapper {\n"
+            + textwrap.indent("\n\n".join(modules.values()), "    ")
+            + "\n}\n"
+        )
+
+    def _build(self, symbol: Symbol) -> tuple[bool, str]:
+        orig_c_src = self.crate.c_src_path.read_bytes()
         orig_rust_src = self.crate.rust_src_path.read_bytes()
         orig_wrapper_src = self.wrapper_path.read_bytes()
 
+        if symbol.is_function:
+            # Make C function extern so that we use the Rust function definition
+            clang_make_extern_(self.crate.c_src_path, symbol.spelling)
+        elif symbol.is_variable:
+            # Make C variable global so we can reference it in the Rust wrapper
+            clang_make_global_(self.crate.c_src_path, symbol.spelling)
+        else:
+            raise NotImplementedError
+        self.crate.vcs.add(self.crate.c_src_path)
+
+        # Remove forbid unsafe from Rust source
+        rust_src = orig_rust_src.decode().replace("#![forbid(unsafe_code)]", "")
+
         # Reference wrapper module in Rust source
-        with self.crate.rust_src_path.open("a") as f:
-            f.write("pub mod wrapper;\n")
+        rust_src += "pub mod wrapper;\n"
+        self.crate.rust_src_path.write_text(rust_src)
         self.crate.vcs.add(self.crate.rust_src_path)
 
         # Reference symbol wrapper module to wrapper module
         with self.wrapper_path.open("a") as f:
-            f.write(f"pub mod {symbol_spelling};\n")
+            f.write(f"pub mod {mangle(symbol.spelling)};\n")
         self.crate.vcs.add(self.wrapper_path)
 
         # Check whether all of the changes compile and commit them
-        success, feedback = self.crate.cargo_build(allow_unsafe=True)
+        success, feedback = self.crate.cargo_build()
 
         # Restore original source
+        self.crate.c_src_path.write_bytes(orig_c_src)
         self.crate.rust_src_path.write_bytes(orig_rust_src)
         self.wrapper_path.write_bytes(orig_wrapper_src)
 
         return success, feedback
 
     def write_cache(self, pred: dspy.Prediction) -> None:
+        # If prediction was not generated by an LM then don't write it to cache
+        if not pred.get_lm_usage():
+            return
+
         required_fields = (
             "name",
             "bindgen_template",
@@ -377,34 +575,44 @@ class WrapperGenerator(dspy.Module):
         )
 
 
-def export_first_unannotated_variable(rust_src: str, export_name: str) -> str | None:
-    # Loop through nodes trying to find a static item
-    attrs = []
-    rust_bytes = rust_src.encode()
-    for node in get_nodes(get_root(rust_bytes)):
-        # Keep track of attributes
-        if node.type == "attribute_item":
-            attrs.append(node)
-            continue
+def bindgen(path: Path, symbol_name: str) -> CodeRust:
+    orig_src = path.read_bytes()
+    try:
+        # We want bindgen to run against an in-place extern'd declaration so it emits
+        # a linkable item (`pub fn` / `pub static mut`) instead of value-style
+        # constants for initialized globals, which we can't link against from Rust.
+        clang_make_bindable_(path, symbol_name)
 
-        # Reset list of attributes when we encounter non-static/non-attribute item
-        elif node.type != "static_item":
-            attrs = []
-            continue
-
-        # If export name already in attrs, skip this static item
-        if any(b"export_name" in attr.text for attr in attrs if attr.text is not None):
-            continue
-
-        # FIXME: Warn if name of variable does not correspond to export_name
-
-        # Insert attribute at location
-        return (
-            rust_bytes[: node.start_byte].decode()
-            + f'#[unsafe(export_name="{export_name}")]\n'
-            + rust_bytes[node.start_byte :].decode()
+        # unsafe extern "C" {
+        #     pub static mut foo: ::std::os::raw::c_int;
+        # }
+        ok, binding, error, _ = run_subprocess(
+            [
+                "bindgen",
+                "--disable-header-comment",
+                "--no-doc-comments",
+                "--no-layout-tests",
+                "--sort-semantically",
+                str(path),
+                "--allowlist-item",
+                mangle(symbol_name),
+            ]
         )
-    return None
+    finally:
+        path.write_bytes(orig_src)
+    if not ok:
+        raise ValueError(f"Bindgen failed for `{symbol_name}` in '{path}'!\nError:\n{error}")
+
+    binding = binding.strip()
+    if binding == "":
+        raise ValueError(f"Bindgen generated an empty binding for `{symbol_name}` in '{path}'!")
+
+    success, output = check_rust(binding, flags=["--crate-type", "lib", "--emit", "metadata"])
+    if not success:
+        raise ValueError(
+            f"Failed to validate binding for `{symbol_name}` in '{path}'!\nWrapper:\n{binding}\nError:\n{output}"
+        )
+    return CodeRust(binding)
 
 
 def _init_cache(cache: Path | None) -> Path | None:
@@ -432,32 +640,38 @@ def _init_cache(cache: Path | None) -> Path | None:
     return cache
 
 
-def _read_cache(cache: Path | None, name: str, bindgen_template: str) -> str:
-    wrapper = ""
+def _read_cache(cache: Path | None, name: str, bindgen_template: CodeRust) -> CodeRust | None:
     if cache is None:
-        return wrapper
+        return None
     with sqlite3.connect(cache) as conn:
         try:
             row = conn.execute(
-                "SELECT wrapper FROM wrapper_translations WHERE name=? AND bindgen_template=? AND success=1 ORDER BY id DESC LIMIT 1",
-                (name, bindgen_template),
+                "SELECT wrapper FROM wrapper_translations WHERE bindgen_template=? AND success=1 ORDER BY id DESC LIMIT 1",
+                (bindgen_template.text,),
             ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT wrapper FROM wrapper_translations WHERE name=? AND success=1 ORDER BY id DESC LIMIT 1",
+                    (name,),
+                ).fetchone()
         except Exception:
             row = None
     if row:
         logger.info(f"Cache hit for wrapper `{name}`")
-        wrapper = row[0]
-    return wrapper
+        return CodeRust(row[0])
+    else:
+        logger.info(f"Cache miss for wrapper `{name}`")
+        return None
 
 
 def _write_cache(
     cache: Path | None,
     name: str,
-    bindgen_template: str,
-    prior_wrapper: str,
+    bindgen_template: CodeRust,
+    prior_wrapper: CodeRust,
     build_feedback: str,
     scope_feedback: str,
-    wrapper: str,
+    wrapper: CodeRust,
     success: bool,
 ) -> None:
     if cache is None:
@@ -471,68 +685,11 @@ def _write_cache(
             """,
             (
                 name,
-                bindgen_template,
-                prior_wrapper,
+                bindgen_template.text,
+                prior_wrapper.text,
                 build_feedback,
                 scope_feedback,
-                wrapper,
+                wrapper.text,
                 int(success),
             ),
         )
-
-
-def _main(cfg: WrapperConfig) -> None:
-    output_dir = Path(HydraConfig.get().runtime.output_dir)
-    logger.info(f"Saving results to {output_dir}")
-    crate = Crate(cargo_toml=cfg.cargo_toml.resolve(), vcs=cfg.vcs)  # type: ignore[reportArgumentType]
-
-    model.configure(cfg.model, cfg.generate)
-    dspy.configure(adapter=adapters.ChatAdapter())
-    agent = WrapperGenerator(crate, max_iters=cfg.max_iters, readonly_cache=cfg.readonly_cache)
-
-    # Remove forbid unsafe from Rust source
-    rust_src = re.sub(re.escape("#![forbid(unsafe_code)]"), "", crate.rust_src_path.read_text())
-    crate.rust_src_path.write_text(rust_src)
-
-    # Get global symbol table
-    tu = create_translation_unit(cfg.filename)
-    asts = [extract_info_c(tu)]
-    symbols, _ = get_symbols_and_dependencies(asts, source_priority=[])
-
-    # Generate wrappers for each global function definition
-    for symbol in symbols.values():
-        if symbol.is_global and symbol.is_function and symbol.is_definition:
-            agent(symbol, "", rust_src)
-
-    # Reference wrapper in Rust source
-    with crate.rust_src_path.open("a") as f:
-        f.write("pub mod wrapper;\n")
-    crate.vcs.add(crate.rust_src_path)
-
-    success, feedback = crate.cargo_build(allow_unsafe=True)
-
-    # Commit unsafe Rust code and wrappers
-    if (output_subdir := HydraConfig.get().output_subdir) is not None:
-        crate.vcs.add(output_dir / output_subdir)
-    name = f"`{crate.root_package['name']}`"
-    msg = f"Successfully wrapped all symbols in {name}!"
-    if not success:
-        msg = f"Failed to wrap all symbols in {name}!"
-        logger.error(msg)
-        msg += f"\n\n{feedback}"
-    else:
-        logger.info(msg)
-    crate.vcs.commit(msg)
-
-
-@hydra.main(version_base=None, config_name="wrapper")
-def main(cfg: WrapperConfig) -> None:
-    try:
-        _main(cfg)
-    except Exception as e:
-        logger.exception(e)
-        sys.exit(-1)
-
-
-if __name__ == "__main__":
-    main()

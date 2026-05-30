@@ -5,9 +5,9 @@
 #
 
 import os
+import re
 import json
-from json import loads as js_loads
-from textwrap import dedent as d
+import shutil
 
 import tomlkit
 import logging
@@ -58,10 +58,39 @@ class VCS:
                 raise ValueError(f"Failed to add {path}!\n{out}")
         return ok
 
+    def rm(self, *paths: Path, force: bool = False) -> bool:
+        if self.vcs == "none":
+            ret = True
+            for path in paths:
+                target = path if path.is_absolute() else self.repo_dir / path
+                try:
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                except Exception:
+                    if not force:
+                        ret = False
+            return ret
+
+        ret = True
+        for path in paths:
+            cmd = ["rm"]
+            if path.is_dir():
+                cmd.append("-r")
+            if force:
+                cmd.append("-f")
+
+            ok, out = self(" ".join([*cmd, str(path)]))
+            if not force:
+                ret = ret and ok
+        return ret
+
     def commit(self, message: str = "") -> bool:
         if self.vcs == "none":
             return True
 
+        message = message.replace("\x00", "")
         ok, out = self("commit --allow-empty -F -", input=message)
         if not ok:
             raise ValueError(f"Failed to commit changes to git!\n{out}")
@@ -91,12 +120,8 @@ class Workspace:
         if not self.cargo_toml.exists():
             # Create a new workspace
             os.makedirs(workspace_dir, exist_ok=True)
-            self.cargo_toml.write_text(
-                d("""
-                [workspace]
-                resolver = "3"
-                """).strip()
-            )
+            contents = {"workspace": {"resolver": "3"}}
+            self.cargo_toml.write_text(tomlkit.dumps(contents))
 
         # Initialize repository if needed
         self.vcs.init(force_init=True)
@@ -135,9 +160,6 @@ class Crate:
                 raise RuntimeError(
                     f"Failed to create new crate at {crate_dir} with error:\n\n{output + error}"
                 )
-
-            # Add unsafe feature that allow unsafe code
-            self.cargo_feature(unsafe=[])
 
         # Initialize repository if needed
         self.vcs.init()
@@ -213,7 +235,9 @@ class Crate:
     def c_src_path(self) -> Path:
         return self.rust_src_path.with_suffix(".c")
 
-    def cargo_add(self, dep: str, section: str | None = None) -> str:
+    def cargo_add(
+        self, dep: str, section: str | None = None, features: list[str] | None = None
+    ) -> str:
         cmd = [
             "cargo",
             "add",
@@ -222,6 +246,8 @@ class Crate:
         ]
         if section:
             cmd.append(f"--{section}")
+        if features:
+            cmd.append(f"--features={','.join(features)}")
         cmd.append(dep)
 
         success, output, error, _ = run_subprocess(cmd)
@@ -246,9 +272,20 @@ class Crate:
         # Invalidate cached metadata
         self.invalidate_metadata()
 
-    def cargo_build(
-        self, allow_unsafe: bool = False, fix_E0601: bool = True
-    ) -> tuple[bool, str]:
+    def cargo_clean(self) -> None:
+        cmd = [
+            "cargo",
+            "clean",
+            "--quiet",
+            f"--manifest-path={self.cargo_toml}",
+        ]
+        success, output, error, _ = run_subprocess(cmd)
+        if not success:
+            raise RuntimeError(
+                f"Failed to clean crate at {self.cargo_toml} with error:\n\n{output + error}"
+            )
+
+    def cargo_build(self, fix_E0601: bool = True) -> tuple[bool, str]:
         cmd = [
             "cargo",
             "build",
@@ -256,8 +293,6 @@ class Crate:
             "--color=never",
             f"--manifest-path={self.cargo_toml}",
         ]
-        if allow_unsafe:
-            cmd += ["--features=unsafe"]
         builds, output, error, _ = run_subprocess(cmd)
 
         # Work around E0601 error "No main function was found in a binary crate."
@@ -270,22 +305,109 @@ class Crate:
 
         return builds, output + error
 
-    def cargo_test(self) -> tuple[bool, str, str, int | Literal["timeout"]]:
+    def cargo_test(
+        self,
+        name: str,
+        test_harness: Literal["nextest run", "test"] = "nextest run",
+        quiet: bool = True,
+        fail_fast: bool = False,
+        build_only: bool = False,
+        skip: list[str] | None = None,
+        message_format: str | None = None,
+    ) -> tuple[bool, str, str, int | Literal["timeout"]]:
         cmd = [
             "cargo",
-            "test",
-            "--quiet",
+            *test_harness.split(),
             "--color=never",
             f"--manifest-path={self.cargo_toml}",
-            "--features=unsafe",
         ]
-        return run_subprocess(cmd)
+        if not fail_fast:
+            cmd.append("--no-fail-fast")
+        if quiet:
+            if test_harness == "nextest run":
+                cmd.append("--cargo-quiet")
+            elif test_harness == "test":
+                cmd.append("--quiet")
+            else:
+                raise ValueError(f"Unsupported test harness: {test_harness}")
+        if name:
+            cmd.extend(["--test", name])
+        if build_only:
+            cmd.append("--no-run")
+
+        env = os.environ.copy()
+        if message_format is not None:
+            cmd.extend(["--message-format", message_format])
+            if message_format == "libtest-json" and test_harness == "nextest run":
+                # https://nexte.st/docs/machine-readable/libtest-json/
+                env["NEXTEST_EXPERIMENTAL_LIBTEST_JSON"] = "1"
+        if skip:
+            if test_harness == "nextest run":
+                excluded_tests = [f"test(/^{re.escape(test_name)}$/)" for test_name in skip]
+                expr = " and ".join(f"not {test_expr}" for test_expr in excluded_tests)
+                cmd.extend(["-E", expr])
+            else:
+                cmd.append("--")
+                cmd.append("--exact")
+                for test_name in skip:
+                    cmd.extend(["--skip", test_name])
+
+        return run_subprocess(cmd, env=env)
+
+    def cargo_nextest_config(self, slow: int = 30, terminate_after: int = 4) -> None:
+        nextest_config_path = self.workspace_root / ".config" / "nextest.toml"
+        nextest_config_path.parent.mkdir(exist_ok=True)
+        nextest_config = {
+            "profile": {
+                "default": {
+                    "slow-timeout": {"period": f"{slow}s", "terminate-after": terminate_after},
+                    "final-status-level": "none",
+                    "fail-fast": False,
+                    "failure-output": "never",
+                    "test-threads": 1,
+                }
+            }
+        }
+        nextest_config_path.write_text(tomlkit.dumps(nextest_config))
+        self.invalidate_metadata()
 
     def write(self, path: Path, data, **kwargs):
         if path.is_absolute():
             raise ValueError("path must not be absolute")
         path = self.cargo_toml.parent / path
         return path.write_text(data, **kwargs)
+
+
+def nextest_json_to_libtest(stdout: str) -> str:
+    """Convert nextest libtest-json output to vanilla `cargo test` text format."""
+    lines = []
+    summary = {}
+    for raw in stdout.splitlines():
+        obj = json.loads(raw)
+
+        if obj.get("type") == "test":
+            event = obj.get("event")
+            if event not in {"ok", "failed", "ignored"}:
+                continue
+
+            # nextest uses "$" to join binary::suite$test_name
+            name = obj["name"].rsplit("$", 1)[-1]
+            status = "FAILED" if event == "failed" else event
+            lines.append(f"test {name} ... {status}")
+
+        elif obj.get("type") == "suite" and obj.get("event") != "started":
+            summary = obj
+
+    # Append summary from the suite event (or zeros if missing)
+    p, f = summary.get("passed", 0), summary.get("failed", 0)
+    ig, m = summary.get("ignored", 0), summary.get("measured", 0)
+    fo = summary.get("filtered_out", 0)
+    result = "FAILED" if f else "ok"
+    lines.append(
+        f"test result: {result}. {p} passed; {f} failed; "
+        f"{ig} ignored; {m} measured; {fo} filtered out"
+    )
+    return "\n".join(lines) + "\n"
 
 
 def run_subprocess(
@@ -316,23 +438,6 @@ def run_subprocess(
         )
 
 
-def compile_c(
-    source_file: str, output_file: str, flags: list[str] | None = None
-) -> tuple[bool, str]:
-    cmd = ["clang-21"]
-
-    if flags:
-        cmd.extend(flags)
-    else:
-        cmd.append("-Wall")
-
-    cmd.append(source_file)
-    cmd.extend(["-o", output_file])
-
-    success, output, error, _ = run_subprocess(cmd)
-    return success, output + error
-
-
 def check_c(
     code: str,
     *,
@@ -348,28 +453,6 @@ def check_c(
     cmd.extend(["-march=native", "-x", "c"])
     cmd.append("-")
     cmd.extend(["-o", "/dev/null"])
-
-    success, output, error, _ = run_subprocess(cmd, input=code)
-    return success, output + error
-
-
-def compile_rust(
-    code: str,
-    output_file: Path,
-    *,
-    flags: list[str] | None = None,
-    structured_output: bool = False,
-) -> tuple[bool, str]:
-    cmd = ["rustc"]
-
-    if flags:
-        cmd.extend(flags)
-
-    if structured_output:
-        cmd.append("--error-format=json")
-
-    cmd.append("-")
-    cmd.extend(["-o", str(output_file)])
 
     success, output, error, _ = run_subprocess(cmd, input=code)
     return success, output + error
@@ -396,60 +479,9 @@ def check_rust(
     return success, output + error
 
 
-def run_clippy(
-    source_file: str, flags: list[list[str]] | None = None, structured_output: bool = False
-) -> list[tuple[bool, str]]:
-    base_cmd = ["clippy-driver"]
-
-    if structured_output:
-        base_cmd.append("--error-format=json")
-
-    if not flags:
-        flags = [
-            ["-D", "correctness"],
-            ["-W", "suspicious"],
-            ["-W", "complexity"],
-            ["-W", "perf"],
-            ["-W", "style"],
-        ]
-
-    res = []
-    for opt in flags:
-        cmd = base_cmd.copy()
-        cmd.extend(opt)
-        cmd.append(source_file)
-        res.append(run_subprocess(cmd))
-
-    return res
-
-
-def tool_output_to_js_dict(out: str | list[str]) -> list[dict[str, Any]]:
-    if isinstance(out, str):
-        out = [out]
-
-    def map_single_str(s: str) -> list[dict[str, Any]]:
-        js_list = []
-        # rustc outputs multiple lines, each representing a json object
-        for line in s.split("\n"):
-            stripped = line.strip()
-            if stripped:
-                js_list.append(js_loads(stripped))
-
-        return js_list
-
-    # clippy tool call is several individual calls; we can process them together as a list
-    js_list = []
-    for s in out:
-        js_list.extend(map_single_str(s))
-    return js_list
-
-
-def structured_to_rendered(js_dict: list[dict[str, Any]]) -> str:
-    rendered = ""
-    for single_msg in js_dict:
-        if r := single_msg["rendered"]:
-            rendered += r
-    return rendered
+def rustfmt(path: Path) -> None:
+    cmd = ["rustfmt", str(path)]
+    run_subprocess(cmd)
 
 
 def run_test(
@@ -516,5 +548,4 @@ def _in_env(var_name: str, default: bool = True) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-HYBRID_BUILD = _in_env("HYBRID_BUILD", default=True)
-STATIC_TRANSLATIONS = HYBRID_BUILD or _in_env("STATIC_TRANSLATIONS", default=True)
+LARGE_PROJECT = _in_env("LARGE_PROJECT", default=False)

@@ -16,7 +16,7 @@ from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 
-from ideas.tools import Crate, run_subprocess
+from ideas.tools import Crate, rustfmt
 
 
 logger = logging.getLogger("ideas.translate")
@@ -26,7 +26,6 @@ logger = logging.getLogger("ideas.translate")
 class ConvertConfig:
     test_vectors: list[Path] = MISSING
     output: Path = MISSING
-    timeout: int = 600000
     vcs: str = "none"
 
     # Library-specific inputs
@@ -36,11 +35,6 @@ class ConvertConfig:
 
 cs = ConfigStore.instance()
 cs.store(name="convert_tests", node=ConvertConfig)
-
-
-def rustfmt(path: Path) -> None:
-    cmd = ["rustfmt", str(path)]
-    run_subprocess(cmd)
 
 
 def to_rust_str(string):
@@ -55,19 +49,17 @@ def is_bin_test(test_case: Path):
 def add_deps_for_exec(crate: Crate) -> None:
     # Add test dependencies
     crate.cargo_add(dep="assert_cmd@2.0.17", section="dev")
-    crate.cargo_add(dep="ntest@0.9.3", section="dev")
     crate.cargo_add(dep="predicates@3.1.3", section="dev")
     crate.invalidate_metadata()
 
 
-def convert_tests_for_exec(test_cases: list[Path], timeout: int = 60000) -> str:
+def convert_tests_for_exec(test_cases: list[Path]) -> str:
     test_cases = list(filter(is_bin_test, test_cases))
     if len(test_cases) == 0:
         return ""
 
     output = ""
     output += "use assert_cmd::Command;\n"
-    output += "use ntest::timeout;\n"
     output += "use predicates::prelude::*;\n"
     output += "\n"
 
@@ -114,11 +106,15 @@ def convert_tests_for_exec(test_cases: list[Path], timeout: int = 60000) -> str:
             raise ValueError(f"stderr.is_regex must be a boolean, got {type(is_stderr_regex)}")
 
         output += "#[test]\n"
-        output += f"#[timeout({timeout})]\n"
         output += f"fn test_case_{test_case.stem}() {{\n"
-        output += "    Command::cargo_bin(assert_cmd::crate_name!()).unwrap()"
-        if len(args) > 0:
-            output += f".args(&[{', '.join([to_rust_str(arg) for arg in args])}])"
+        output += "let pkg_name_path = assert_cmd::cargo::cargo_bin(assert_cmd::pkg_name!());\n"
+        output += '    Command::new("stdbuf")'
+        output += '.arg("-e0")'
+        output += '.arg("-o0")'
+        output += ".arg(pkg_name_path)"
+        args = [to_rust_str(arg) for arg in args]
+        if args:
+            output += f".args([{', '.join(args)}])"
         if stdin is not None:
             output += f".write_stdin({to_rust_str(stdin)})"
         output += ".assert()"
@@ -145,7 +141,6 @@ def is_lib_test(test_case: Path):
 
 def add_deps_for_lib(crate: Crate) -> None:
     # Add test dependencies
-    crate.cargo_add(dep="ntest@0.9.3", section="dev")
     crate.cargo_add(dep="once_cell@1.21.3", section="dev")
     crate.cargo_add(dep="test-cdylib@1.1.0", section="dev")
     crate.invalidate_metadata()
@@ -155,7 +150,6 @@ def convert_tests_for_lib(
     test_cases: list[Path],
     runner_manifest: Path | None,
     template_path: Path | None,
-    timeout: int = 60000,
 ) -> str:
     test_cases = list(filter(is_lib_test, test_cases))
     if len(test_cases) == 0:
@@ -167,8 +161,6 @@ def convert_tests_for_lib(
 
     # Load template
     template = template_path.read_text()
-    # Replace the timeout
-    template = template.replace("#[timeout(placeholder)]", f"#[timeout({timeout})]")
 
     # FIXME: This currently assumes that the macro generate_tests! is defined in the template
     # Use the generate_tests! macro to add tests
@@ -195,8 +187,8 @@ def _main(cfg: ConvertConfig) -> None:
     cargo_toml = output_dir / "Cargo.toml"
     output_file = output_dir / cfg.output
 
-    exec_tests = convert_tests_for_exec(test_vectors, cfg.timeout)
-    lib_tests = convert_tests_for_lib(test_vectors, runner_manifest, cfg.template, cfg.timeout)
+    exec_tests = convert_tests_for_exec(test_vectors)
+    lib_tests = convert_tests_for_lib(test_vectors, runner_manifest, cfg.template)
     # Write and format tests
     output_file.parent.mkdir(exist_ok=True)
     output_file.write_text(exec_tests + "\n" + lib_tests)

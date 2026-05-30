@@ -9,9 +9,12 @@ from collections import OrderedDict
 from tree_sitter import Language, Parser, Node, Query, QueryCursor
 import tree_sitter_rust
 
+from .adapters import Code
+
 # Initialize the Rust language once
 RUST_LANGUAGE = Language(tree_sitter_rust.language())
 RUST_PARSER = Parser(RUST_LANGUAGE)
+CodeRust = Code["rust"]
 
 
 class RustFnSignature:
@@ -96,9 +99,9 @@ def get_macro_nodes(root: Node, placeholder: str) -> list[Node]:
     return list(ancestors)
 
 
-def validate_changes(code: str, template: str) -> OrderedDict[str, str]:
-    code_root = get_root(code)
-    template_root = get_root(template)
+def validate_changes(code: CodeRust, template: CodeRust) -> OrderedDict[str, str]:
+    code_root = get_root(code.text)
+    template_root = get_root(template.text)
 
     nodes = get_nodes(code_root)
     template_nodes = get_nodes(template_root)
@@ -143,3 +146,57 @@ def validate_changes(code: str, template: str) -> OrderedDict[str, str]:
                     )
 
     return scope_feedback
+
+
+def mangle(name: str) -> str:
+    # FIXME: It would be much nicer to let bindgen mangle names but need to feed the mangled name to --allowlist-function.
+    # See: https://github.com/rust-lang/rust-bindgen/blob/b7b501feb2642b6ac3796f8c5f2a1461640a2a67/bindgen/ir/context.rs#L859-L887
+    if (
+        "@" in name
+        or "?" in name
+        or "$" in name
+        or name in ("abstract", "alignof", "as", "async", "await", "become", "box", "break")
+        or name in ("const", "continue", "crate", "do", "dyn", "else", "enum", "extern")
+        or name in ("false", "final", "fn", "for", "gen", "if", "impl", "in")
+        or name in ("let", "loop", "macro", "match", "mod", "move", "mut", "offsetof")
+        or name in ("override", "priv", "proc", "pub", "pure", "ref", "return", "Self")
+        or name in ("self", "sizeof", "static", "struct", "super", "trait", "true", "try")
+        or name in ("type", "typeof", "unsafe", "unsized", "use", "virtual", "where", "while")
+        or name in ("yield", "str", "bool", "f32", "f64", "usize", "isize", "u128")
+        or name in ("i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8", "_")
+    ):
+        name = name.replace("@", "_")
+        name = name.replace("?", "_")
+        name = name.replace("$", "_")
+        name += "_"
+    return name
+
+
+def _rust_node_signature(node: Node, source: bytes) -> str | None:
+    ntype = node.type
+    if ntype in ("function_item", "function_signature_item"):
+        # Find the block body and remove it
+        body = node.child_by_field_name("body")
+        if body:
+            # Everything before the body is the signature
+            sig = source[node.start_byte : body.start_byte].rstrip()
+            return sig.decode() + ";"
+
+    # Keep everything else as-is
+    return source[node.start_byte : node.end_byte].decode()
+
+
+def get_signatures(code: CodeRust) -> CodeRust:
+    if not code.text.strip():
+        return code
+
+    source = code.text.encode()
+    root = get_root(source)
+    parts: list[str] = []
+
+    for node in root.children:
+        sig = _rust_node_signature(node, source)
+        if sig:
+            parts.append(sig)
+
+    return CodeRust("\n".join(parts)) if parts else CodeRust("")

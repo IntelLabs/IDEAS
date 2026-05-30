@@ -8,7 +8,7 @@
 import pytest
 from pathlib import Path
 
-from ideas.ast_rust import validate_changes
+from ideas.ast_rust import CodeRust, validate_changes
 
 
 @pytest.fixture
@@ -32,11 +32,11 @@ def modified_invalid(fixtures_dir: Path) -> str:
 
 
 def test_modified_valid(template: str, modified_valid: str):
-    feedback = validate_changes(modified_valid, template)
+    feedback = validate_changes(CodeRust(code=modified_valid), CodeRust(code=template))
     assert not feedback
 
 
 def test_modified_invalid(template: str, modified_invalid: str):
-    feedback = validate_changes(modified_invalid, template)
+    feedback = validate_changes(CodeRust(code=modified_invalid), CodeRust(code=template))
     assert feedback
     assert list(feedback.keys()) == ["top_level_changes", "signature_changes"]

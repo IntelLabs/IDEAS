@@ -23,7 +23,7 @@ class ModelConfig:
 
 @dataclass
 class GenerateConfig:
-    max_new_tokens: int = 64000
+    max_new_tokens: int = 128000
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int | None = None
@@ -55,22 +55,37 @@ def get_lm(model: ModelConfig, generate: GenerateConfig) -> dspy.LM:
         if "anthropic" in model.name:
             provider["order"] = ["anthropic", "anthropic/2", "google-vertex/us-east5", "azure"]
 
-        # Require fp8 and limit prices for qwen3-coder
-        if model.name.lower().endswith("qwen/qwen3-coder"):
-            provider["quantizations"] = ["fp8"]
-            provider["max_price"] = {"prompt": 0.5, "completion": 2}
-
         lm.kwargs["provider"] = provider  # type: ignore[reportArgumentType]
 
         # Mask and/or disable reasoning if desired and possible
         if model.text_output:
             lm.kwargs["reasoning"] = {"exclude": True}  # type: ignore[reportArgumentType]
-            if model.name.startswith("openrouter/x-ai"):
-                lm.kwargs["reasoning"].update({"effort": "none"})  # type: ignore[reportArgumentType]
 
     return lm
 
 
 def configure(model: ModelConfig, generate: GenerateConfig):
     lm = get_lm(model, generate)
-    dspy.configure(lm=lm)
+    dspy.configure(lm=lm, track_usage=True)
+
+
+def format_usage(pred: dspy.Prediction) -> str:
+    # get_lm_usage() returns dict[lm_name, dict[str, Any]] — aggregate across all LMs
+    lm_usage = pred.get_lm_usage()
+    if lm_usage is None:
+        return "unknown usage"
+
+    usage: dict[str, Any] = {}
+    for per_lm in lm_usage.values():
+        for key, value in per_lm.items():
+            if isinstance(value, (int, float)):
+                usage[key] = usage.get(key, 0) + value
+
+    prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+    completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+    total_tokens = usage.get("total_tokens") or (prompt_tokens + completion_tokens)
+    cost_usd = usage.get("cost") or usage.get("cost_usd") or usage.get("total_cost")
+
+    cost = f"${cost_usd:.4f}, " if cost_usd is not None else ""
+
+    return f"{cost}{total_tokens:,} tok ({prompt_tokens:,} in / {completion_tokens:,} out)"

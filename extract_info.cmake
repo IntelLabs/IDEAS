@@ -52,12 +52,11 @@ function(extract_info)
             continue()
         endif()
 
-        get_target_property(TARGET_DIR ${TARGET} SOURCE_DIR)
         get_target_property(TARGET_LINK_LIBRARIES ${TARGET} LINK_LIBRARIES)
 
         message(STATUS "  Found ${TARGET_TYPE} ${TARGET}")
 
-        # Recursively get target sources and and shared library/object sources
+        # Recursively get target sources and shared library/object sources
         get_target_sources(TARGET_SOURCES ${TARGET})
         foreach(LINK_TARGET IN LISTS TARGET_LINK_LIBRARIES)
             if(TARGET ${LINK_TARGET})
@@ -67,15 +66,11 @@ function(extract_info)
         endforeach()
         list(JOIN TARGET_SOURCES "\n" TARGET_SOURCES)
 
-        if(${TARGET_TYPE} STREQUAL "OBJECT_LIBRARY")
-            set(TARGET_NAME ${TARGET})
-        elseif(${TARGET_TYPE} STREQUAL "EXECUTABLE")
+        if(${TARGET_TYPE} STREQUAL "EXECUTABLE")
             set(TARGET_NAME $<TARGET_FILE_NAME:${TARGET}>)
         else()
             set(TARGET_NAME $<TARGET_LINKER_FILE_NAME:${TARGET}>)
         endif()
-        file(GENERATE OUTPUT "${TARGET_NAME}.type" CONTENT "${TARGET_TYPE}")
-        file(GENERATE OUTPUT "${TARGET_NAME}.dir" CONTENT "${TARGET_DIR}")
         file(GENERATE OUTPUT "${TARGET_NAME}.sources" CONTENT "${TARGET_SOURCES}")
     endforeach()
 endfunction()
