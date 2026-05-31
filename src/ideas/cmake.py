@@ -69,7 +69,17 @@ def configure(
     if not preset:
         cmd = ["cmake", "-S", str(source_dir), "-B", str(build_dir), "-G", "Ninja"] + flags
     else:
-        cmd = ["cmake", "-S", ".", "--preset", preset] + flags
+        cmd = [
+            "cmake",
+            "-S",
+            ".",
+            "--preset",
+            preset,
+            "-B",
+            str(build_dir),
+            "-G",
+            "Ninja",
+        ] + flags
 
     success, output, error, _ = run_subprocess(cmd)
     if not success:
@@ -95,9 +105,26 @@ def build(build_dir: Path, preset: str | None = None) -> None:
         raise RuntimeError(f"CMake build failed: {' '.join(cmd)}\n{output + error}")
 
 
+def patch_preset_binary_dir(preset_path: Path, build_dir: Path) -> None:
+    """Ensure binaryDir and generator in all configure presets are set to ninja."""
+    data = json.loads(preset_path.read_text())
+    for preset in data.get("configurePresets", []):
+        if "binaryDir" in preset and preset["binaryDir"] != str(build_dir):
+            preset["binaryDir"] = str(build_dir)
+
+        if "generator" in preset and preset["generator"] != "Ninja":
+            preset["generator"] = "Ninja"
+
+    preset_path.write_text(json.dumps(data, indent=2))
+
+
 def _main(cfg: CmakeConfig) -> None:
     # Determine Cmake preset
     preset = "test" if os.path.exists("CMakePresets.json") else None
+
+    # Patch binaryDir in presets to match our expected build directory
+    if preset:
+        patch_preset_binary_dir(Path("CMakePresets.json"), cfg.build_dir)
 
     # Configure Cmake
     configure(
