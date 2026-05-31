@@ -1,0 +1,24 @@
+//
+// Copyright (C) 2026 Intel Corporation
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#include <stdio.h>
+#include "hello.h"
+
+#define GREETING "Hello World!"
+#define BORDER_CHAR '*'
+#define BORDER_LENGTH 5
+
+void hello_print(void) {
+    for (int i = 0; i < BORDER_LENGTH; i++) {
+        printf("%c", BORDER_CHAR);
+    }
+
+    printf("\n%s\n", GREETING);
+
+    for (int i = 0; i < BORDER_LENGTH; i++) {
+        printf("%c", BORDER_CHAR);
+    }
+}
