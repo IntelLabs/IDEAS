@@ -18,7 +18,6 @@ from hydra.core.hydra_config import HydraConfig
 from ideas import adapters, model, ModelConfig, GenerateConfig
 from ideas import SnippetTranslator, RecurrentTranslator, WrapperGenerator, SymbolTester
 from ideas import create_translation_unit, extract_info_c
-from ideas.ast_rust import mangle
 from ideas.init.consolidate import get_symbols_and_dependencies
 from .tools import Crate, LARGE_PROJECT
 
@@ -113,30 +112,10 @@ def _cleanup(crate: Crate, symbols: dict) -> None:
     )
     logger.info("Removed bindgen artifacts")
 
-    # For libaries, keep variables and global functions
-    keepers: set[str] = set()
-    if not crate.is_bin:
-        keepers = {
-            mangle(s.spelling)
-            for s in symbols.values()
-            if s.is_variable or (s.is_global and s.is_function and s.is_definition)
-        }
-    wrapper_dir = crate.rust_src_path.parent / "wrapper"
-    wrapper_module = crate.rust_src_path.parent / "wrapper.rs"
-
-    lines = wrapper_module.read_text().splitlines() if wrapper_module.exists() else []
-    if wrapper_dir.exists():
-        for wrapper_file in wrapper_dir.glob("*.rs"):
-            if wrapper_file.stem not in keepers:
-                crate.vcs.rm(wrapper_file, force=True)
-                logger.info(f"Removed non-global wrapper: {wrapper_file.name}")
-                mod_line = f"pub mod {wrapper_file.stem};"
-                if mod_line in lines:
-                    lines.remove(mod_line)
-    if lines:
-        wrapper_module.write_text("\n".join(lines) + "\n")
-        crate.vcs.add(wrapper_module)
-    else:
+    # For binaries, delete wrappers
+    if crate.is_bin:
+        wrapper_dir = crate.rust_src_path.parent / "wrapper"
+        wrapper_module = crate.rust_src_path.parent / "wrapper.rs"
         crate.vcs.rm(wrapper_module, wrapper_dir, force=True)
 
 
