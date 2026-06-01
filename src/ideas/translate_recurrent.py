@@ -276,14 +276,13 @@ class RecurrentTranslator(dspy.Module):
         with self.crate.rust_src_path.open("a") as f:
             f.write(translation.text + "\n")
 
-        if self.wrap_symbol is None:
-            # If we don't want a wrapper, then we are done
-            return pred
-
         # Generate wrapper, that may modify the translation, for each symbol
         unsafe_translation = translation
         wrappers: dict[str, dspy.Prediction] = {}
         for symbol in symbols:
+            # If we don't have a wrapper function, then skip the symbol
+            if self.wrap_symbol is None:
+                continue
             # We can only hybrid build-test functions and variables
             if not (symbol.is_function and symbol.is_definition) and not symbol.is_variable:
                 continue
@@ -330,8 +329,9 @@ class RecurrentTranslator(dspy.Module):
         # Cache successful translation and wrappers
         if pred.success:
             self.translate_symbol.write_cache(pred)
-            for wrapper in wrappers.values():
-                self.wrap_symbol.write_cache(wrapper)
+            if self.wrap_symbol is not None:
+                for wrapper in wrappers.values():
+                    self.wrap_symbol.write_cache(wrapper)
 
         # Return wrappers for next retry
         pred.wrappers = {name: wrapper.wrapper for name, wrapper in wrappers.items()}
