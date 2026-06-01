@@ -113,14 +113,14 @@ def _cleanup(crate: Crate, symbols: dict) -> None:
     )
     logger.info("Removed bindgen artifacts")
 
-    # Remove wrappers for symbols that are not globally linked
-    keepers = {
-        mangle(s.spelling)
-        for s in symbols.values()
-        if s.is_global
-        and not crate.is_bin
-        and (s.is_variable or (s.is_function and s.is_definition))
-    }
+    # For libaries, keep variables and global functions
+    keepers: set[str] = set()
+    if not crate.is_bin:
+        keepers = {
+            mangle(s.spelling)
+            for s in symbols.values()
+            if s.is_variable or (s.is_global and s.is_function and s.is_definition)
+        }
     wrapper_dir = crate.rust_src_path.parent / "wrapper"
     wrapper_module = crate.rust_src_path.parent / "wrapper.rs"
 
