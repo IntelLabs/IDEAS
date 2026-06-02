@@ -37,8 +37,13 @@ endif
 
 EVALUATION_TEST ?= test_cases
 TEST_FILES := $(wildcard test_vectors/*.json)
+ifeq ($(LARGE_PROJECT),1)
+TARGETS_LIB ?=
+TARGETS_BIN ?= $(shell [ -d build-ninja ] && find build-ninja -maxdepth 1 -name '*.sources' ! -name '*.so.sources' -exec basename {} .sources \; )
+else
 TARGETS_LIB ?= $(shell [ -d build-ninja ] && find build-ninja -maxdepth 1 -name 'lib*.so.sources' -exec basename {} .so.sources \; | sed -e "s/^lib//gi")
 TARGETS_BIN ?= $(shell [ -d build-ninja ] && find build-ninja -maxdepth 1 -name '*.sources' ! -name 'lib*.so.sources' -exec basename {} .sources \; )
+endif
 TARGETS ?= $(TARGETS_BIN) $(TARGETS_LIB)
 ifeq (${TARGETS},)
 ifeq ($(filter cmake clean,$(MAKECMDGOALS)),)
@@ -122,6 +127,33 @@ translate: $(patsubst %,${TRANSLATION_DIR}/%/translate,${TARGETS}) ;
 ${TRANSLATION_DIR}/%/translate: ${TRANSLATION_DIR}/%/src/lib.rs | build-ninja/lib%.so.sources ;
 ${TRANSLATION_DIR}/%/translate: ${TRANSLATION_DIR}/%/src/main.rs | build-ninja/%.sources ;
 
+ifeq ($(LARGE_PROJECT),1)
+.PRECIOUS: ${TRANSLATION_DIR}/%/src/lib.rs
+${TRANSLATION_DIR}/%/src/lib.rs: | ${TRANSLATION_DIR}/%/Cargo.toml ${TRANSLATION_DIR}/%/tests/${TRANSLATION_TEST}.rs build-ninja/compile_commands.json
+	-uv run python -m ideas.translate model.name=${PROVIDER}/${MODEL} \
+                                 filename=build-ninja/compile_commands.json \
+                                 cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
+                                 source_priority=build-ninja/lib$*.so.sources \
+                                 tests=${TRANSLATION_TEST} \
+                                 vcs=${VCS} \
+                                 hydra.output_subdir=.translate \
+                                 hydra.job.name=translate \
+                                 hydra.run.dir=${TRANSLATION_DIR}/$* ${TRANSLATE_ARGS}
+	@touch $@
+
+.PRECIOUS: ${TRANSLATION_DIR}/%/src/main.rs
+${TRANSLATION_DIR}/%/src/main.rs: | ${TRANSLATION_DIR}/%/Cargo.toml ${TRANSLATION_DIR}/%/tests/${TRANSLATION_TEST}.rs build-ninja/compile_commands.json
+	-uv run python -m ideas.translate model.name=${PROVIDER}/${MODEL} \
+                                 filename=build-ninja/compile_commands.json \
+                                 cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
+                                 source_priority=build-ninja/$*.sources \
+                                 tests=${TRANSLATION_TEST} \
+                                 vcs=${VCS} \
+                                 hydra.output_subdir=.translate \
+                                 hydra.job.name=translate \
+                                 hydra.run.dir=${TRANSLATION_DIR}/$* ${TRANSLATE_ARGS}
+	@touch $@
+else
 .PRECIOUS: ${TRANSLATION_DIR}/%/src/lib.rs
 ${TRANSLATION_DIR}/%/src/lib.rs: ${TRANSLATION_DIR}/%/src/lib.c | ${TRANSLATION_DIR}/%/Cargo.toml ${TRANSLATION_DIR}/%/tests/${TRANSLATION_TEST}.rs
 	-uv run python -m ideas.translate model.name=${PROVIDER}/${MODEL} \
@@ -145,6 +177,7 @@ ${TRANSLATION_DIR}/%/src/main.rs: ${TRANSLATION_DIR}/%/src/main.c | ${TRANSLATIO
                                  hydra.job.name=translate \
                                  hydra.run.dir=${TRANSLATION_DIR}/$* ${TRANSLATE_ARGS}
 	@touch $@
+endif
 
 # build
 .PHONY: build
