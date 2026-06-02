@@ -11,7 +11,7 @@ from collections.abc import Iterable
 import dspy
 import networkx as nx
 
-from .ast import CodeC, Symbol
+from .ast import CodeC, Symbol, TreeResult
 from .ast_rust import CodeRust, get_signatures
 from .tools import Crate, LARGE_PROJECT
 from .init.consolidate import create_symbol_lexical_key_fn
@@ -43,6 +43,7 @@ class RecurrentTranslator(dspy.Module):
         self,
         symbols: dict[SymbolName, Symbol],
         dependencies: dict[SymbolGroup, Iterable[SymbolGroup]],
+        ast_order: dict[Path, TreeResult] | None = None,
     ) -> dspy.Prediction:
         # We always start with an empty crate
         self.crate.rust_src_path.write_text("")
@@ -53,7 +54,7 @@ class RecurrentTranslator(dspy.Module):
         assert isinstance(G, nx.DiGraph)
         groups = list(
             nx.lexicographical_topological_sort(
-                G.reverse(copy=False), key=create_symbol_lexical_key_fn(symbols)
+                G.reverse(copy=False), key=create_symbol_lexical_key_fn(symbols, ast_order)
             )
         )
 

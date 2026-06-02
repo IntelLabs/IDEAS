@@ -629,6 +629,10 @@ def merge_symbols(
 
 
 def _main(cfg: ConsolidateConfig):
+    if LARGE_PROJECT:
+        logger.info("LARGE_PROJECT mode enabled: consolidation is disabled!")
+        return
+
     output_dir = Path(HydraConfig.get().runtime.output_dir)
 
     # Get crate information
