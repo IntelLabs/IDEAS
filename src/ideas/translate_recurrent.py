@@ -13,7 +13,7 @@ import networkx as nx
 
 from .ast import CodeC, Symbol, TreeResult
 from .ast_rust import CodeRust, get_signatures
-from .tools import Crate, LARGE_PROJECT
+from .tools import Crate, LARGE_PROJECT, MAX_DEPENDENT_CHARS
 from .init.consolidate import create_symbol_lexical_key_fn
 
 logger = logging.getLogger("ideas.translate_recurrent")
@@ -105,12 +105,21 @@ class RecurrentTranslator(dspy.Module):
             )
 
             # Gather dependent code in topological order
-            dependent_code = CodeC.join(
-                symbols[name].code
-                for g in groups
-                if g in immediate_to_be_translated
-                for name in g
-            )
+            dependent_parts: list[CodeC] = []
+            total_chars, exceeded = 0, False
+            for g in groups:
+                if exceeded:
+                    break
+                if g in immediate_to_be_translated:
+                    for name in g:
+                        code = symbols[name].code.text
+                        char_count = len(str(code))
+                        if LARGE_PROJECT and total_chars + char_count > MAX_DEPENDENT_CHARS:
+                            exceeded = True
+                            break
+                        dependent_parts.append(symbols[name].code)
+                        total_chars += char_count
+            dependent_code = CodeC.join(dependent_parts)
 
             # Translate snippet and save it if successful
             pred = self.translate_with_retries(
