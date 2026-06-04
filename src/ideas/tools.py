@@ -549,3 +549,4 @@ def _in_env(var_name: str, default: bool = True) -> bool:
 
 
 LARGE_PROJECT = _in_env("LARGE_PROJECT", default=False)
+MAX_DEPENDENT_CHARS = int(os.environ.get("MAX_DEPENDENT_CHARS", "20000"))
