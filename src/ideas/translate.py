@@ -18,8 +18,7 @@ from hydra.core.hydra_config import HydraConfig
 from ideas import adapters, model, ModelConfig, GenerateConfig
 from ideas import SnippetTranslator, RecurrentTranslator, WrapperGenerator, SymbolTester
 from ideas import create_translation_unit, extract_info_c
-from ideas.ast_rust import mangle
-from ideas.init.consolidate import get_symbols_and_dependencies
+from ideas.init.consolidate import get_symbols_and_dependencies, get_asts, create_ast_order
 from .tools import Crate, LARGE_PROJECT
 
 logger = logging.getLogger("ideas.translate")
@@ -33,6 +32,8 @@ class TranslateConfig:
 
     cargo_toml: Path = MISSING
     tests: str = MISSING
+
+    source_priority: Path | None = None
 
     translator: str = "ChainOfThought"
     translator_max_iters: int = 5
@@ -51,7 +52,15 @@ def _main(cfg: TranslateConfig) -> None:
     logger.info(f"Saving results to {output_dir}")
     crate = Crate(cargo_toml=cfg.cargo_toml.resolve(), vcs=cfg.vcs)  # type: ignore[reportArgumentType]
 
+    # Resolve source priority
+    source_priority: list[Path] = []
+    if cfg.source_priority:
+        lines = cfg.source_priority.read_text().splitlines()
+        source_priority = [Path(line.strip()).resolve() for line in lines if line.strip()]
+
     # Save C source since it will be modified by the agent
+    if LARGE_PROJECT:
+        crate.c_src_path.write_text("")
     orig_c_src = crate.c_src_path.read_bytes()
 
     # Make sure Rust source is in known state (i.e., empty)
@@ -61,11 +70,21 @@ def _main(cfg: TranslateConfig) -> None:
         crate.vcs.rm(crate.cargo_toml.parent / "build.rs", force=True)
 
     # Get global symbol table
-    tu = create_translation_unit(cfg.filename)
-    asts = [extract_info_c(tu)]
-    symbols, dependencies = get_symbols_and_dependencies(
-        asts, external_symbol_names=["c:@F@main"] if crate.is_bin else None
-    )
+    if cfg.filename.suffix == ".c":
+        tu = create_translation_unit(cfg.filename)
+        asts = [extract_info_c(tu)]
+        ast_order = None
+        symbols, dependencies = get_symbols_and_dependencies(
+            asts, external_symbol_names=["c:@F@main"] if crate.is_bin else None
+        )
+    else:
+        asts = get_asts(cfg.filename, source_priority)
+        ast_order = create_ast_order(source_priority, asts)
+        symbols, dependencies = get_symbols_and_dependencies(
+            asts,
+            external_symbol_names=["c:@F@main"] if crate.is_bin else None,
+            ast_order=ast_order,
+        )
 
     # Create translation agent
     model.configure(cfg.model, cfg.generate)
@@ -81,7 +100,7 @@ def _main(cfg: TranslateConfig) -> None:
     )
 
     # Run translation agent and write it to disk
-    pred = agent(symbols, dependencies)
+    pred = agent(symbols, dependencies, ast_order)
     crate.rust_src_path.write_text(pred.translation.text)
     usage = model.format_usage(pred)
     if pred.success:
@@ -113,30 +132,10 @@ def _cleanup(crate: Crate, symbols: dict) -> None:
     )
     logger.info("Removed bindgen artifacts")
 
-    # Remove wrappers for symbols that are not globally linked
-    keepers = {
-        mangle(s.spelling)
-        for s in symbols.values()
-        if s.is_global
-        and not crate.is_bin
-        and (s.is_variable or (s.is_function and s.is_definition))
-    }
-    wrapper_dir = crate.rust_src_path.parent / "wrapper"
-    wrapper_module = crate.rust_src_path.parent / "wrapper.rs"
-
-    lines = wrapper_module.read_text().splitlines() if wrapper_module.exists() else []
-    if wrapper_dir.exists():
-        for wrapper_file in wrapper_dir.glob("*.rs"):
-            if wrapper_file.stem not in keepers:
-                crate.vcs.rm(wrapper_file, force=True)
-                logger.info(f"Removed non-global wrapper: {wrapper_file.name}")
-                mod_line = f"pub mod {wrapper_file.stem};"
-                if mod_line in lines:
-                    lines.remove(mod_line)
-    if lines:
-        wrapper_module.write_text("\n".join(lines) + "\n")
-        crate.vcs.add(wrapper_module)
-    else:
+    # For binaries, delete wrappers
+    if crate.is_bin:
+        wrapper_dir = crate.rust_src_path.parent / "wrapper"
+        wrapper_module = crate.rust_src_path.parent / "wrapper.rs"
         crate.vcs.rm(wrapper_module, wrapper_dir, force=True)
 
 

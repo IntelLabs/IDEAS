@@ -11,9 +11,9 @@ from collections.abc import Iterable
 import dspy
 import networkx as nx
 
-from .ast import CodeC, Symbol
+from .ast import CodeC, Symbol, TreeResult
 from .ast_rust import CodeRust, get_signatures
-from .tools import Crate, LARGE_PROJECT
+from .tools import Crate, LARGE_PROJECT, MAX_DEPENDENT_CHARS
 from .init.consolidate import create_symbol_lexical_key_fn
 
 logger = logging.getLogger("ideas.translate_recurrent")
@@ -43,6 +43,7 @@ class RecurrentTranslator(dspy.Module):
         self,
         symbols: dict[SymbolName, Symbol],
         dependencies: dict[SymbolGroup, Iterable[SymbolGroup]],
+        ast_order: dict[Path, TreeResult] | None = None,
     ) -> dspy.Prediction:
         # We always start with an empty crate
         self.crate.rust_src_path.write_text("")
@@ -53,7 +54,7 @@ class RecurrentTranslator(dspy.Module):
         assert isinstance(G, nx.DiGraph)
         groups = list(
             nx.lexicographical_topological_sort(
-                G.reverse(copy=False), key=create_symbol_lexical_key_fn(symbols)
+                G.reverse(copy=False), key=create_symbol_lexical_key_fn(symbols, ast_order)
             )
         )
 
@@ -104,12 +105,21 @@ class RecurrentTranslator(dspy.Module):
             )
 
             # Gather dependent code in topological order
-            dependent_code = CodeC.join(
-                symbols[name].code
-                for g in groups
-                if g in immediate_to_be_translated
-                for name in g
-            )
+            dependent_parts: list[CodeC] = []
+            total_chars, exceeded = 0, False
+            for g in groups:
+                if exceeded:
+                    break
+                if g in immediate_to_be_translated:
+                    for name in g:
+                        code = symbols[name].code.text
+                        char_count = len(str(code))
+                        if LARGE_PROJECT and total_chars + char_count > MAX_DEPENDENT_CHARS:
+                            exceeded = True
+                            break
+                        dependent_parts.append(symbols[name].code)
+                        total_chars += char_count
+            dependent_code = CodeC.join(dependent_parts)
 
             # Translate snippet and save it if successful
             pred = self.translate_with_retries(
@@ -276,14 +286,13 @@ class RecurrentTranslator(dspy.Module):
         with self.crate.rust_src_path.open("a") as f:
             f.write(translation.text + "\n")
 
-        if self.wrap_symbol is None:
-            # If we don't want a wrapper, then we are done
-            return pred
-
         # Generate wrapper, that may modify the translation, for each symbol
         unsafe_translation = translation
         wrappers: dict[str, dspy.Prediction] = {}
         for symbol in symbols:
+            # If we don't have a wrapper function, then skip the symbol
+            if self.wrap_symbol is None:
+                continue
             # We can only hybrid build-test functions and variables
             if not (symbol.is_function and symbol.is_definition) and not symbol.is_variable:
                 continue
@@ -330,8 +339,9 @@ class RecurrentTranslator(dspy.Module):
         # Cache successful translation and wrappers
         if pred.success:
             self.translate_symbol.write_cache(pred)
-            for wrapper in wrappers.values():
-                self.wrap_symbol.write_cache(wrapper)
+            if self.wrap_symbol is not None:
+                for wrapper in wrappers.values():
+                    self.wrap_symbol.write_cache(wrapper)
 
         # Return wrappers for next retry
         pred.wrappers = {name: wrapper.wrapper for name, wrapper in wrappers.items()}

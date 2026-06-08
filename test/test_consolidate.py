@@ -11,6 +11,8 @@ import networkx as nx
 import pytest
 import json
 
+from clang.cindex import TranslationUnit as TU
+
 from ideas import ast
 from ideas.init.consolidate import (
     create_ast_order,
@@ -204,14 +206,6 @@ def test_nested_include_symbols_do_not_tie(tmp_path: Path):
 
 
 def test_consolidation_places_typedef_before_struct_definition(tmp_path: Path):
-    """
-      - types.h: typedef struct X X;
-      - thing.h: includes types.h, defines struct X { fields };
-      - thing.c: includes thing.h, uses X in function signatures
-
-    Consolidation must place the typedef before the struct definition so
-    that uses of 'X' as a bare type name compile correctly.
-    """
     types_h = tmp_path / "types.h"
     thing_h = tmp_path / "thing.h"
     thing_c = tmp_path / "thing.c"
@@ -219,27 +213,21 @@ def test_consolidation_places_typedef_before_struct_definition(tmp_path: Path):
     types_h.write_text(
         dedent(
             """\
-            #ifndef TYPES_H
-            #define TYPES_H
-            typedef struct git_callbacks git_callbacks;
-            #endif
+            typedef struct X X;
             """
         )
     )
     thing_h.write_text(
         dedent(
             """\
-            #ifndef THING_H
-            #define THING_H
             #include "types.h"
 
-            struct git_callbacks {
-                int (*notify)(git_callbacks *self, int status);
+            struct X {
+                int (*notify)(X *self, int status);
                 void *payload;
             };
 
-            int git_callbacks_init(git_callbacks *out);
-            #endif
+            int X_init(X *out);
             """
         )
     )
@@ -248,7 +236,7 @@ def test_consolidation_places_typedef_before_struct_definition(tmp_path: Path):
             """\
             #include "thing.h"
 
-            int git_callbacks_init(git_callbacks *out) {
+            int X_init(X *out) {
                 out->notify = 0;
                 out->payload = 0;
                 return 0;
@@ -261,8 +249,6 @@ def test_consolidation_places_typedef_before_struct_definition(tmp_path: Path):
     compile_commands = _write_compile_commands(tmp_path, [thing_c])
     consolidated = consolidate_init(compile_commands, source_priority=[])
 
-    # The consolidated code must compile — the typedef must appear before
-    # the struct definition and function that use 'git_callbacks' as a type name.
     success, error = check_c(consolidated, flags=["-fsyntax-only", "-Wall"])
     assert success, (
         f"Consolidated code does not compile:\n{error}\n\nConsolidated output:\n{consolidated}"
@@ -270,22 +256,6 @@ def test_consolidation_places_typedef_before_struct_definition(tmp_path: Path):
 
 
 def test_consolidation_typedef_before_struct_cross_tu(tmp_path: Path):
-    """
-    Cross-TU corner case: when the struct does NOT use the typedef name internally,
-    the typedef and struct can end up in the same SCC with cursors from different TUs.
-    clang_isBeforeInTranslationUnit returns 0 for both directions (undefined cross-TU),
-    so order depends on sort stability.
-
-    In valid C, if a struct body uses the typedef name, the typedef must be included
-    before it — meaning both symbols always appear in the same TU. So cross-TU
-    comparison can only happen when the struct does NOT reference the typedef,
-    in which case ordering doesn't affect compilability.
-
-      - types.h: typedef struct Node Node;
-      - node.h: struct Node { int val; struct Node *next; }; (struct tag only)
-      - api.c: includes types.h + node.h, uses Node * in function
-      - internal.c: includes node.h only, uses struct Node *
-    """
     types_h = tmp_path / "types.h"
     node_h = tmp_path / "node.h"
     api_c = tmp_path / "api.c"
@@ -294,23 +264,17 @@ def test_consolidation_typedef_before_struct_cross_tu(tmp_path: Path):
     types_h.write_text(
         dedent(
             """\
-            #ifndef TYPES_H
-            #define TYPES_H
             typedef struct Node Node;
-            #endif
             """
         )
     )
     node_h.write_text(
         dedent(
             """\
-            #ifndef NODE_H
-            #define NODE_H
             struct Node {
                 int val;
                 struct Node *next;
             };
-            #endif
             """
         )
     )
@@ -374,20 +338,14 @@ def test_consolidation_mutual_cross_tu_typedefs(tmp_path: Path):
     a_types_h.write_text(
         dedent(
             """\
-            #ifndef A_TYPES_H
-            #define A_TYPES_H
             typedef struct A A;
-            #endif
             """
         )
     )
     b_types_h.write_text(
         dedent(
             """\
-            #ifndef B_TYPES_H
-            #define B_TYPES_H
             typedef struct B B;
-            #endif
             """
         )
     )
@@ -490,7 +448,6 @@ def test_macro_wrapped_declaration(tmp_path: Path):
         f"Consolidated output contains unexpanded macro 'LIB_EXPORT':\n{consolidated}"
     )
 
-    # It must still compile
     success, error = check_c(consolidated, flags=["-fsyntax-only", "-Wall"])
     assert success, (
         f"Consolidated code does not compile:\n{error}\n\nConsolidated output:\n{consolidated}"
@@ -499,11 +456,6 @@ def test_macro_wrapped_declaration(tmp_path: Path):
 
 def test_typedef_after_struct_cross_tu_three_tus(tmp_path: Path):
     """
-    Three-TU corner case exposing invalid ordering when typedef and struct
-    definition form a cycle (same SCC) but their cursors come from different TUs
-    after merge_symbols.
-
-    Setup:
       - types.h: typedef struct X X;   (forward-declares struct X via typedef)
       - TU1 (a.c): #include "types.h", defines struct X { X *self; int val; };
                     The struct body uses the typedef name 'X' → creates cycle:
@@ -535,10 +487,7 @@ def test_typedef_after_struct_cross_tu_three_tus(tmp_path: Path):
     types_h.write_text(
         dedent(
             """\
-            #ifndef TYPES_H
-            #define TYPES_H
             typedef struct X X;
-            #endif
             """
         )
     )
@@ -824,29 +773,6 @@ def test_isystem_inline_function_dependency_not_lost(tmp_path: Path):
 
 
 def test_static_inline_in_scc_emitted_before_caller(tmp_path: Path):
-    """
-    When a static inline function from a header participates in a dependency
-    cycle (via a global variable whose initializer references its caller),
-    all participants collapse into one SCC. The lexical sort within that SCC
-    uses TU rank. If the caller's TU has a LOWER rank than the inline's TU,
-    the caller is emitted first — before the inline is defined — causing:
-      "call to undeclared function"
-
-    The static inline has declaration=None (the definition IS the declaration),
-    so the SCC emission logic cannot emit a forward declaration for it.
-
-    Setup:
-      header.h: struct vtable_t, extern vtable, static inline helper()
-      caller.c: #include "header.h", defines compute() which calls helper()
-      state.c:  #include "header.h", defines vtable = { .fn = compute }
-
-    Cycle: compute -> helper -> vtable -> compute
-    merge_symbols picks helper from state.c (processed first in asts).
-    ast_order = [caller.c, state.c] => caller.c rank 0, state.c rank 1.
-    SCC sort: compute(rank 0) before helper(rank 1) => BUG.
-    """
-    from clang.cindex import TranslationUnit as TU
-
     # header.h: static inline helper reads extern vtable
     header_h = tmp_path / "header.h"
     header_h.write_text(

@@ -85,7 +85,7 @@ install-clang:## Install Clang-21, must be sudo
 
 .PHONY: install-sys-deps
 install-sys-deps:## Install system dependencies, must be sudo
-	apt install libpcre3-dev
+	apt install libpcre3-dev libpcre2-dev
 
 .PHONY: serve
 serve:## Start vLLM server
