@@ -12,11 +12,10 @@ To install the Python and Rust toolchain dependencies, run `make install` and fo
 # Quick start
 To translate a single C project to a Rust workspace, ensure it uses Cmake as a build system, place it in the `examples` folder and run:
 ```bash
-make examples/C-project-name/wrapper \
+make examples/C-project-name/translate \
   OPENROUTER_API_KEY="your-key" \
   MODEL="openai/gpt-5.1" \
-  PROVIDER="openrouter" \
-  BASE_URL="https://openrouter.ai/api/v1"
+  TRANSLATION_TEST=smoke
 ```
 
 # Expected C project structure
@@ -83,24 +82,14 @@ make examples/C-project-name/translate \
   TRANSLATION_DIR="translated_rust" \
   OPENROUTER_API_KEY="your-key" \
   MODEL="openai/gpt-5.1" \
-  PROVIDER="openrouter" \
-  BASE_URL="https://openrouter.ai/api/v1"
+  TRANSLATION_TEST=smoke
 ```
 
-This will **only** produce the translation for libraries, not C FFI wrappers.
-
-To translate (and produce wrappers) any project, run:
-```bash
-make examples/C-project-name/wrapper \
-  ...
-```
-
-If a project (library or executable) was not already translated under `TRANSLATION_DIR`, our dependency chain will first trigger its memory-safe translation, followed by wrappers (only for libraries).
+If a project (library or executable) was not already found under `TRANSLATION_DIR`, our dependency chain will first trigger its memory-safe translation, followed by C FFI wrappers (only for libraries).
 
 To run all tests (if available and following the DARPA TRACTOR evaluation schema) on an existing translation, run:
 ```bash
-make examples/C-project-name/test \
-  ...
+make examples/C-project-name/test
 ```
 
 If a project was not already translated, this will trigger complete translation and testing, and can be used a **single-click** translation-and-evaluation command.
