@@ -3,7 +3,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/IntelLabs/IDEAS/badge)](https://scorecard.dev/viewer/?uri=github.com/IntelLabs/IDEAS)
 
 > [!NOTE]
-> IDEAS is a framework under active development which may still go through major changes with each release.  
+> IDEAS is a framework under active development which may go through major changes with each release.  
 > If you encounter any issues or have questions about how to run the framework, please do not hesitate to [open a GitHub issue](https://github.com/IntelLabs/IDEAS/issues/new).
 
 # Requirements
