@@ -7,6 +7,7 @@
 import logging
 import sqlite3
 from pathlib import Path
+from textwrap import indent
 
 import dspy
 from dspy.utils.exceptions import AdapterParseError
@@ -140,8 +141,8 @@ Use functions from these crates as needed to translate the C code to equivalent,
 class SnippetTranslator(dspy.Module):
     def __init__(
         self,
-        translator: type[dspy.Module],
         crate: Crate,
+        translator: type[dspy.Module],
         max_iters: int = 5,
     ):
         super().__init__()
@@ -151,8 +152,8 @@ class SnippetTranslator(dspy.Module):
                 "\n\n".join([signature.instructions, _crate_dependencies])
             )
 
-        self._translate = translator(signature)
         self.crate = crate
+        self._translate = translator(signature)
         self.max_iters = max_iters
         self.cache = _init_cache(crate.workspace_root / "cache.db")
 
@@ -165,19 +166,18 @@ class SnippetTranslator(dspy.Module):
         dependent_code: CodeC,
         prior_translation: CodeRust | None = None,
         feedback: str = "",
-        translation: CodeRust | None = None,
     ) -> dspy.Prediction:
         logger.info(f"Translating snippet `{name}` ...")
 
-        # If the snippet is empty, use static translation
-        if not snippet.text:
+        # Use cache when no prior translation
+        if prior_translation is None and not str(snippet):
+            # Special case for empty snippets: fall back to a static comment
             translation = CodeRust(f"// Empty snippet `{name}`")
-
-        # Use cache when no translation nor prior translation
-        if translation is None and prior_translation is None:
+        elif prior_translation is None:
             translation = _read_cache(self.cache, name, snippet)
         else:
             logger.info("Ignoring snippet cache...")
+            translation = None
 
         orig_rust_src = self.crate.rust_src_path.read_bytes()
         pred = dspy.Prediction()
@@ -195,7 +195,7 @@ class SnippetTranslator(dspy.Module):
             # This allows static translations that violate safety, which will be fixed by the LLM!
             try:
                 pred = self.translate(
-                    rust_src if not LARGE_PROJECT else reference_context,
+                    reference_code if not LARGE_PROJECT else reference_context,
                     snippet,
                     dependent_code,
                     prior_translation,
@@ -221,7 +221,7 @@ class SnippetTranslator(dspy.Module):
 
             # Append translation and check if it builds
             rust_src += translation
-            self.crate.rust_src_path.write_text(rust_src.text)
+            self.crate.rust_src_path.write_text(str(rust_src))
             self.crate.vcs.add(self.crate.rust_src_path)
             # FIXME: Checking name for c:@F@main is brittle but we have no better way here.
             #        The proper way to fix is to yield the translation back to the caller so it can
@@ -240,14 +240,16 @@ class SnippetTranslator(dspy.Module):
             if builds:
                 msg = f"Translated snippet `{name}`: {usage}"
                 logger.info(msg)
-                msg += f"\n\n# Reasoning\n{pred.reasoning}" if "reasoning" in pred else ""
+                if "reasoning" in pred:
+                    msg += f"\n\n# Reasoning\n{indent(pred.reasoning, '  ')}"
                 self.crate.vcs.commit(msg)
                 break
 
             msg = f"Failed to translate snippet `{name}` ({i + 1}/{self.max_iters}): {usage}"
             logger.error(msg)
-            msg += f"\n\n# Reasoning\n{pred.reasoning}" if "reasoning" in pred else ""
-            msg += f"\n\n# Feedback\n{feedback}" if feedback else ""
+            if "reasoning" in pred:
+                msg += f"\n\n# Reasoning\n{indent(pred.reasoning, '  ')}"
+            msg += f"\n\n# Feedback\n{indent(feedback, '  ')}" if feedback else ""
             self.crate.vcs.commit(msg)
         self.crate.rust_src_path.write_bytes(orig_rust_src)
         pred.name = name
@@ -262,7 +264,7 @@ class SnippetTranslator(dspy.Module):
 
     def translate(
         self,
-        rust_src: CodeRust,
+        reference_code: CodeRust,
         snippet: CodeC,
         dependent_code: CodeC,
         prior_translation: CodeRust | None,
@@ -278,7 +280,7 @@ class SnippetTranslator(dspy.Module):
         else:
             if parent_usage_tracker is None:
                 pred = self._translate(
-                    reference_code=rust_src,
+                    reference_code=reference_code,
                     snippet=snippet,
                     dependent_code=dependent_code,
                     prior_translation=prior_translation or CodeRust(),
@@ -287,7 +289,7 @@ class SnippetTranslator(dspy.Module):
             else:
                 with track_usage() as local_usage_tracker:
                     pred = self._translate(
-                        reference_code=rust_src,
+                        reference_code=reference_code,
                         snippet=snippet,
                         dependent_code=dependent_code,
                         prior_translation=prior_translation or CodeRust(),
@@ -350,7 +352,7 @@ def _read_cache(cache: Path | None, name: str, snippet: CodeC) -> CodeRust | Non
         try:
             row = conn.execute(
                 "SELECT translation FROM snippet_translations WHERE snippet=? AND success=1 ORDER BY id DESC LIMIT 1",
-                (snippet.text,),
+                (str(snippet),),
             ).fetchone()
             if row is None:
                 row = conn.execute(
@@ -389,12 +391,12 @@ def _write_cache(
             """,
             (
                 name,
-                snippet.text,
-                reference_code.text,
-                dependent_code.text,
-                prior_translation.text,
+                str(snippet),
+                str(reference_code),
+                str(dependent_code),
+                str(prior_translation),
                 feedback,
-                translation.text,
+                str(translation),
                 int(success),
             ),
         )

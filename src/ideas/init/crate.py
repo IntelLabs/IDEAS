@@ -8,7 +8,7 @@ import sys
 import logging
 import tomlkit
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import hydra
 from omegaconf import MISSING
@@ -22,16 +22,21 @@ logger = logging.getLogger("ideas.init.crate")
 
 @dataclass
 class CrateConfig:
-    crate_type: str = MISSING
+    cargo_toml: Path = MISSING
+    template: str = MISSING
     vcs: str = "none"
 
     reexport_lib: bool = True
+    workspace_dependencies: list[str] = field(default_factory=list)
 
     def __post_init__(self):
-        if self.crate_type not in ["bin", "lib"]:
-            raise ValueError(f"Invalid crate type: {self.crate_type}!")
+        if self.template not in ["bin", "lib"]:
+            raise ValueError(f"Invalid crate template: {self.template}!")
         if self.vcs not in ["git", "none"]:
             raise ValueError(f"Invalid VCS: {self.vcs}!")
+        for dep in self.workspace_dependencies:
+            if not dep.strip():
+                raise ValueError("workspace_dependencies entries must be non-empty crate names")
 
 
 cs = ConfigStore.instance()
@@ -42,11 +47,7 @@ def _main(cfg: CrateConfig) -> None:
     output_dir = Path(HydraConfig.get().runtime.output_dir)
 
     # Initialize crate
-    crate = Crate(
-        cargo_toml=output_dir / "Cargo.toml",
-        type=cfg.crate_type,  # type: ignore[reportArgumentType]
-        vcs=cfg.vcs,  # type: ignore[reportArgumentType]
-    )
+    crate = Crate(cfg.cargo_toml, template=cfg.template, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
 
     # Delete default cargo init code
     crate.rust_src_path.write_text("")
@@ -61,15 +62,16 @@ def _main(cfg: CrateConfig) -> None:
     crate.cargo_add(dep="serde_json@1", section="dev")
     crate.cargo_add(dep="tempfile@3", section="dev")
     crate.cargo_add(dep="cc@1.2.53", section="build")
+    crate.add_workspace_dependencies(cfg.workspace_dependencies)
 
-    if cfg.crate_type == "bin":
+    if crate.is_bin:
         # Add static test dependencies
         crate.cargo_add(dep="assert_cmd@2.0.17", section="dev")
         crate.cargo_add(dep="predicates@3.1.3", section="dev")
 
     # Disable default tests
     cargo_toml = tomlkit.loads(crate.cargo_toml.read_text())
-    if cfg.crate_type == "bin":
+    if crate.is_bin:
         bin, found = cargo_toml.get("bin", list()), False
         for target in bin:
             if target.get("name", None) == crate.root_package["name"]:
@@ -78,14 +80,14 @@ def _main(cfg: CrateConfig) -> None:
         if not found:
             bin.append({"name": crate.root_package["name"], "test": False})
         cargo_toml["bin"] = bin
-    if cfg.crate_type == "lib":
+    else:
         lib = cargo_toml.get("lib", dict())
         lib.update({"test": False, "doctest": False})
         cargo_toml["lib"] = lib
     crate.cargo_toml.write_text(tomlkit.dumps(cargo_toml))
 
     # Export cdylib
-    if cfg.crate_type == "lib" and cfg.reexport_lib:
+    if not crate.is_bin and cfg.reexport_lib:
         cargo_toml = tomlkit.loads(crate.cargo_toml.read_text())
         lib = cargo_toml.get("lib", dict())
         lib.update({"crate-type": ["lib", "cdylib"]})

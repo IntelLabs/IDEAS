@@ -195,7 +195,7 @@ def _main(cfg: ConvertConfig) -> None:
     rustfmt(output_file)
 
     # Add crate dependencies
-    crate = Crate(cargo_toml=cargo_toml, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
+    crate = Crate(cargo_toml, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
     if exec_tests:
         add_deps_for_exec(crate)
     if lib_tests:

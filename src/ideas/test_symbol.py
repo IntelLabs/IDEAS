@@ -11,7 +11,7 @@ import dspy
 
 from ideas.tools import Crate
 from ideas.ast import Symbol
-from ideas.init.build import write_main_binding
+from ideas.init.build import write_main_binding, CodeRust
 
 logger = logging.getLogger("ideas.test_symbol")
 
@@ -21,6 +21,7 @@ class SymbolTester(dspy.Module):
         super().__init__()
         self.crate = crate
         self.tests = tests
+        self.main_function: CodeRust | None = None
 
         for symbol in symbols:
             if not (symbol.is_function and symbol.is_definition and symbol.is_global):
@@ -28,7 +29,7 @@ class SymbolTester(dspy.Module):
             if self.crate.is_bin and symbol.spelling == "main":
                 # main requires special handling because we must bind to it as _main and
                 # statically create a Rust main that calls it
-                self.main_function: str = write_main_binding(crate)
+                self.main_function = write_main_binding(crate)
 
     def test(
         self, tests: str, skip: list[str] | None = None
@@ -56,9 +57,9 @@ class SymbolTester(dspy.Module):
 
         # Try building the crate to detect if we need to insert a main
         builds, feedback = self.crate.cargo_build(fix_E0601=False)
-        if "error[E0601]" in feedback and self.main_function:
+        if "error[E0601]" in feedback and self.main_function is not None:
             with self.crate.rust_src_path.open("a+") as f:
-                f.write(self.main_function)
+                f.write(str(self.main_function))
 
         self.crate.vcs.add(wrapper_path, binding_path, self.crate.rust_src_path)
 
@@ -70,7 +71,7 @@ class SymbolTester(dspy.Module):
         passes, jsonl, error, _ = self.crate.cargo_test(
             tests, skip=skip, test_harness="nextest run", message_format="libtest-json"
         )
-        results = extract_test_results(jsonl)
+        results = _extract_test_results(jsonl)
         return passes, results, error
 
     def forward(self, symbol: Symbol, skip: list[str] | None = None) -> dspy.Prediction:
@@ -117,7 +118,7 @@ class SymbolTester(dspy.Module):
         return pred
 
 
-def extract_test_results(output: str) -> dict[str, bool]:
+def _extract_test_results(output: str) -> dict[str, bool]:
     test_results: dict[str, bool] = {}
 
     for line in output.splitlines():

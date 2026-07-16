@@ -148,7 +148,7 @@ def test_bindgen_emits_expected_text_for_global_shapes(
 
     binding = wrapper_mod.bindgen(c_path, symbol)
 
-    assert binding.text.strip() == expected
+    assert str(binding).strip() == expected
     assert c_path.read_text() == source
 
 
@@ -194,7 +194,7 @@ def test_bindgen_handles_dependent_declarations_for_target_global(tmp_path: Path
     dependent_binding = wrapper_mod.bindgen(c_path, "arr")
     assert c_path.read_text() == array_decl + dependent_decl
 
-    assert dependent_binding.text.strip() == baseline_binding.text.strip()
+    assert str(dependent_binding).strip() == str(baseline_binding).strip()
 
 
 def test_bindgen_handles_dependent_declarations_for_target_function(tmp_path: Path):
@@ -210,4 +210,4 @@ def test_bindgen_handles_dependent_declarations_for_target_function(tmp_path: Pa
     dependent_binding = wrapper_mod.bindgen(c_path, "f")
     assert c_path.read_text() == dependent_source
 
-    assert dependent_binding.text.strip() == baseline_binding.text.strip()
+    assert str(dependent_binding).strip() == str(baseline_binding).strip()

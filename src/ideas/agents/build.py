@@ -115,7 +115,7 @@ def write_symbol_binding(crate: Crate, symbol_name: str):
         "\n\n".join(
             [
                 "#![allow(unused_attributes)]",
-                symbol_binding.text,
+                str(symbol_binding),
             ]
         )
     )
@@ -182,10 +182,7 @@ def _main(cfg: BuildConfig) -> None:
     output_dir = Path(HydraConfig.get().runtime.output_dir)
 
     # Fetch crate
-    crate = Crate(
-        cargo_toml=output_dir / "Cargo.toml",
-        vcs=cfg.vcs,  # type: ignore[reportArgumentType]
-    )
+    crate = Crate(output_dir / "Cargo.toml", vcs=cfg.vcs)  # type: ignore[reportArgumentType]
 
     # Get global symbol table
     tu = create_translation_unit(crate.c_src_path)

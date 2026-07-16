@@ -34,8 +34,7 @@ class Code(dspy.Code):
         kwargs["code"] = code
         super().__init__(**kwargs)
 
-    @property
-    def text(self) -> str:
+    def __str__(self):
         return self.code
 
     def __add__(self, other):

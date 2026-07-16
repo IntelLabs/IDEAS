@@ -7,8 +7,8 @@
 import re
 import sqlite3
 import logging
-import textwrap
 from pathlib import Path
+from textwrap import indent
 from collections import OrderedDict
 
 import dspy
@@ -191,15 +191,15 @@ def generate_unimplemented_wrapper(path: Path, symbol_name: str) -> CodeRust:
     # pub extern "C" fn match_(
     #     threshold: f64,
     # ) -> ::std::os::raw::c_int {
-    #     unimplemented!();
+    #     unimplemented!()
     # }
     unimplemented_wrapper = re.sub(
         r'unsafe extern "C" {\s*.*\s+pub fn (.*);\s+}',
-        rf'#[unsafe(export_name="{symbol_name}")]\npub extern "C" fn \1 {{\n    unimplemented!();\n}}',
-        bindgen_wrapper.text,
+        rf'#[unsafe(export_name="{symbol_name}")]\npub extern "C" fn \1 {{\n    unimplemented!()\n}}',
+        str(bindgen_wrapper),
         flags=re.DOTALL,
     )
-    if unimplemented_wrapper == bindgen_wrapper.text:
+    if unimplemented_wrapper == str(bindgen_wrapper):
         raise ValueError(
             f"Failed to convert bindgen output to function for `{symbol_name}`!\nWrapper:\n{unimplemented_wrapper}"
         )
@@ -226,7 +226,7 @@ class WrapperGenerator(dspy.Module):
     def __init__(
         self,
         crate: Crate,
-        max_iters: int,
+        max_iters: int = 5,
     ) -> None:
         super().__init__()
         self.crate = crate
@@ -243,7 +243,6 @@ class WrapperGenerator(dspy.Module):
         reference_code: CodeRust,
         translation: CodeRust,
         prior_wrapper: CodeRust | None = None,
-        wrapper: CodeRust | None = None,
         support_code: CodeC | None = None,
     ) -> dspy.Prediction:
         if symbol.is_function and symbol.is_definition:
@@ -252,12 +251,11 @@ class WrapperGenerator(dspy.Module):
                 reference_code,
                 translation,
                 prior_wrapper=prior_wrapper,
-                wrapper=wrapper,
                 support_code=support_code,
             )
         elif symbol.is_variable:
             self.wrap_variable_(symbol)
-            return dspy.Prediction(success=True, translation=translation)
+            return dspy.Prediction(success=True)
         else:
             raise NotImplementedError
 
@@ -269,7 +267,7 @@ class WrapperGenerator(dspy.Module):
         wrapper = bindgen(self.crate.c_src_path, symbol.spelling)
         symbol_wrapper_path = self.wrapper_path.parent / "wrapper" / f"{rust_spelling}.rs"
         symbol_wrapper_path.parent.mkdir(exist_ok=True, parents=True)
-        symbol_wrapper_path.write_text(wrapper.text)
+        symbol_wrapper_path.write_text(str(wrapper))
         self.crate.vcs.add(symbol_wrapper_path)
 
         success, output = self._build(symbol)
@@ -295,7 +293,6 @@ class WrapperGenerator(dspy.Module):
         reference_code: CodeRust,
         translation: CodeRust,
         prior_wrapper: CodeRust | None = None,
-        wrapper: CodeRust | None = None,
         support_code: CodeC | None = None,
     ) -> dspy.Prediction:
         # Don't bother wrapping main in binary crates
@@ -304,7 +301,7 @@ class WrapperGenerator(dspy.Module):
             clang_make_extern_(self.crate.c_src_path, symbol.spelling)
             self.crate.vcs.add(self.crate.c_src_path)
             self.crate.vcs.commit(f"Made function `{symbol.name}` extern")
-            return dspy.Prediction(success=True, translation=translation)
+            return dspy.Prediction(success=True)
 
         logger.info(f"Generating wrapper for function `{symbol.name}` ...")
 
@@ -315,16 +312,17 @@ class WrapperGenerator(dspy.Module):
         rust_spelling = mangle(symbol.spelling)
         symbol_wrapper_path = self.wrapper_path.parent / "wrapper" / f"{rust_spelling}.rs"
         symbol_wrapper_path.parent.mkdir(exist_ok=True, parents=True)
-        symbol_wrapper_path.write_text(unimplemented_wrapper.text)
+        symbol_wrapper_path.write_text(str(unimplemented_wrapper))
         success, build_feedback = self._build(symbol)
         if not success:
             raise RuntimeError(f"The crate does not build!\n\n{build_feedback}")
 
-        # Use cache when no wrapper nor prior wrapper
-        if wrapper is None and prior_wrapper is None:
+        # Use cache when no prior wrapper
+        if prior_wrapper is None:
             wrapper = _read_cache(self.cache, symbol.spelling, unimplemented_wrapper)
         else:
             logger.info("Ignoring wrapper cache...")
+            wrapper = None
 
         # Generate dynamic signature and module for symbol
         signature_class = HybridSignature if not LARGE_PROJECT else Signature
@@ -344,8 +342,7 @@ class WrapperGenerator(dspy.Module):
 
         # Try generating wrapper up to max_iter times
         msg = ""
-        success, build_feedback = False, ""
-        scope_feedback: OrderedDict[str, str] = OrderedDict()
+        success, build_feedback, scope_feedback = False, "", ""
         pred = dspy.Prediction()
         for i in range(max(self.max_iters, 1)):
             # Use the wrapper from the prior iteration as feedback for the next iteration
@@ -360,7 +357,7 @@ class WrapperGenerator(dspy.Module):
                     unimplemented_wrapper,
                     prior_wrapper,
                     build_feedback,
-                    "\n\n".join(scope_feedback.values()),
+                    scope_feedback,
                     wrapper if i == 0 else None,
                 )
             except AdapterParseError:
@@ -374,28 +371,26 @@ class WrapperGenerator(dspy.Module):
                 continue
 
             # Reset scope feedback
-            scope_feedback.clear()
-
             if "wrapper" not in pred or not isinstance(pred.wrapper, CodeRust):
-                scope_feedback["no_wrapper"] = (
-                    "No wrapper was generated. You must respect the template and instructions **exactly**!"
-                )
                 wrapper = unimplemented_wrapper
+                scope_feedback = "No wrapper was generated. You must respect the template and instructions **exactly**!"
             else:
                 wrapper = pred.wrapper
                 # Validate that changes are in scope
-                scope_feedback.update(validate_changes(wrapper, unimplemented_wrapper))
-
+                scope_feedback = "\n\n".join(
+                    validate_changes(wrapper, unimplemented_wrapper).values()
+                )
                 # TODO: Check for a single crate function call in scope
 
             # Write wrapper to disk and check if we build with unsafe code since wrappers can use unsafe code
-            symbol_wrapper_path.write_text(wrapper.text)
+            symbol_wrapper_path.write_text(str(wrapper))
             self.crate.vcs.add(symbol_wrapper_path)
             success, build_feedback = self._build(symbol)
             success = success and not build_feedback and not scope_feedback
 
             usage = format_usage(pred)
 
+            # Exit early if we build
             if success:
                 # Permanently make function extern
                 clang_make_extern_(self.crate.c_src_path, symbol.spelling)
@@ -410,26 +405,26 @@ class WrapperGenerator(dspy.Module):
                 msg = f"Wrapped function `{symbol.name}`: {usage}"
                 logger.info(msg)
                 if "reasoning" in pred:
-                    msg += f"\n\n# Reasoning\n{pred.reasoning}"
+                    msg += f"\n\n# Reasoning\n{indent(pred.reasoning, '  ')}"
                 self.crate.vcs.commit(msg)
                 break
 
             # Log and commit failure
             msg = f"Failed to wrap function `{symbol.name}` ({i + 1}/{self.max_iters}): {usage}"
             logger.error(msg)
-            msg += f"\n\n# Reasoning\n{pred.reasoning}" if "reasoning" in pred else ""
-            msg += f"\n\n# Build feedback\n{build_feedback}"
-            msg += f"\n\n# Scope Feedback\n{scope_feedback}"
+            if "reasoning" in pred:
+                msg += f"\n\n# Reasoning\n{indent(pred.reasoning, '  ')}"
+            msg += f"\n\n# Build Feedback\n{indent(build_feedback, '  ')}"
+            msg += f"\n\n# Scope Feedback\n{indent(scope_feedback, '  ')}"
             self.crate.vcs.commit(msg)
 
         pred.success = success
         pred.name = symbol.spelling
-        pred.translation = translation
         pred.wrapper = wrapper
         pred.bindgen_template = unimplemented_wrapper
         pred.prior_wrapper = prior_wrapper or CodeRust()
         pred.build_feedback = build_feedback
-        pred.scope_feedback = "\n\n".join(scope_feedback.values())
+        pred.scope_feedback = scope_feedback
         if not success:
             # Feedback for translator
             pred.feedback = "It was difficult to generate a C-compatible FFI wrapper for the translation. Regenerate the translation with clear, explicit, wrapper-friendly Rust function boundaries and straightforward ownership, while keeping the translation fully memory-safe and free of unsafe constructs."
@@ -496,16 +491,14 @@ class WrapperGenerator(dspy.Module):
                 continue
 
             modules[rust_spelling] = (
-                f"pub mod {rust_spelling} {{\n" + textwrap.indent(wrapper_src, "    ") + "\n}"
+                f"pub mod {rust_spelling} {{\n" + indent(wrapper_src, "    ") + "\n}"
             )
 
         if not modules:
             return CodeRust()
 
         return CodeRust(
-            "pub mod wrapper {\n"
-            + textwrap.indent("\n\n".join(modules.values()), "    ")
-            + "\n}\n"
+            "pub mod wrapper {\n" + indent("\n\n".join(modules.values()), "    ") + "\n}\n"
         )
 
     def _build(self, symbol: Symbol) -> tuple[bool, str]:
@@ -647,7 +640,7 @@ def _read_cache(cache: Path | None, name: str, bindgen_template: CodeRust) -> Co
         try:
             row = conn.execute(
                 "SELECT wrapper FROM wrapper_translations WHERE bindgen_template=? AND success=1 ORDER BY id DESC LIMIT 1",
-                (bindgen_template.text,),
+                (str(bindgen_template),),
             ).fetchone()
             if row is None:
                 row = conn.execute(
@@ -685,11 +678,11 @@ def _write_cache(
             """,
             (
                 name,
-                bindgen_template.text,
-                prior_wrapper.text,
+                str(bindgen_template),
+                str(prior_wrapper),
                 build_feedback,
                 scope_feedback,
-                wrapper.text,
+                str(wrapper),
                 int(success),
             ),
         )

@@ -15,7 +15,7 @@ from ideas import tools
 def tmp_crate(tmp_path: Path):
     """Create a minimal lib crate with passing and failing integration tests."""
     crate_dir = tmp_path / "test_crate"
-    crate = tools.Crate(cargo_toml=crate_dir / "Cargo.toml", vcs="none", type="lib")
+    crate = tools.Crate(cargo_toml=crate_dir / "Cargo.toml", vcs="none", template="lib")
 
     (crate_dir / "src" / "lib.rs").write_text("pub fn add(a: i32, b: i32) -> i32 { a + b }\n")
 

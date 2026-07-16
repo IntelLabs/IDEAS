@@ -5,6 +5,7 @@
 #
 
 
+import pickle
 import pytest
 from pathlib import Path
 from textwrap import dedent as d
@@ -70,3 +71,28 @@ def test_newline():
         ).strip()
         + "\n"
     )
+
+
+def test_symbol_is_picklable():
+    tu = parse_c("int main(int argc, char **argv) { return 0; }")
+    symbol = ast.extract_info_c(tu).symbols["c:@F@main"]
+
+    blob = pickle.dumps(symbol)
+    restored = pickle.loads(blob)
+
+    assert restored.name == symbol.name
+    assert restored.spelling == symbol.spelling
+    assert restored.kind == symbol.kind
+    assert restored.tu_preorder_index == symbol.tu_preorder_index
+    assert restored.code == symbol.code
+
+
+def test_tree_result_is_picklable():
+    tu = parse_c("int main(int argc, char **argv) { return 0; }")
+    result = ast.extract_info_c(tu)
+
+    blob = pickle.dumps(result)
+    restored = pickle.loads(blob)
+
+    assert isinstance(restored, ast.TreeResult)
+    assert restored == result

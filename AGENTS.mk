@@ -56,11 +56,12 @@ endif
 test_crates/%/Cargo.toml \
 test_crates/%/src/lib.c \
 test_crates/%/build.rs: | build-ninja/lib%.so.sources
-	uv run python -m ideas.init.crate crate_type=lib \
+	uv run python -m ideas.init.crate cargo_toml=test_crates/$*/Cargo.toml \
+                                  template=lib \
                                   reexport_lib=false \
                                   hydra.output_subdir=null \
                                   hydra.run.dir=test_crates/$*
-	uv run python -m ideas.init.consolidate filename=build-ninja/compile_commands.json \
+	uv run python -m ideas.init.consolidate compile_commands=build-ninja/compile_commands.json \
                                         cargo_toml=test_crates/$*/Cargo.toml \
                                         source_priority=build-ninja/lib$*.so.sources \
                                         hydra.output_subdir=null \
@@ -73,10 +74,11 @@ test_crates/%/build.rs: | build-ninja/lib%.so.sources
 test_crates/%/Cargo.toml \
 test_crates/%/src/main.c \
 test_crates/%/build.rs: | build-ninja/%.sources
-	uv run python -m ideas.init.crate crate_type=bin \
+	uv run python -m ideas.init.crate cargo_toml=test_crates/$*/Cargo.toml \
+                                  template=bin \
                                   hydra.output_subdir=null \
                                   hydra.run.dir=test_crates/$*
-	uv run python -m ideas.init.consolidate filename=build-ninja/compile_commands.json \
+	uv run python -m ideas.init.consolidate compile_commands=build-ninja/compile_commands.json \
                                         cargo_toml=test_crates/$*/Cargo.toml \
                                         source_priority=build-ninja/$*.sources \
                                         hydra.output_subdir=null \

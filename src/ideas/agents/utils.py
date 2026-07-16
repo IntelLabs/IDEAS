@@ -80,10 +80,10 @@ def write_collect_script(crate: Crate) -> Path:
                     panic!("UBSAN detected during collection!");
                 }
                 println!("{{");
-                println!("  \"name\": \"{}\",", name);
-                println!("  \"stdout\": {},", serde_json::to_string(&*stdout).unwrap());
-                println!("  \"stderr\": {},", serde_json::to_string(&*stderr).unwrap());
-                println!("  \"exit_code\": {}", code);
+                println!("  \\"name\\": \\"{}\\",", name);
+                println!("  \\"stdout\\": {},", serde_json::to_string(&*stdout).unwrap());
+                println!("  \\"stderr\\": {},", serde_json::to_string(&*stderr).unwrap());
+                println!("  \\"exit_code\\": {}", code);
                 println!("}}");
             }
             """

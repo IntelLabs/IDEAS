@@ -27,7 +27,7 @@ class RecurrentTranslator(dspy.Module):
         self,
         crate: Crate,
         symbol_translator: dspy.Module,
-        symbol_wrapper: dspy.Module | None = None,
+        symbol_wrapper: dspy.Module,
         symbol_tester: dspy.Module | None = None,
         max_iters: int = 1,
     ):
@@ -112,12 +112,12 @@ class RecurrentTranslator(dspy.Module):
                     break
                 if g in immediate_to_be_translated:
                     for name in g:
-                        code = symbols[name].code.text
+                        code = symbols[name].code
                         char_count = len(str(code))
                         if LARGE_PROJECT and total_chars + char_count > MAX_DEPENDENT_CHARS:
                             exceeded = True
                             break
-                        dependent_parts.append(symbols[name].code)
+                        dependent_parts.append(code)
                         total_chars += char_count
             dependent_code = CodeC.join(dependent_parts)
 
@@ -284,15 +284,11 @@ class RecurrentTranslator(dspy.Module):
         # Write translation to crate
         translation = pred.translation
         with self.crate.rust_src_path.open("a") as f:
-            f.write(translation.text + "\n")
+            f.write(str(translation) + "\n")
 
-        # Generate wrapper, that may modify the translation, for each symbol
-        unsafe_translation = translation
+        # Generate wrapper for each symbol
         wrappers: dict[str, dspy.Prediction] = {}
         for symbol in symbols:
-            # If we don't have a wrapper function, then skip the symbol
-            if self.wrap_symbol is None:
-                continue
             # We can only hybrid build-test functions and variables
             if not (symbol.is_function and symbol.is_definition) and not symbol.is_variable:
                 continue
@@ -305,11 +301,10 @@ class RecurrentTranslator(dspy.Module):
             wrapper = self.wrap_symbol(
                 symbol=symbol,
                 reference_code=reference_code,
-                translation=unsafe_translation,
+                translation=pred.translation,
                 support_code=support_code + snippet + dependent_code,
                 prior_wrapper=prior_wrapper,
             )
-            unsafe_translation = wrapper.translation
 
             # Save function wrappers for next retry and caching
             if symbol.is_function and symbol.is_definition and "wrapper" in wrapper:
@@ -339,9 +334,8 @@ class RecurrentTranslator(dspy.Module):
         # Cache successful translation and wrappers
         if pred.success:
             self.translate_symbol.write_cache(pred)
-            if self.wrap_symbol is not None:
-                for wrapper in wrappers.values():
-                    self.wrap_symbol.write_cache(wrapper)
+            for wrapper in wrappers.values():
+                self.wrap_symbol.write_cache(wrapper)
 
         # Return wrappers for next retry
         pred.wrappers = {name: wrapper.wrapper for name, wrapper in wrappers.items()}
