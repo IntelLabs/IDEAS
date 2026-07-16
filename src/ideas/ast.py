@@ -4,18 +4,18 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-import re
 import logging
 from pathlib import Path
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
+from typing import get_args
 
 from clang.cindex import TranslationUnit, TranslationUnitLoadError, Diagnostic
 from clang.cindex import Cursor, CursorKind, SourceRange, TokenKind
 from clang.cindex import PrintingPolicy, PrintingPolicyProperty, LinkageKind, StorageClass
-from clang.cindex import conf, SourceLocation
-from ctypes import pointer, c_size_t, c_char_p
+from clang.cindex import conf, SourceLocation, _CXString
+from ctypes import byref, pointer, c_size_t, c_char_p, c_uint
 
 from .adapters import Code
 
@@ -26,100 +26,190 @@ CodeC = Code["c"]
 
 @dataclass(frozen=True)
 class Symbol:
+    # Symbol identity
     name: str
-    cursor: Cursor
-    parent: Cursor | None = None
-    decl: Cursor | None = None
+    spelling: str
+    kind: CursorKind
 
-    @property
-    def spelling(self) -> str:
-        return self.cursor.spelling
+    # Rendered C snippets
+    llm_context_declaration: str
+    declaration: CodeC | None
+    code: CodeC
 
-    @property
-    def kind(self) -> CursorKind:
-        return self.cursor.kind
+    # Symbol semantics
+    is_definition: bool
+    is_variable: bool
+    is_function: bool
+    is_global: bool
+    is_system: bool
+    is_top_level: bool
+    storage_class: StorageClass
 
-    @property
-    def llm_context_declaration(self) -> str:
-        # Synthesize forward declaration from cursor
-        if self.cursor.kind == CursorKind.FUNCTION_DECL:
-            result_type = (
-                self.cursor.result_type.spelling if self.cursor.result_type else "void"
-            )
-            params = ", ".join(
-                p.type.spelling + (" " + p.spelling if p.spelling else "")  # type: ignore[reportOptionalMemberAccess]
-                for p in self.cursor.get_arguments()
-            )
-            return f"{result_type} {self.cursor.spelling}({params});"
-        elif self.cursor.kind in (
-            CursorKind.STRUCT_DECL,
-            CursorKind.UNION_DECL,
-            CursorKind.ENUM_DECL,
-        ):
-            kind_name = {
-                CursorKind.STRUCT_DECL: "struct",
-                CursorKind.UNION_DECL: "union",
-                CursorKind.ENUM_DECL: "enum",
-            }[self.cursor.kind]
-            return f"{kind_name} {self.cursor.spelling};"
-        elif self.cursor.kind == CursorKind.TYPEDEF_DECL:
-            underlying = self.cursor.underlying_typedef_type.spelling
-            return f"typedef {underlying} {self.cursor.spelling};"
-        elif self.cursor.kind == CursorKind.VAR_DECL:
-            return f"{self.cursor.type.spelling} {self.cursor.spelling};"
+    # Source and lexical metadata
+    tu_path: Path
+    presumed_path: Path | None
+    tu_preorder_index: int
+    line_directive: CodeC | None
+    declaration_line_directive: CodeC | None
 
-        # Fallback: return full code
-        return self.code.text
+    @classmethod
+    def from_cursor(
+        cls,
+        name: str,
+        cursor: Cursor,
+        parent: Cursor | None = None,
+        decl: Cursor | None = None,
+        tu_preorder_index: int = -1,
+    ) -> "Symbol":
+        parent_or_cursor = parent or cursor
+        code = get_cursor_code(parent_or_cursor, pretty_print=True)
+        presumed_location = clang_get_presumed_location(parent_or_cursor)
+        return cls(
+            name=name,
+            spelling=cursor.spelling,
+            kind=cursor.kind,
+            llm_context_declaration=_synthesize_llm_context_declaration(
+                cursor, fallback_code=code
+            ),
+            declaration=get_cursor_code(decl, pretty_print=True) if decl else None,
+            code=code,
+            is_definition=cursor.is_definition(),
+            is_variable=cursor.kind == CursorKind.VAR_DECL,
+            is_function=cursor.kind == CursorKind.FUNCTION_DECL,
+            is_global=cursor.linkage == LinkageKind.EXTERNAL,
+            is_system=cursor.location.is_in_system_header,
+            tu_path=Path(cursor.translation_unit.spelling).resolve(),
+            presumed_path=Path(presumed_location[0]) if presumed_location is not None else None,
+            tu_preorder_index=tu_preorder_index,
+            line_directive=_line_directive_for(parent_or_cursor),
+            declaration_line_directive=_line_directive_for(decl),
+            storage_class=cursor.storage_class,
+            is_top_level=parent is None,
+        )
 
-    @property
-    def declaration(self) -> CodeC | None:
-        return get_cursor_code(self.decl, pretty_print=True) if self.decl else None
+    def with_declaration(self, decl_symbol: "Symbol") -> "Symbol":
+        return replace(
+            self,
+            declaration=decl_symbol.code,
+            declaration_line_directive=decl_symbol.line_directive,
+        )
 
-    @property
-    def code(self) -> CodeC:
-        return get_cursor_code(self.parent or self.cursor, pretty_print=True)
+    def __getstate__(self) -> dict[str, object]:
+        state = dict(self.__dict__)
+        for field_name, value in state.items():
+            if isinstance(value, CodeC):
+                state[field_name] = str(value)
+        return state
 
-    @property
-    def is_definition(self) -> bool:
-        return self.cursor.is_definition()
-
-    @property
-    def is_variable(self) -> bool:
-        return self.cursor.kind == CursorKind.VAR_DECL
-
-    @property
-    def is_function(self) -> bool:
-        return self.cursor.kind == CursorKind.FUNCTION_DECL
-
-    @property
-    def is_global(self) -> bool:
-        return self.cursor.linkage == LinkageKind.EXTERNAL
-
-    @property
-    def is_system(self) -> bool:
-        return self.cursor.location.is_in_system_header
-
-    @property
-    def source_path(self) -> Path:
-        return Path(self.cursor.translation_unit.spelling).resolve()
-
-    def with_declaration(self, decl: Cursor) -> "Symbol":
-        return Symbol(self.name, self.cursor, self.parent, decl=decl)
+    def __setstate__(self, state: dict[str, object]):
+        annotations = {f.name: f.type for f in fields(type(self))}
+        for field_name, value in state.items():
+            annotation = annotations.get(field_name)
+            if value is not None and (annotation is CodeC or CodeC in get_args(annotation)):
+                assert isinstance(value, str)
+                value = CodeC(value)
+            object.__setattr__(self, field_name, value)
 
 
 @dataclass
 class TreeResult:
     symbols: dict[str, Symbol] = field(default_factory=dict)
-    complete_graph: dict[str, list[str]] = field(
-        default_factory=lambda: defaultdict(lambda: list())
+    complete_graph: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    filename: str | None = None
+    arguments: list[str] | None = None
+
+
+def _synthesize_llm_context_declaration(cursor: Cursor, fallback_code: CodeC) -> str:
+    # Synthesize forward declaration from cursor
+    if cursor.kind == CursorKind.FUNCTION_DECL:
+        result_type = cursor.result_type.spelling if cursor.result_type else "void"
+        params = ", ".join(
+            p.type.spelling + (" " + p.spelling if p.spelling else "")  # type: ignore[reportOptionalMemberAccess]
+            for p in cursor.get_arguments()
+        )
+        return f"{result_type} {cursor.spelling}({params});"
+    elif cursor.kind in (
+        CursorKind.STRUCT_DECL,
+        CursorKind.UNION_DECL,
+        CursorKind.ENUM_DECL,
+    ):
+        kind_name = {
+            CursorKind.STRUCT_DECL: "struct",
+            CursorKind.UNION_DECL: "union",
+            CursorKind.ENUM_DECL: "enum",
+        }[cursor.kind]
+        return f"{kind_name} {cursor.spelling};"
+    elif cursor.kind == CursorKind.TYPEDEF_DECL:
+        underlying = cursor.underlying_typedef_type.spelling
+        return f"typedef {underlying} {cursor.spelling};"
+    elif cursor.kind == CursorKind.VAR_DECL:
+        return f"{cursor.type.spelling} {cursor.spelling};"
+
+    # Fallback: return full code
+    return str(fallback_code)
+
+
+def _line_directive_for(cursor: Cursor | None) -> CodeC | None:
+    if cursor is None:
+        return None
+
+    location = cursor.location
+    if location.file is None or location.line == 0:
+        return None
+
+    source_path = Path(str(location.file)).resolve().as_posix().replace('"', '\\"')
+    return CodeC(f'#line {location.line} "{source_path}"')
+
+
+def _cursor_key(cursor: Cursor) -> tuple[str, str, str, str, int, int, int, int]:
+    location = cursor.location
+    source_path = Path(str(location.file)).resolve().as_posix() if location.file else ""
+    kind = str(cursor.kind)
+    return (
+        cursor.get_usr(),
+        cursor.spelling,
+        kind,
+        source_path,
+        int(location.line),
+        int(location.column),
+        int(cursor.extent.start.offset),
+        int(cursor.extent.end.offset),
     )
+
+
+def _cursor_order_map(root: Cursor) -> dict[tuple[str, str, str, str, int, int, int, int], int]:
+    order: dict[tuple[str, str, str, str, int, int, int, int], int] = {}
+    for i, cursor in enumerate(root.walk_preorder()):
+        key = _cursor_key(cursor)
+        if key not in order:
+            order[key] = i
+    return order
+
+
+def clang_get_presumed_location(cursor: Cursor | None) -> tuple[str, int, int] | None:
+    if cursor is None:
+        return None
+
+    filename = _CXString()
+    line = c_uint(0)
+    column = c_uint(0)
+    conf.lib.clang_getPresumedLocation(
+        cursor.location, byref(filename), byref(line), byref(column)
+    )
+
+    path_text = _CXString.from_result(filename)
+    if not path_text or line.value == 0:
+        return None
+
+    path = Path(path_text).resolve().as_posix()
+    return path, int(line.value), int(column.value)
 
 
 def create_translation_unit(path_or_code: Path | CodeC) -> TranslationUnit:
     # Parse the code using clang
     if isinstance(path_or_code, CodeC):
         code = path_or_code
-        tu = TranslationUnit.from_source(FILENAME, unsaved_files=[(FILENAME, code.text)])
+        tu = TranslationUnit.from_source(FILENAME, unsaved_files=[(FILENAME, str(code))])
     else:
         tu = TranslationUnit.from_source(str(path_or_code.resolve()))
     if any(d.severity >= Diagnostic.Error for d in tu.diagnostics):
@@ -130,21 +220,38 @@ def create_translation_unit(path_or_code: Path | CodeC) -> TranslationUnit:
 # Traverse the AST, extract symbols and resolve deep references
 def extract_info_c(tu: TranslationUnit) -> TreeResult:
     assert tu.cursor is not None
-    symbols = extract_symbol_info_c(tu.cursor)
+    tu_preorder_index_map = _cursor_order_map(tu.cursor)
+    symbols, reference_nodes = _extract_symbol_info_c(
+        tu.cursor, tu_preorder_index_map=tu_preorder_index_map
+    )
     graph = {
-        # Prefer parent over cursor
-        name: extract_referenced_symbols(symbol.parent or symbol.cursor, symbols.keys())
+        name: extract_referenced_symbols(reference_nodes[name], symbols.keys())
         for name, symbol in symbols.items()
     }
     return TreeResult(symbols=symbols, complete_graph=graph)
 
 
 def extract_symbol_info_c(node: Cursor, parent: Cursor | None = None) -> dict[str, Symbol]:
+    tu_preorder_index_map = _cursor_order_map(node)
+    symbols, _ = _extract_symbol_info_c(
+        node, parent=parent, tu_preorder_index_map=tu_preorder_index_map
+    )
+    return symbols
+
+
+def _extract_symbol_info_c(
+    node: Cursor,
+    parent: Cursor | None = None,
+    tu_preorder_index_map: dict[tuple[str, str, str, str, int, int, int, int], int]
+    | None = None,
+) -> tuple[dict[str, Symbol], dict[str, Cursor]]:
     symbols: dict[str, Symbol] = {}
+    reference_nodes: dict[str, Cursor] = {}
+    tu_preorder_index_map = tu_preorder_index_map or _cursor_order_map(node)
 
     # If enter new scope then exit early
     if node.kind == CursorKind.COMPOUND_STMT:
-        return symbols
+        return symbols, reference_nodes
 
     # Add declarative nodes to symbols
     usr = node.get_usr()
@@ -158,36 +265,50 @@ def extract_symbol_info_c(node: Cursor, parent: Cursor | None = None) -> dict[st
         CursorKind.VAR_DECL,
         CursorKind.TYPEDEF_DECL,
     ):
-        symbols[usr] = Symbol(usr, node, parent=parent)
+        symbols[usr] = Symbol.from_cursor(
+            usr,
+            node,
+            parent=parent,
+            tu_preorder_index=tu_preorder_index_map.get(_cursor_key(node), -1),
+        )
+        reference_nodes[usr] = parent or node
 
     # Recurse through children and merge them into symbols
     for child_node in node.get_children():
         parent = node if parent is None and node.kind != CursorKind.TRANSLATION_UNIT else parent
-        child_symbols = extract_symbol_info_c(child_node, parent=parent)
+        child_symbols, child_refs = _extract_symbol_info_c(
+            child_node,
+            parent=parent,
+            tu_preorder_index_map=tu_preorder_index_map,
+        )
         for child_name, child_symbol in child_symbols.items():
             if child_name not in symbols:
                 # Found a new symbol
                 symbols[child_name] = child_symbol
+                reference_nodes[child_name] = child_refs[child_name]
             elif symbols[child_name].is_definition and child_symbol.is_definition:
                 # Always keep current definition
                 symbols[child_name] = child_symbol
+                reference_nodes[child_name] = child_refs[child_name]
             elif not symbols[child_name].is_definition and child_symbol.is_definition:
                 # Previous symbol was a declaration so replace it with new definitional symbol
-                symbols[child_name] = child_symbol.with_declaration(symbols[child_name].cursor)
+                symbols[child_name] = child_symbol.with_declaration(symbols[child_name])
+                reference_nodes[child_name] = child_refs[child_name]
             elif symbols[child_name].is_definition and not child_symbol.is_definition:
                 if not symbols[child_name].is_system or not child_symbol.is_system:
                     logger.debug(f"Ignoring declaration after definition of `{child_name}`")
             elif not symbols[child_name].is_definition and not child_symbol.is_definition:
                 if (
-                    child_symbol.cursor.kind == CursorKind.VAR_DECL
-                    and symbols[child_name].cursor.storage_class == StorageClass.EXTERN
-                    and child_symbol.cursor.storage_class != StorageClass.EXTERN
+                    child_symbol.kind == CursorKind.VAR_DECL
+                    and symbols[child_name].storage_class == StorageClass.EXTERN
+                    and child_symbol.storage_class != StorageClass.EXTERN
                 ):
                     # Prefer non-extern variable declaration (e.g. tentative definition) over extern one
                     symbols[child_name] = child_symbol
+                    reference_nodes[child_name] = child_refs[child_name]
                 elif not symbols[child_name].is_system or not child_symbol.is_system:
                     logger.debug(f"Ignoring re-declaration of `{child_name}`")
-    return symbols
+    return symbols, reference_nodes
 
 
 def extract_referenced_symbols(node: Cursor, global_symbols: Iterable[str]) -> list[str]:
@@ -240,6 +361,8 @@ def get_cursor_prettyprinted(cursor: Cursor) -> CodeC:
 
     policy = PrintingPolicy.create(cursor)
     policy.set_property(PrintingPolicyProperty.IncludeTagDefinition, include_tag_definition)
+    # Emit C99 builtin spelling to avoid dependence on stdbool.h macro context.
+    policy.set_property(PrintingPolicyProperty.Bool, 0)
     return CodeC(cursor.pretty_printed(policy))
 
 
@@ -251,7 +374,7 @@ def get_cursor_code(cursor: Cursor, pretty_print: bool = False) -> CodeC:
 
     # Non-function definitions require statement terminations
     if cursor.kind != CursorKind.FUNCTION_DECL or not cursor.is_definition():
-        code = CodeC(code.text.rstrip() + ";")
+        code = CodeC(str(code).rstrip() + ";")
 
     return code
 
@@ -592,48 +715,6 @@ def _apply_edits(path: Path, edits: dict[tuple[int, int], bytes]):
         source = source[:start] + replacement + source[end:]
 
     path.write_bytes(source)
-
-
-def get_system_macro_undefs(includes: list[str], code: str) -> list[str]:
-    if not includes:
-        return []
-
-    # Parse the includes to enumerate system macros
-    include_text = "\n".join(includes) + "\n"
-    tu = TranslationUnit.from_source(
-        "undefs.c",
-        unsaved_files=[("undefs.c", include_text)],
-        options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
-    )
-
-    self_ref_macros: set[str] = set()
-    assert tu.cursor is not None
-    for cursor in tu.cursor.get_children():
-        if cursor.kind != CursorKind.MACRO_DEFINITION:
-            continue
-        if not cursor.location.is_in_system_header:
-            continue
-        tokens = list(cursor.get_tokens())
-        # Function-like macros have '(' immediately after the name token
-        if len(tokens) >= 2 and tokens[1].spelling == "(":
-            continue
-        # FIXME: This needs to be stronger and not detect #define stuff mystuff
-        # as self-referencing.
-        # We should ideally only check the replacement list tokens,
-        # but clang does not provide a way to get just those.
-        name = cursor.spelling
-        if any(tok.spelling == name for tok in tokens[1:]):
-            self_ref_macros.add(name)
-
-    if not self_ref_macros:
-        return []
-
-    # Only #undef self-referencing macros whose name appears in the code
-    # FIXME: Would be nice if we had an AST list of already-expanded macros across all TUs
-    code_identifiers = set(re.findall(r"\b([A-Za-z_]\w*)\b", code))
-    conflicting = self_ref_macros & code_identifiers
-
-    return [f"#undef {name}" for name in sorted(conflicting)]
 
 
 def mangle(name: str) -> str:

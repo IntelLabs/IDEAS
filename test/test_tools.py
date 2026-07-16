@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from ideas import tools
+from ideas.ast import CodeC
 
 
 @pytest.fixture
@@ -28,12 +29,12 @@ def rust_paths(fixtures_dir: Path) -> tuple[Path, Path]:
 
 def test_check_c(c_paths: tuple[Path, ...]):
     # Compilation should succeed
-    success1, out1 = tools.check_c(c_paths[0].read_text())
+    success1, out1 = tools.check_c(CodeC(c_paths[0].read_text()))
     assert success1, out1
     assert out1 == ""
 
     # Compilation should fail
-    success2, out2 = tools.check_c(c_paths[1].read_text())
+    success2, out2 = tools.check_c(CodeC(c_paths[1].read_text()))
     assert not success2, out2
     assert out2 != ""
 

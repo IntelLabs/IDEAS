@@ -56,7 +56,7 @@ def list_tests(test_file: Path) -> list[str]:
 
 def _main(cfg: EvaluateConfig) -> None:
     # Resolve integration test file (error loudly if missing)
-    crate = Crate(cargo_toml=cfg.manifest, vcs="none")
+    crate = Crate(cfg.manifest, vcs="none")
     test_file = crate.cargo_toml.parent / "tests" / f"{cfg.test_cases}.rs"
     if not test_file.exists():
         raise FileNotFoundError(f"Integration test file not found: {test_file}")

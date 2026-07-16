@@ -7,18 +7,12 @@
 from pathlib import Path
 from textwrap import dedent
 
-import networkx as nx
-import pytest
 import json
-
-from clang.cindex import TranslationUnit as TU
 
 from ideas import ast
 from ideas.init.consolidate import (
     create_ast_order,
     create_symbol_lexical_key_fn,
-    get_includes,
-    get_symbols_and_dependencies,
     init as consolidate_init,
 )
 from ideas.tools import check_c
@@ -55,8 +49,7 @@ def _ast_order_from_symbols(
     source_priority = source_priority or []
     tu_representatives: dict[Path, ast.Symbol] = {}
     for symbol in symbols.values():
-        tu_path = Path(symbol.cursor.translation_unit.spelling).resolve()
-        tu_representatives.setdefault(tu_path, symbol)
+        tu_representatives.setdefault(symbol.tu_path, symbol)
     fallback_asts = [
         ast.TreeResult(symbols={symbol.name: symbol}) for symbol in tu_representatives.values()
     ]
@@ -444,7 +437,7 @@ def test_macro_wrapped_declaration(tmp_path: Path):
     consolidated = consolidate_init(compile_commands, source_priority=[])
 
     # The consolidated output must not contain the unexpanded macro
-    assert "LIB_EXPORT" not in consolidated, (
+    assert "LIB_EXPORT" not in str(consolidated), (
         f"Consolidated output contains unexpanded macro 'LIB_EXPORT':\n{consolidated}"
     )
 
@@ -623,9 +616,6 @@ def test_static_variable_tentative_defs_same_name_renamed(tmp_path: Path):
     )
 
 
-@pytest.mark.xfail(
-    reason="USR mismatch from -isystem; fixed at cmake level in ideas.cmake._normalize_isystem"
-)
 def test_isystem_inline_function_dependency_not_lost(tmp_path: Path):
     """
     When a header is included via -isystem in one TU but via -I in another,
@@ -640,8 +630,6 @@ def test_isystem_inline_function_dependency_not_lost(tmp_path: Path):
       error: call to undeclared function 'my_alloc'; ISO C99 and later do not
       support implicit function declarations
     """
-    from clang.cindex import TranslationUnit as TU
-
     # alloc.h in util/ with a static inline function
     util_dir = tmp_path / "util"
     util_dir.mkdir()
@@ -711,60 +699,28 @@ def test_isystem_inline_function_dependency_not_lost(tmp_path: Path):
         )
     )
 
-    # Parse caller.c with -isystem for util/ (ext target uses SYSTEM includes)
-    caller_tu = TU.from_source(
-        None,
-        args=["-c", str(caller_c), "-isystem", str(util_dir), f"-I{ext_dir}"],
-    )
-    assert not any(d.severity >= 3 for d in caller_tu.diagnostics)
-
-    # Parse user.c with regular -I for util/
-    user_tu = TU.from_source(None, args=["-c", str(user_c), f"-I{util_dir}"])
-    assert not any(d.severity >= 3 for d in user_tu.diagnostics)
-
-    caller_tree = ast.extract_info_c(caller_tu)
-    user_tree = ast.extract_info_c(user_tu)
-
-    # Verify the USR mismatch exists
-    caller_alloc_usr = next(
-        n for n, s in caller_tree.symbols.items() if s.spelling == "my_alloc"
-    )
-    user_alloc_usr = next(n for n, s in user_tree.symbols.items() if s.spelling == "my_alloc")
-    assert caller_alloc_usr != user_alloc_usr, (
-        "Expected USR mismatch between -isystem and -I includes"
-    )
-
-    # Put caller.c FIRST in ast_order so its symbols have higher priority
-    # in the lexicographic sort. This ensures my_alloc (from user.c, rank 1)
-    # sorts AFTER make_item (from caller.c, rank 0) when the dependency
-    # edge is missing.
-    asts = [caller_tree, user_tree]
-    ast_order = create_ast_order([caller_c, user_c], asts)
-
-    symbols, dependencies = get_symbols_and_dependencies(asts, ast_order=ast_order)
-
-    symbol_lexical_key = create_symbol_lexical_key_fn(symbols, ast_order)
-    sorted_symbol_groups = list(
-        nx.lexicographical_topological_sort(
-            nx.from_dict_of_lists(dependencies, create_using=nx.DiGraph).reverse(copy=False),  # type: ignore[reportArgumentType]
-            key=symbol_lexical_key,
+    # Keep mixed include modes across TUs to exercise the USR normalization path.
+    compile_commands = tmp_path / "compile_commands.json"
+    compile_commands.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(tmp_path),
+                    "file": str(caller_c),
+                    "command": f"cc -isystem {util_dir} -I{ext_dir} -c {caller_c}",
+                },
+                {
+                    "directory": str(tmp_path),
+                    "file": str(user_c),
+                    "command": f"cc -I{util_dir} -c {user_c}",
+                },
+            ]
         )
     )
 
-    # Build consolidated output
-    sources: list[str] = get_includes(symbols) + [""]
-    for group in sorted_symbol_groups:
-        if len(group) > 1:
-            for name in group:
-                declaration = symbols[name].declaration
-                if declaration and declaration.text not in sources:
-                    sources.append(declaration.text)
-        for name in group:
-            definition = symbols[name].code.text
-            if definition not in sources:
-                sources.append(definition)
-
-    consolidated = "\n".join(sources)
+    consolidated = consolidate_init(
+        compile_commands, source_priority=[caller_c.resolve(), user_c.resolve()]
+    )
     success, error = check_c(consolidated, flags=["-fsyntax-only", "-Wall"])
     assert success, (
         f"Consolidated code does not compile (isystem USR mismatch lost dependency):\n"
@@ -812,50 +768,12 @@ def test_static_inline_in_scc_emitted_before_caller(tmp_path: Path):
         )
     )
 
-    caller_tu = TU.from_source(None, args=["-c", str(caller_c), f"-I{tmp_path}"])
-    state_tu = TU.from_source(None, args=["-c", str(state_c), f"-I{tmp_path}"])
-    assert not any(d.severity >= 3 for d in caller_tu.diagnostics)
-    assert not any(d.severity >= 3 for d in state_tu.diagnostics)
-
-    caller_tree = ast.extract_info_c(caller_tu)
-    state_tree = ast.extract_info_c(state_tu)
-
-    # state_tree FIRST in asts so merge_symbols picks helper from state.c
-    # (both have identical code; first encountered wins => state.c).
-    # ast_order = [caller.c, state.c]: rank 0, rank 1.
-    # Result: compute(rank 0) emitted before helper(rank 1) in SCC.
-    # helper has declaration=None (static inline), so no forward decl is emitted.
-    asts = [state_tree, caller_tree]
-    ast_order = create_ast_order([caller_c, state_c], asts)
-
-    symbols, dependencies = get_symbols_and_dependencies(asts, ast_order=ast_order)
-
-    # Verify cycle exists
-    scc_groups = [group for group in dependencies if len(group) > 1]
-    assert scc_groups, "Expected at least one multi-member SCC"
-
-    # Build consolidated output (mirrors compose_all logic)
-    symbol_lexical_key = create_symbol_lexical_key_fn(symbols, ast_order)
-    sorted_symbol_groups = list(
-        nx.lexicographical_topological_sort(
-            nx.from_dict_of_lists(dependencies, create_using=nx.DiGraph).reverse(copy=False),  # type: ignore[reportArgumentType]
-            key=symbol_lexical_key,
-        )
+    compile_commands = _write_compile_commands(
+        tmp_path, [state_c, caller_c], extra_flags=f"-I{tmp_path}"
     )
-
-    sources: list[str] = get_includes(symbols) + [""]
-    for group in sorted_symbol_groups:
-        if len(group) > 1:
-            for name in group:
-                declaration = symbols[name].declaration
-                if declaration and declaration.text not in sources:
-                    sources.append(declaration.text)
-        for name in group:
-            definition = symbols[name].code.text
-            if definition not in sources:
-                sources.append(definition)
-
-    consolidated = "\n".join(sources)
+    consolidated = consolidate_init(
+        compile_commands, source_priority=[caller_c.resolve(), state_c.resolve()]
+    )
     success, error = check_c(consolidated, flags=["-fsyntax-only", "-Wall"])
     assert success, (
         f"Consolidated code fails (static inline in SCC emitted after caller due to TU rank):\n"
@@ -889,11 +807,12 @@ def test_system_macro_double_expansion(tmp_path: Path):
     )
 
 
-def test_gnu_source_preserved_in_consolidation(tmp_path: Path):
+def test_cc_defines_preserved_in_consolidation(tmp_path: Path):
     main_c = tmp_path / "main.c"
     main_c.write_text(
         dedent(
             """\
+            #include <pcre2.h>
             #include <unistd.h>
             #include <stdlib.h>
             #include <stddef.h>
@@ -931,19 +850,20 @@ def test_gnu_source_preserved_in_consolidation(tmp_path: Path):
         )
     )
 
-    compile_commands = _write_compile_commands(tmp_path, [main_c], extra_flags="-D_GNU_SOURCE")
+    compile_commands = _write_compile_commands(
+        tmp_path, [main_c], extra_flags="-D_GNU_SOURCE -DPCRE2_CODE_UNIT_WIDTH=8"
+    )
     consolidated = consolidate_init(compile_commands, source_priority=[])
 
-    # All _GNU_SOURCE-gated symbols must appear in the consolidated output
     for sym in ("environ", "euidaccess", "pipe2", "qsort_r", "secure_getenv"):
-        assert sym in consolidated, (
+        assert sym in str(consolidated), (
             f"Consolidated output is missing '{sym}' usage:\n{consolidated}"
         )
 
     success, error = check_c(consolidated, flags=["-fsyntax-only"])
     assert success, (
-        f"Consolidated code does not compile without -D_GNU_SOURCE "
-        f"(feature-test macro lost during consolidation):\n"
+        f"Consolidated code does not compile without -D_GNU_SOURCE and -DPCRE2_CODE_UNIT_WIDTH=8 "
+        f"(macros lost during consolidation):\n"
         f"{error}\n\nConsolidated output:\n{consolidated}"
     )
 
@@ -981,7 +901,7 @@ def test_posix_c_source_preserved_in_consolidation(tmp_path: Path):
 
     # All _POSIX_C_SOURCE-gated symbols must appear in the consolidated output
     for sym in ("clock_gettime", "strdup", "strtok_r"):
-        assert sym in consolidated, (
+        assert sym in str(consolidated), (
             f"Consolidated output is missing '{sym}' usage:\n{consolidated}"
         )
 
@@ -1043,5 +963,109 @@ def test_system_macro_undefs_preserve_benign_macros(tmp_path: Path):
     success, error = check_c(consolidated, flags=["-fsyntax-only"])
     assert success, (
         f"Consolidated code does not compile (benign macros broken):\n{error}\n\n"
+        f"Consolidated output:\n{consolidated}"
+    )
+
+
+def test_source_level_defines_required_by_system_headers_preserved(tmp_path: Path):
+    """
+    Source-level #defines that affect system header behavior must be preserved
+    in consolidated output.  Two sub-cases:
+      1. PCRE2_CODE_UNIT_WIDTH: pcre2.h fires #error if missing.
+      2. _GNU_SOURCE: changes strerror_r signature from int (POSIX) to char* (GNU).
+    """
+    main_c = tmp_path / "main.c"
+    main_c.write_text(
+        dedent(
+            """\
+            #define _GNU_SOURCE
+            #define PCRE2_CODE_UNIT_WIDTH 8
+            #include <pcre2.h>
+            #include <string.h>
+
+            int use_pcre(const char *pat) {
+                (void)pat;
+                return 0;
+            }
+
+            const char *get_err(int errnum) {
+                static char buf[256];
+                const char *errstr = strerror_r(errnum, buf, sizeof(buf));
+                return errstr;
+            }
+            """
+        )
+    )
+
+    compile_commands = _write_compile_commands(tmp_path, [main_c])
+    consolidated = consolidate_init(compile_commands, source_priority=[])
+
+    success, error = check_c(consolidated, flags=["-fsyntax-only", "-Werror"])
+    assert success, (
+        f"Consolidated code does not compile (source-level defines dropped):\n{error}\n\n"
+        f"Consolidated output:\n{consolidated}"
+    )
+
+
+def test_header_defined_gnu_source_with_default_source_flag(tmp_path: Path):
+    """
+    Compile commands have -D_DEFAULT_SOURCE, but _GNU_SOURCE is defined inside
+    a project header (config.h/first.h).  The consolidator preserves
+    _DEFAULT_SOURCE (from -D flags) but loses _GNU_SOURCE (from the header).
+    Code using the GNU strerror_r (returns char*) then fails with:
+      error: incompatible integer to pointer conversion
+
+    Uses two TUs to exercise the union: both include config.h which defines
+    _GNU_SOURCE, so the union should emit it exactly once.
+    """
+    config_h = tmp_path / "config.h"
+    config_h.write_text(
+        dedent(
+            """\
+            #define _GNU_SOURCE
+            """
+        )
+    )
+
+    main_c = tmp_path / "main.c"
+    main_c.write_text(
+        dedent(
+            """\
+            #include "config.h"
+            #include <string.h>
+
+            const char *get_err(int errnum) {
+                static char buf[256];
+                const char *errstr = strerror_r(errnum, buf, sizeof(buf));
+                return errstr;
+            }
+            """
+        )
+    )
+
+    util_c = tmp_path / "util.c"
+    util_c.write_text(
+        dedent(
+            """\
+            #include "config.h"
+            #include <string.h>
+
+            const char *get_err2(int errnum) {
+                static char buf[128];
+                const char *errstr = strerror_r(errnum, buf, sizeof(buf));
+                return errstr;
+            }
+            """
+        )
+    )
+
+    compile_commands = _write_compile_commands(
+        tmp_path, [main_c, util_c], extra_flags=f"-D_DEFAULT_SOURCE -I{tmp_path}"
+    )
+    consolidated = consolidate_init(compile_commands, source_priority=[])
+
+    success, error = check_c(consolidated, flags=["-fsyntax-only", "-Werror"])
+    assert success, (
+        f"Consolidated code does not compile (header-defined _GNU_SOURCE lost):\n{error}\n\n"
         f"Consolidated output:\n{consolidated}"
     )

@@ -21,29 +21,18 @@ endif
 RUSTFLAGS ?= -Awarnings## Ignore Rust compiler warnings
 CARGO_NET_OFFLINE ?= true## Cargo offline mode
 CFLAGS ?= -w## Ignore C compiler warnings
-LARGE_PROJECT ?= 0## Disable translation-time tests and enable context compression
-export EXTRACT_INFO_CMAKE CFLAGS LARGE_PROJECT
+export EXTRACT_INFO_CMAKE CFLAGS
 
 VCS ?= git
 GIT_AUTHOR_NAME ?= ideas
 GIT_AUTHOR_EMAIL ?= ideas@localhost
 export GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL
 
-ifeq ($(LARGE_PROJECT),1)
 TRANSLATION_TEST ?= smoke
-else
-TRANSLATION_TEST ?= test_assert
-endif
-
 EVALUATION_TEST ?= test_cases
 TEST_FILES := $(wildcard test_vectors/*.json)
-ifeq ($(LARGE_PROJECT),1)
-TARGETS_LIB ?=
-TARGETS_BIN ?= $(shell [ -d build-ninja ] && find build-ninja -maxdepth 1 -name '*.sources' ! -name '*.so.sources' -exec basename {} .sources \; )
-else
 TARGETS_LIB ?= $(shell [ -d build-ninja ] && find build-ninja -maxdepth 1 -name 'lib*.so.sources' -exec basename {} .so.sources \; | sed -e "s/^lib//gi")
 TARGETS_BIN ?= $(shell [ -d build-ninja ] && find build-ninja -maxdepth 1 -name '*.sources' ! -name 'lib*.so.sources' -exec basename {} .sources \; )
-endif
 TARGETS ?= $(TARGETS_BIN) $(TARGETS_LIB)
 ifeq (${TARGETS},)
 ifeq ($(filter cmake clean,$(MAKECMDGOALS)),)
@@ -88,17 +77,19 @@ ${TRANSLATION_DIR}/Cargo.toml:
 ${TRANSLATION_DIR}/%/Cargo.toml \
 ${TRANSLATION_DIR}/%/src/lib.c \
 ${TRANSLATION_DIR}/%/build.rs: | ${TRANSLATION_DIR}/Cargo.toml build-ninja/compile_commands.json build-ninja/lib%.so.sources
-	uv run python -m ideas.init.crate crate_type=lib \
+	uv run python -m ideas.init.crate cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
+                                  template=lib \
                                   vcs=${VCS} \
                                   hydra.output_subdir=.init.crate \
                                   hydra.run.dir=${TRANSLATION_DIR}/$*
-	uv run python -m ideas.init.consolidate filename=build-ninja/compile_commands.json \
+	uv run python -m ideas.init.consolidate compile_commands=build-ninja/compile_commands.json \
                                         vcs=${VCS} \
                                         cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
                                         source_priority=build-ninja/lib$*.so.sources \
                                         hydra.output_subdir=.init.consolidate \
                                         hydra.run.dir=${TRANSLATION_DIR}/$*
-	uv run python -m ideas.init.build vcs=${VCS} \
+	uv run python -m ideas.init.build cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
+                                  vcs=${VCS} \
                                   hydra.output_subdir=.init.build \
                                   hydra.job.name=init.build \
                                   hydra.run.dir=${TRANSLATION_DIR}/$*
@@ -106,17 +97,19 @@ ${TRANSLATION_DIR}/%/build.rs: | ${TRANSLATION_DIR}/Cargo.toml build-ninja/compi
 ${TRANSLATION_DIR}/%/Cargo.toml \
 ${TRANSLATION_DIR}/%/src/main.c \
 ${TRANSLATION_DIR}/%/build.rs: | ${TRANSLATION_DIR}/Cargo.toml build-ninja/compile_commands.json build-ninja/%.sources
-	uv run python -m ideas.init.crate crate_type=bin \
+	uv run python -m ideas.init.crate cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
+                                  template=bin \
                                   vcs=${VCS} \
                                   hydra.output_subdir=.init.crate \
                                   hydra.run.dir=${TRANSLATION_DIR}/$*
-	uv run python -m ideas.init.consolidate filename=build-ninja/compile_commands.json \
+	uv run python -m ideas.init.consolidate compile_commands=build-ninja/compile_commands.json \
                                         vcs=${VCS} \
                                         cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
                                         source_priority=build-ninja/$*.sources \
                                         hydra.output_subdir=.init.consolidate \
                                         hydra.run.dir=${TRANSLATION_DIR}/$*
-	uv run python -m ideas.init.build vcs=${VCS} \
+	uv run python -m ideas.init.build cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
+                                  vcs=${VCS} \
                                   hydra.output_subdir=.init.build \
                                   hydra.job.name=init.build \
                                   hydra.run.dir=${TRANSLATION_DIR}/$*
@@ -127,33 +120,6 @@ translate: $(patsubst %,${TRANSLATION_DIR}/%/translate,${TARGETS}) ;
 ${TRANSLATION_DIR}/%/translate: ${TRANSLATION_DIR}/%/src/lib.rs | build-ninja/lib%.so.sources ;
 ${TRANSLATION_DIR}/%/translate: ${TRANSLATION_DIR}/%/src/main.rs | build-ninja/%.sources ;
 
-ifeq ($(LARGE_PROJECT),1)
-.PRECIOUS: ${TRANSLATION_DIR}/%/src/lib.rs
-${TRANSLATION_DIR}/%/src/lib.rs: | ${TRANSLATION_DIR}/%/Cargo.toml ${TRANSLATION_DIR}/%/tests/${TRANSLATION_TEST}.rs build-ninja/compile_commands.json
-	-uv run python -m ideas.translate model.name=${PROVIDER}/${MODEL} \
-                                 filename=build-ninja/compile_commands.json \
-                                 cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
-                                 source_priority=build-ninja/lib$*.so.sources \
-                                 tests=${TRANSLATION_TEST} \
-                                 vcs=${VCS} \
-                                 hydra.output_subdir=.translate \
-                                 hydra.job.name=translate \
-                                 hydra.run.dir=${TRANSLATION_DIR}/$* ${TRANSLATE_ARGS}
-	@touch $@
-
-.PRECIOUS: ${TRANSLATION_DIR}/%/src/main.rs
-${TRANSLATION_DIR}/%/src/main.rs: | ${TRANSLATION_DIR}/%/Cargo.toml ${TRANSLATION_DIR}/%/tests/${TRANSLATION_TEST}.rs build-ninja/compile_commands.json
-	-uv run python -m ideas.translate model.name=${PROVIDER}/${MODEL} \
-                                 filename=build-ninja/compile_commands.json \
-                                 cargo_toml=${TRANSLATION_DIR}/$*/Cargo.toml \
-                                 source_priority=build-ninja/$*.sources \
-                                 tests=${TRANSLATION_TEST} \
-                                 vcs=${VCS} \
-                                 hydra.output_subdir=.translate \
-                                 hydra.job.name=translate \
-                                 hydra.run.dir=${TRANSLATION_DIR}/$* ${TRANSLATE_ARGS}
-	@touch $@
-else
 .PRECIOUS: ${TRANSLATION_DIR}/%/src/lib.rs
 ${TRANSLATION_DIR}/%/src/lib.rs: ${TRANSLATION_DIR}/%/src/lib.c | ${TRANSLATION_DIR}/%/Cargo.toml ${TRANSLATION_DIR}/%/tests/${TRANSLATION_TEST}.rs
 	-uv run python -m ideas.translate model.name=${PROVIDER}/${MODEL} \
@@ -164,6 +130,7 @@ ${TRANSLATION_DIR}/%/src/lib.rs: ${TRANSLATION_DIR}/%/src/lib.c | ${TRANSLATION_
                                  hydra.output_subdir=.translate \
                                  hydra.job.name=translate \
                                  hydra.run.dir=${TRANSLATION_DIR}/$* ${TRANSLATE_ARGS}
+	@touch ${TRANSLATION_DIR}/$*/build.rs
 	@touch $@
 
 .PRECIOUS: ${TRANSLATION_DIR}/%/src/main.rs
@@ -176,8 +143,8 @@ ${TRANSLATION_DIR}/%/src/main.rs: ${TRANSLATION_DIR}/%/src/main.c | ${TRANSLATIO
                                  hydra.output_subdir=.translate \
                                  hydra.job.name=translate \
                                  hydra.run.dir=${TRANSLATION_DIR}/$* ${TRANSLATE_ARGS}
+	@touch ${TRANSLATION_DIR}/$*/build.rs
 	@touch $@
-endif
 
 # build
 .PHONY: build
@@ -260,10 +227,7 @@ ${TRANSLATION_DIR}/%/tests/test_assert_wrapper.rs: test_crates/%/tests/test_asse
 .PRECIOUS: ${TRANSLATION_DIR}/%/tests/smoke.rs
 ${TRANSLATION_DIR}/%/tests/smoke.rs:
 	mkdir -p $(dir $@)
-	echo "#[test]" >> $@
-	echo "fn smoke() {" >> $@
-	echo "    assert_eq!(1, 1);" >> $@
-	echo "}" >> $@
+	printf '#[test]\nfn smoke() {\n    assert_eq!(1, 1);\n}\n' > $@
 
 
 # clean

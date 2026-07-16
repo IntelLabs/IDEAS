@@ -18,7 +18,7 @@ from hydra.core.hydra_config import HydraConfig
 from ideas import adapters, model, ModelConfig, GenerateConfig
 from ideas import SnippetTranslator, RecurrentTranslator, WrapperGenerator, SymbolTester
 from ideas import create_translation_unit, extract_info_c
-from ideas.init.consolidate import get_symbols_and_dependencies, get_asts, create_ast_order
+from ideas.init.consolidate import get_symbols_and_dependencies
 from .tools import Crate, LARGE_PROJECT
 
 logger = logging.getLogger("ideas.translate")
@@ -32,8 +32,6 @@ class TranslateConfig:
 
     cargo_toml: Path = MISSING
     tests: str = MISSING
-
-    source_priority: Path | None = None
 
     translator: str = "ChainOfThought"
     translator_max_iters: int = 5
@@ -50,58 +48,41 @@ cs.store(name="translate", node=TranslateConfig)
 def _main(cfg: TranslateConfig) -> None:
     output_dir = Path(HydraConfig.get().runtime.output_dir)
     logger.info(f"Saving results to {output_dir}")
-    crate = Crate(cargo_toml=cfg.cargo_toml.resolve(), vcs=cfg.vcs)  # type: ignore[reportArgumentType]
-
-    # Resolve source priority
-    source_priority: list[Path] = []
-    if cfg.source_priority:
-        lines = cfg.source_priority.read_text().splitlines()
-        source_priority = [Path(line.strip()).resolve() for line in lines if line.strip()]
+    crate = Crate(cfg.cargo_toml, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
 
     # Save C source since it will be modified by the agent
-    if LARGE_PROJECT:
-        crate.c_src_path.write_text("")
     orig_c_src = crate.c_src_path.read_bytes()
 
     # Make sure Rust source is in known state (i.e., empty)
     crate.rust_src_path.write_text("")
-    if LARGE_PROJECT and (crate.cargo_toml.parent / "build.rs").exists():
-        (crate.cargo_toml.parent / "build.rs").unlink()
-        crate.vcs.rm(crate.cargo_toml.parent / "build.rs", force=True)
 
     # Get global symbol table
-    if cfg.filename.suffix == ".c":
-        tu = create_translation_unit(cfg.filename)
-        asts = [extract_info_c(tu)]
-        ast_order = None
-        symbols, dependencies = get_symbols_and_dependencies(
-            asts, external_symbol_names=["c:@F@main"] if crate.is_bin else None
-        )
-    else:
-        asts = get_asts(cfg.filename, source_priority)
-        ast_order = create_ast_order(source_priority, asts)
-        symbols, dependencies = get_symbols_and_dependencies(
-            asts,
-            external_symbol_names=["c:@F@main"] if crate.is_bin else None,
-            ast_order=ast_order,
-        )
+    tu = create_translation_unit(cfg.filename)
+    asts = [extract_info_c(tu)]
+    symbols, dependencies = get_symbols_and_dependencies(
+        asts, external_symbol_names=["c:@F@main"] if crate.is_bin else None
+    )
 
     # Create translation agent
     model.configure(cfg.model, cfg.generate)
     dspy.configure(adapter=adapters.ChatAdapter())
     translator = getattr(dspy, cfg.translator)
-    snippet_translator = SnippetTranslator(translator, crate, cfg.translator_max_iters)
-    symbol_wrapper, symbol_tester = None, None
+    snippet_translator = SnippetTranslator(crate, translator, cfg.translator_max_iters)
+    symbol_wrapper = WrapperGenerator(crate, cfg.wrapper_max_iters)
+    symbol_tester = None
     if not LARGE_PROJECT:
-        symbol_wrapper = WrapperGenerator(crate, cfg.wrapper_max_iters)
         symbol_tester = SymbolTester(crate, symbols=list(symbols.values()), tests=cfg.tests)
     agent = RecurrentTranslator(
         crate, snippet_translator, symbol_wrapper, symbol_tester, cfg.max_iters
     )
 
     # Run translation agent and write it to disk
-    pred = agent(symbols, dependencies, ast_order)
-    crate.rust_src_path.write_text(pred.translation.text)
+    try:
+        pred = agent(symbols, dependencies)
+        crate.rust_src_path.write_text(str(pred.translation))
+    except Exception as e:
+        logger.exception(e)
+        pred = dspy.Prediction(success=False)
     usage = model.format_usage(pred)
     if pred.success:
         msg = f"Translated `{crate.root_package['name']}` to Rust: {usage}"
@@ -114,7 +95,7 @@ def _main(cfg: TranslateConfig) -> None:
         logger.error(msg)
 
     # Clean up intermediate artifacts produced during translation
-    _cleanup(crate, symbols)
+    _cleanup(crate)
 
     # Commit translation
     if (output_subdir := HydraConfig.get().output_subdir) is not None:
@@ -123,7 +104,7 @@ def _main(cfg: TranslateConfig) -> None:
     crate.vcs.commit(msg)
 
 
-def _cleanup(crate: Crate, symbols: dict) -> None:
+def _cleanup(crate: Crate) -> None:
     # Remove bindgen artifacts
     crate.vcs.rm(
         crate.rust_src_path.parent / "binding",

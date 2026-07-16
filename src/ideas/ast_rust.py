@@ -100,8 +100,8 @@ def get_macro_nodes(root: Node, placeholder: str) -> list[Node]:
 
 
 def validate_changes(code: CodeRust, template: CodeRust) -> OrderedDict[str, str]:
-    code_root = get_root(code.text)
-    template_root = get_root(template.text)
+    code_root = get_root(str(code))
+    template_root = get_root(str(template))
 
     nodes = get_nodes(code_root)
     template_nodes = get_nodes(template_root)
@@ -187,10 +187,10 @@ def _rust_node_signature(node: Node, source: bytes) -> str | None:
 
 
 def get_signatures(code: CodeRust) -> CodeRust:
-    if not code.text.strip():
+    if not str(code).strip():
         return code
 
-    source = code.text.encode()
+    source = str(code).encode()
     root = get_root(source)
     parts: list[str] = []
 

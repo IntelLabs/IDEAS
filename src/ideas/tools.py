@@ -17,6 +17,8 @@ from typing import Any, Literal
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
+from .ast import CodeC
+
 
 TestCase = dict[str, None | str | int | float | list[int] | list[str] | list[float]]
 
@@ -112,7 +114,7 @@ class Workspace:
         cargo_toml: Path,
         vcs: Literal["none", "git"] = "none",
     ):
-        self.cargo_toml = cargo_toml
+        self.cargo_toml = cargo_toml.resolve()
 
         workspace_dir = self.cargo_toml.parent
         self.vcs = VCS(repo_dir=workspace_dir, vcs=vcs)
@@ -132,18 +134,18 @@ class Crate:
         self,
         cargo_toml: Path,
         vcs: Literal["none", "git"] = "none",
-        type: Literal["bin", "lib"] | None = None,
+        template: Literal["bin", "lib"] | None = None,
     ):
-        self.cargo_toml = cargo_toml
+        self.cargo_toml = cargo_toml.resolve()
 
         crate_dir = self.cargo_toml.parent
         self.vcs = VCS(repo_dir=crate_dir, vcs=vcs)
 
         if not self.cargo_toml.exists():
-            # Create a new crate with specified type, but without VCS
-            if not type:
+            # Create a new crate with specified template, but without VCS
+            if not template:
                 raise ValueError(
-                    f"Crate at {crate_dir} does not exist; type must be specified!"
+                    f"Crate at {crate_dir} does not exist; template must be specified!"
                 )
             os.makedirs(crate_dir, exist_ok=True)
             success, output, error, _ = run_subprocess(
@@ -151,7 +153,7 @@ class Crate:
                     "cargo",
                     "init",
                     "--quiet",
-                    f"--{type}",
+                    f"--{template}",
                     "--vcs=none",
                     str(crate_dir),
                 ]
@@ -270,6 +272,51 @@ class Crate:
         self.cargo_toml.write_text(tomlkit.dumps(cargo_toml))
 
         # Invalidate cached metadata
+        self.invalidate_metadata()
+
+    def add_workspace_dependencies(self, names: list[str]) -> None:
+        if not names:
+            return
+
+        workspace_root = self.workspace_root
+        workspace_toml_path = workspace_root / "Cargo.toml"
+        workspace_toml = tomlkit.loads(workspace_toml_path.read_text())
+        workspace_table = workspace_toml.get("workspace", tomlkit.table())
+        workspace_deps = workspace_table.get("dependencies", tomlkit.table())
+
+        workspace_member_ids = set(self.metadata.get("workspace_members", []))
+        workspace_packages = {
+            pkg["name"]: pkg
+            for pkg in self.metadata.get("packages", [])
+            if pkg.get("id") in workspace_member_ids
+        }
+
+        cargo_toml = tomlkit.loads(self.cargo_toml.read_text())
+        dependencies = cargo_toml.get("dependencies", tomlkit.table())
+
+        for dep_name in names:
+            dep_name = dep_name.strip()
+            if not dep_name:
+                raise ValueError("workspace dependency names must be non-empty")
+
+            pkg = workspace_packages.get(dep_name)
+            if pkg is None:
+                raise ValueError(
+                    f"Workspace dependency `{dep_name}` was not found among workspace members"
+                )
+
+            manifest_path = Path(pkg["manifest_path"])
+            dep_dir = manifest_path.parent
+            rel_path = dep_dir.relative_to(workspace_root)
+            workspace_deps[dep_name] = {"path": str(rel_path)}
+            dependencies[dep_name] = {"workspace": True}
+
+        workspace_table["dependencies"] = workspace_deps
+        workspace_toml["workspace"] = workspace_table
+        workspace_toml_path.write_text(tomlkit.dumps(workspace_toml))
+
+        cargo_toml["dependencies"] = dependencies
+        self.cargo_toml.write_text(tomlkit.dumps(cargo_toml))
         self.invalidate_metadata()
 
     def cargo_clean(self) -> None:
@@ -439,7 +486,7 @@ def run_subprocess(
 
 
 def check_c(
-    code: str,
+    code: CodeC,
     *,
     flags: list[str] | None = None,
 ) -> tuple[bool, str]:
@@ -454,7 +501,7 @@ def check_c(
     cmd.append("-")
     cmd.extend(["-o", "/dev/null"])
 
-    success, output, error, _ = run_subprocess(cmd, input=code)
+    success, output, error, _ = run_subprocess(cmd, input=str(code))
     return success, output + error
 
 
