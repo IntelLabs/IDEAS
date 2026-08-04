@@ -9,6 +9,7 @@ from textwrap import dedent
 
 import pytest
 
+from ideas import translate_recurrent as translate_recurrent_mod
 from ideas import wrapper as wrapper_mod
 
 
@@ -146,7 +147,7 @@ def test_bindgen_emits_expected_text_for_global_shapes(
     c_path = tmp_path / "input.c"
     c_path.write_text(source)
 
-    binding = wrapper_mod.bindgen(c_path, symbol)
+    binding = translate_recurrent_mod.bindgen(c_path, symbol)
 
     assert str(binding).strip() == expected
     assert c_path.read_text() == source
@@ -160,7 +161,9 @@ def test_bindgen_restores_source_when_bindgen_fails(
     c_path.write_text(original_src)
 
     monkeypatch.setattr(
-        wrapper_mod, "run_subprocess", lambda *_args, **_kwargs: (False, "", "boom", 1)
+        wrapper_mod,
+        "run_subprocess",
+        lambda *_args, **_kwargs: (False, "", "boom", 1),
     )
 
     with pytest.raises(ValueError, match="Bindgen failed"):
@@ -174,7 +177,9 @@ def test_bindgen_raises_for_empty_binding(tmp_path: Path, monkeypatch: pytest.Mo
     c_path.write_text("int foo(void) { return 1; }\n")
 
     monkeypatch.setattr(
-        wrapper_mod, "run_subprocess", lambda *_args, **_kwargs: (True, "   \n", "", 0)
+        wrapper_mod,
+        "run_subprocess",
+        lambda *_args, **_kwargs: (True, "   \n", "", 0),
     )
 
     with pytest.raises(ValueError, match="empty binding"):
@@ -187,11 +192,11 @@ def test_bindgen_handles_dependent_declarations_for_target_global(tmp_path: Path
     dependent_decl = "static const int num_arr = sizeof(arr) / sizeof(arr[0]);\n"
 
     c_path.write_text(array_decl)
-    baseline_binding = wrapper_mod.bindgen(c_path, "arr")
+    baseline_binding = translate_recurrent_mod.bindgen(c_path, "arr")
     assert c_path.read_text() == array_decl
 
     c_path.write_text(array_decl + dependent_decl)
-    dependent_binding = wrapper_mod.bindgen(c_path, "arr")
+    dependent_binding = translate_recurrent_mod.bindgen(c_path, "arr")
     assert c_path.read_text() == array_decl + dependent_decl
 
     assert str(dependent_binding).strip() == str(baseline_binding).strip()
@@ -203,11 +208,11 @@ def test_bindgen_handles_dependent_declarations_for_target_function(tmp_path: Pa
     dependent_source = baseline_source + "int (*pf)(int) = f;\n"
 
     c_path.write_text(baseline_source)
-    baseline_binding = wrapper_mod.bindgen(c_path, "f")
+    baseline_binding = translate_recurrent_mod.bindgen(c_path, "f")
     assert c_path.read_text() == baseline_source
 
     c_path.write_text(dependent_source)
-    dependent_binding = wrapper_mod.bindgen(c_path, "f")
+    dependent_binding = translate_recurrent_mod.bindgen(c_path, "f")
     assert c_path.read_text() == dependent_source
 
     assert str(dependent_binding).strip() == str(baseline_binding).strip()

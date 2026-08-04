@@ -7,14 +7,13 @@
 import logging
 import sqlite3
 from pathlib import Path
-from textwrap import indent
+from collections.abc import Callable
 
 import dspy
 from dspy.utils.exceptions import AdapterParseError
 from dspy.utils.usage_tracker import track_usage
 from dspy.dsp.utils.settings import settings
 
-from .tools import Crate, LARGE_PROJECT
 from .ast import CodeC
 from .ast_rust import CodeRust
 from .model import format_usage
@@ -31,7 +30,7 @@ class SnippetTranslatorSignature(dspy.Signature):
 
     - `reference_code`: Existing Rust code the translation must build on. Use it as-is; do not refactor it.
     - `snippet`: The single C definition to translate.
-    - `dependent_code`: C code that uses the snippet. Use it only to understand ownership, lifetime, and memory-management requirements; do not translate it.
+    - `dependent_code`: C code that uses the snippet. Use it to determine concrete types for opaque and void pointers, ownership, lifetimes, and memory-management requirements; do not translate it.
     - `prior_translation` and `feedback`: If provided, treat the feedback as a critique of the prior translation and address it in the new translation.
 
     # Hard constraints
@@ -39,11 +38,15 @@ class SnippetTranslatorSignature(dspy.Signature):
     - The translation must contain no `unsafe` constructs.
     - Do not include `#![forbid(unsafe_code)]` in the translation since it is included by default.
     - Do not define any `impl` blocks.
+    - Define all top-level items (functions, structs, enums, type aliases, constants, statics, unions, traits, and modules) as fully public using plain `pub` (e.g., `pub fn ...`, `pub struct ...`). Also define every field of a top-level struct as `pub`, including unnamed fields in tuple structs (e.g., `pub struct Pair(pub i32, pub i32)`). Do not use restricted visibility such as `pub(crate)` or `pub(super)` anywhere; use only `pub`.
     - Do not weaken behavior with stubs, fallback defaults, relaxed assertions, or intentionally partial implementations.
+    - Do not annotate any type with `#[repr(C)]`; the translation does not need C ABI compatibility.
+    - Do not add `#[derive(...)]` attributes; they generate `impl` blocks and may impose behavior (e.g., `Default`, `Clone`) that does not match C semantics.
+    - If the snippet references a C type not yet present in `reference_code`, include a correct translation of that type in the output so the translation compiles. Derive the referenced type's translation from `dependent_code` and any context visible in the snippet itself. Its translation will be reused as-is when the type's own snippet is processed later.
 
     # Faithfulness to C semantics
 
-    The overarching rule: reproduce the C code's observable behavior exactly. Do not "fix", simplify, or second-guess the C code's intent.
+    The overarching rule: reproduce the C code's runtime behavior exactly. Do not "fix", simplify, or second-guess the C code's intent. For type definitions, use idiomatic Rust types that are semantically equivalent rather than structurally identical.
 
     ## Arithmetic and expressions
 
@@ -97,6 +100,22 @@ class SnippetTranslatorSignature(dspy.Signature):
     - Translate a C function that returns a pointer into a global/static container (e.g., `return &table[i]`) as a function returning `&T` into that container, not an owned clone.
     - If the container is locked: acquire the lock in the caller and borrow `&T` from the held guard. If the existing accessor locks internally and returns an owned value, the caller must bypass it — lock the container directly, borrow references from the guard, and finish all identity comparisons before releasing.
 
+    ## Void pointers (`void *`)
+
+    - A `void *` field or parameter is not inherently polymorphic. Inspect `dependent_code` to find every cast applied to the value. If all casts resolve to the same concrete type, translate the field using that concrete type (e.g., `Option<Box<ConcreteType>>`). Do not use `Box<dyn Any>`, `Box<dyn Trait>`, or any other type-erasure mechanism unless the pointer is genuinely polymorphic — i.e., cast to multiple structurally unrelated types in different code paths.
+    - A `void *` used solely to break a forward-declaration cycle is not polymorphic. Resolve the concrete type from the casts and use it directly.
+    - When the `void *` is nullable in C (compared to `NULL`, initialized to `0`, or conditionally assigned), translate it as `Option<Box<T>>` if the containing struct owns the allocation (evidenced by `free` being called through this field), or as `Option<&T>` / `Option<&mut T>` if it is a non-owning reference.
+
+    ## Pointer fields in structs (`T *`, `T **`)
+
+    Determine ownership from `dependent_code` before choosing a Rust type:
+
+    - If `free(field)` or equivalent is called through the struct, the struct owns the pointee. Use `Box<T>` for a single value or `Vec<T>` for a heap-allocated array. Wrap in `Option<>` if the pointer may be null.
+    - If the pointer is never freed through the struct (it aliases data owned elsewhere): use `&T` or `&mut T` with an appropriate lifetime.
+    - If the field stores a heap array whose length is tracked separately (a C dynamic array): use `Vec<T>`, not `Box<[T]>`.
+    - If the field is a fixed-length C array (`T arr[N]`): use `[T; N]`.
+    - Do not use raw pointers (`*mut T`, `*const T`) as a shortcut when a safe owned or borrowed type is available.
+
     ## Mutable global state and locking
 
     - Never lock the same mutex/`RwLock` more than once in a single expression.
@@ -114,10 +133,48 @@ class SnippetTranslatorSignature(dspy.Signature):
 
     If the translation introduces an auxiliary data structure (thread-local, `HashMap`, `RefCell<Vec<_>>`, etc.) to represent metadata that C tracked via struct fields or raw pointers, every function that conceptually reads or writes that metadata in C must read or write the auxiliary structure in Rust. A stub claiming the data is "not accessible in safe Rust" is never acceptable once such a mechanism exists.
 
+    ## C primitive type mappings
+
+    Use the following canonical mappings:
+
+    - `char` (used as integer) → `i8`; `unsigned char` → `u8`
+    - `short` → `i16`; `unsigned short` → `u16`
+    - `int` → `i32`; `unsigned int` → `u32`
+    - `long` → `i64`; `unsigned long` → `u64`
+    - `long long` → `i64`; `unsigned long long` → `u64`
+    - `float` → `f32`; `double` → `f64`
+    - `size_t` → `usize`; `ptrdiff_t` → `isize`
+    - `intptr_t` → `isize`; `uintptr_t` → `usize`
+    - `int8_t`/`uint8_t` → `i8`/`u8`; `int16_t`/`uint16_t` → `i16`/`u16`; `int32_t`/`uint32_t` → `i32`/`u32`; `int64_t`/`uint64_t` → `i64`/`u64`
+    - `char *` used as a string: see "Strings and NUL termination".
+
+    ## C typedefs and forward declarations
+
+    - A typedef that merely names an existing struct (`typedef struct Foo Foo;`) carries no information and should be omitted.
+    - An anonymous struct typedef (`typedef struct { ... } Foo;`) translates to `pub struct Foo { ... }`.
+    - A scalar typedef (`typedef unsigned int foo_t;`) translates to `pub type FooT = u32;`.
+    - A function-pointer typedef (`typedef int (*cmp_fn)(int, int);`) translates to `pub type CmpFn = fn(i32, i32) -> i32;`.
+    - Forward struct declarations (`struct Foo;`) are not translated; they become concrete when the full definition's snippet is processed.
+
+    ## C enums
+
+    - A C enum whose values are used as integers (assigned to integer variables, used in arithmetic, or used as array indices) translates to a group of `pub const` items with the appropriate integer type (default `i32`). Do not translate such enums as Rust `enum` variants; Rust enums are not freely interchangeable with integers.
+    - A C enum whose values are used exclusively in switch/pattern-match contexts and never mixed with integers may be translated as a Rust `enum`.
+    - Anonymous C enums (`enum { A = 0, B, C };`) follow the same rules; omit the type name.
+
     ## Observable output
 
     - Reproduce stdout/stderr text, spacing, punctuation, and line breaks exactly.
     - When the C source contains multi-byte UTF-8 literals (e.g., box-drawing characters), count Unicode scalar values, not bytes. Reproduce the same number of code points.
+
+    # Allowed External Crates
+
+    - `libc`: Raw FFI bindings to platform libraries like libc.
+    - `openssl`: OpenSSL bindings
+    - `flate2`: DEFLATE compression and decompression exposed as Read/BufRead/Write streams. Supports miniz_oxide and multiple zlib implementations. Supports zlib, gzip, and raw deflate streams.
+    - `regex`: An implementation of regular expressions for Rust. This implementation uses finite automata and guarantees linear time matching on all inputs.
+
+    Use functions from these crates, as needed, to translate the C code to equivalent, memory-safe Rust.
     """
 
     reference_code: CodeRust = dspy.InputField()
@@ -128,45 +185,44 @@ class SnippetTranslatorSignature(dspy.Signature):
     translation: CodeRust = dspy.OutputField()
 
 
-_crate_dependencies = """
-# Crate dependencies:
-The Rust project has visibility into the following crates:
-- `flate2` for DEFLATE compression and decompression
-- `regex` for regular expression parsing and matching
+def _default_feedback_fn(translation: CodeRust) -> str:
+    return ""
 
-Use functions from these crates as needed to translate the C code to equivalent, memory-safe Rust.
-"""
+
+def _default_on_attempt(msg: str, pred: dspy.Prediction) -> None:
+    pass
 
 
 class SnippetTranslator(dspy.Module):
     def __init__(
         self,
-        crate: Crate,
         translator: type[dspy.Module],
         max_iters: int = 5,
+        cache: Path | None = None,
     ):
         super().__init__()
         signature = SnippetTranslatorSignature
-        if LARGE_PROJECT:
-            signature = signature.with_instructions(
-                "\n\n".join([signature.instructions, _crate_dependencies])
-            )
-
-        self.crate = crate
         self._translate = translator(signature)
         self.max_iters = max_iters
-        self.cache = _init_cache(crate.workspace_root / "cache.db")
+        self.cache = _init_cache(cache)
 
     def forward(
         self,
         name: str,
+        crate_code: CodeRust,
         reference_code: CodeRust,
-        reference_context: CodeRust,
         snippet: CodeC,
         dependent_code: CodeC,
         prior_translation: CodeRust | None = None,
         feedback: str = "",
+        feedback_fn: Callable[[CodeRust], str] | None = None,
+        on_attempt: Callable[[str, dspy.Prediction], None] | None = None,
     ) -> dspy.Prediction:
+        if feedback_fn is None:
+            feedback_fn = _default_feedback_fn
+        if on_attempt is None:
+            on_attempt = _default_on_attempt
+
         logger.info(f"Translating snippet `{name}` ...")
 
         # Use cache when no prior translation
@@ -175,32 +231,28 @@ class SnippetTranslator(dspy.Module):
             translation = CodeRust(f"// Empty snippet `{name}`")
         elif prior_translation is None:
             translation = _read_cache(self.cache, name, snippet)
+            if translation is not None:
+                translation = _make_public(translation)
         else:
             logger.info("Ignoring snippet cache...")
             translation = None
 
-        orig_rust_src = self.crate.rust_src_path.read_bytes()
-        pred = dspy.Prediction()
-        builds = False
+        pred = dspy.Prediction(feedback=feedback)
         for i in range(max(self.max_iters, 1)):
             # Use the translation from the prior iteration as feedback for the next iteration
             if i > 0:
                 prior_translation = translation
 
-            # Ensure any translated snippet is safe
-            rust_src = CodeRust("#![forbid(unsafe_code)]")
-            rust_src += reference_code
-
             # Use prior translation as the translation on first iteration only.
             # This allows static translations that violate safety, which will be fixed by the LLM!
             try:
                 pred = self.translate(
-                    reference_code if not LARGE_PROJECT else reference_context,
-                    snippet,
-                    dependent_code,
-                    prior_translation,
-                    feedback,
-                    translation if i == 0 else None,
+                    reference_code=reference_code,
+                    snippet=snippet,
+                    dependent_code=dependent_code,
+                    prior_translation=prior_translation,
+                    feedback=pred.feedback,
+                    translation=translation if i == 0 else None,
                 )
             except AdapterParseError:
                 logger.exception(
@@ -214,52 +266,34 @@ class SnippetTranslator(dspy.Module):
 
             translation = pred.translation
             assert isinstance(translation, CodeRust)
-            if translation in reference_code:
+            if translation in crate_code:
                 translation = CodeRust(f"// duplicate snippet `{name}` detected")
             if translation == prior_translation:
                 logger.warning("Snippet translation loop detected!")
+            pred.name = name
+            pred.snippet = snippet
+            pred.crate_code = crate_code
+            pred.dependent_code = dependent_code
+            pred.prior_translation = prior_translation or CodeRust()
+            pred.translation = translation
 
-            # Append translation and check if it builds
-            rust_src += translation
-            self.crate.rust_src_path.write_text(str(rust_src))
-            self.crate.vcs.add(self.crate.rust_src_path)
-            # FIXME: Checking name for c:@F@main is brittle but we have no better way here.
-            #        The proper way to fix is to yield the translation back to the caller so it can
-            #        build and tell us whether to translation is successful.
-            builds, feedback = self.crate.cargo_build(fix_E0601="c:@F@main" not in name)
-            if not builds:
-                feedback = "Running `cargo build` fails!\n" + feedback
-
+            parts = []
             if CodeRust("#![forbid(unsafe_code)]") in translation:
-                feedback = "Do not include `#![forbid(unsafe_code)]` in the translation!"
-                builds = False
+                parts.append("Do not include `#![forbid(unsafe_code)]` in the translation!")
+            if feedback := feedback_fn(translation):
+                parts.append(feedback)
+            pred.feedback = "\n\n".join(parts)
+            pred.success = not pred.feedback
 
-            usage = format_usage(pred)
-
-            # Exit early if we build
-            if builds:
-                msg = f"Translated snippet `{name}`: {usage}"
+            if pred.success:
+                msg = f"Translated snippet `{name}`: {format_usage(pred)}"
                 logger.info(msg)
-                if "reasoning" in pred:
-                    msg += f"\n\n# Reasoning\n{indent(pred.reasoning, '  ')}"
-                self.crate.vcs.commit(msg)
+                on_attempt(msg, pred)
                 break
-
-            msg = f"Failed to translate snippet `{name}` ({i + 1}/{self.max_iters}): {usage}"
-            logger.error(msg)
-            if "reasoning" in pred:
-                msg += f"\n\n# Reasoning\n{indent(pred.reasoning, '  ')}"
-            msg += f"\n\n# Feedback\n{indent(feedback, '  ')}" if feedback else ""
-            self.crate.vcs.commit(msg)
-        self.crate.rust_src_path.write_bytes(orig_rust_src)
-        pred.name = name
-        pred.snippet = snippet
-        pred.reference_code = reference_code
-        pred.dependent_code = dependent_code
-        pred.prior_translation = prior_translation or CodeRust()
-        pred.feedback = feedback
-        pred.translation = translation
-        pred.success = builds
+            else:
+                msg = f"Failed to translate snippet `{name}` ({i + 1}/{self.max_iters}): {format_usage(pred)}"
+                logger.error(msg)
+                on_attempt(msg, pred)
         return pred
 
     def translate(
@@ -271,7 +305,6 @@ class SnippetTranslator(dspy.Module):
         feedback: str,
         translation: CodeRust | None,
     ) -> dspy.Prediction:
-        """Get a prediction for the current iteration."""
         parent_usage_tracker = settings.usage_tracker
         if translation is not None:
             pred = dspy.Prediction(translation=translation)
@@ -310,7 +343,7 @@ class SnippetTranslator(dspy.Module):
             self.cache,
             pred.name,
             pred.snippet,
-            pred.reference_code,
+            pred.crate_code,
             pred.dependent_code,
             pred.prior_translation,
             pred.feedback,
@@ -369,11 +402,217 @@ def _read_cache(cache: Path | None, name: str, snippet: CodeC) -> CodeRust | Non
         return None
 
 
+def _make_public(translation: CodeRust) -> CodeRust:
+    source = str(translation)
+    from typing import Any
+    from tree_sitter import Language, Parser, Query, QueryCursor
+    from tree_sitter_rust import language as rust_language
+
+    language = Language(rust_language())
+    parser = Parser(language)
+    tree = parser.parse(source.encode("utf-8"))
+    query = Query(
+        language,
+        """
+        (function_item
+          (visibility_modifier)? @vis
+          "fn" @fn_kw
+        ) @item
+
+        (struct_item
+          (visibility_modifier)? @vis
+          "struct" @kw
+        ) @item
+
+        (type_item
+          (visibility_modifier)? @vis
+          "type" @kw
+        ) @item
+
+        (enum_item
+          (visibility_modifier)? @vis
+          "enum" @kw
+        ) @item
+
+        (static_item
+          (visibility_modifier)? @vis
+          "static" @kw
+        ) @item
+
+        (union_item
+          (visibility_modifier)? @vis
+          "union" @kw
+        ) @item
+
+        (const_item
+          (visibility_modifier)? @vis
+          "const" @kw
+        ) @item
+
+        (trait_item
+          (visibility_modifier)? @vis
+          "trait" @kw
+        ) @item
+
+        (mod_item
+          (visibility_modifier)? @vis
+          "mod" @kw
+        ) @item
+
+        (struct_item
+          body: (field_declaration_list
+            (field_declaration
+              (visibility_modifier)? @field_vis
+              (field_identifier) @field_name
+            ) @field
+          )
+        ) @struct
+
+        """,
+    )
+
+    by_item: dict[tuple[int, int], dict[str, Any]] = {}
+    by_field: dict[tuple[int, int], dict[str, Any]] = {}
+    item_types = {
+        "function_item",
+        "struct_item",
+        "type_item",
+        "enum_item",
+        "static_item",
+        "union_item",
+        "const_item",
+        "trait_item",
+        "mod_item",
+    }
+
+    cursor = QueryCursor(query)
+    captures = cursor.captures(tree.root_node)
+    for capture_name, nodes in captures.items():
+        for node in nodes:
+            if capture_name == "item":
+                key = (node.start_byte, node.end_byte)
+                by_item.setdefault(key, {"item": node, "vis": None, "kw": None})
+                continue
+
+            if capture_name == "field":
+                key = (node.start_byte, node.end_byte)
+                by_field.setdefault(key, {"field": node, "vis": None, "name": None})
+                continue
+
+            parent = node.parent
+            while parent is not None and parent.type not in item_types | {
+                "field_declaration",
+            }:
+                parent = parent.parent
+            if parent is None:
+                continue
+
+            if parent.type == "field_declaration":
+                key = (parent.start_byte, parent.end_byte)
+                entry = by_field.setdefault(key, {"field": parent, "vis": None, "name": None})
+                if capture_name == "field_vis":
+                    entry["vis"] = node
+                elif capture_name == "field_name":
+                    entry["name"] = node
+                continue
+
+            key = (parent.start_byte, parent.end_byte)
+            entry = by_item.setdefault(key, {"item": parent, "vis": None, "kw": None})
+            if capture_name == "vis":
+                entry["vis"] = node
+            elif capture_name in {"fn_kw", "kw"}:
+                entry["kw"] = node
+
+    edits: list[tuple[int, int, bytes]] = []
+    source_bytes = source.encode("utf-8")
+
+    for entry in by_item.values():
+        item_node = entry["item"]
+        vis_node = entry["vis"]
+        kw_node = entry["kw"]
+
+        # Only rewrite module-level items.
+        if item_node.parent is None or item_node.parent.type != "source_file":
+            continue
+
+        if vis_node is None:
+            if kw_node is None:
+                continue
+            edits.append((kw_node.start_byte, kw_node.start_byte, b"pub "))
+            continue
+
+        vis_text = source_bytes[vis_node.start_byte : vis_node.end_byte].strip()
+        if vis_text != b"pub":
+            edits.append((vis_node.start_byte, vis_node.end_byte, b"pub"))
+
+    for entry in by_field.values():
+        field_node = entry["field"]
+        vis_node = entry["vis"]
+        name_node = entry["name"]
+
+        # Only rewrite fields of top-level structs.
+        struct_node = field_node.parent
+        while struct_node is not None and struct_node.type != "struct_item":
+            struct_node = struct_node.parent
+        if struct_node is None or struct_node.parent is None:
+            continue
+        if struct_node.parent.type != "source_file":
+            continue
+
+        if vis_node is None:
+            if name_node is None:
+                continue
+            edits.append((name_node.start_byte, name_node.start_byte, b"pub "))
+            continue
+
+        vis_text = source_bytes[vis_node.start_byte : vis_node.end_byte].strip()
+        if vis_text != b"pub":
+            edits.append((vis_node.start_byte, vis_node.end_byte, b"pub"))
+
+    # Handle tuple struct fields programmatically: tree-sitter-rust has no
+    # "ordered_field_declaration" wrapper node; fields are direct children of
+    # "ordered_field_declaration_list".
+    for struct_node in tree.root_node.children:
+        if struct_node.type != "struct_item":
+            continue
+        for child in struct_node.children:
+            if child.type != "ordered_field_declaration_list":
+                continue
+            pending_vis = None
+            for fc in child.children:
+                if fc.type in ("(", ")", ","):
+                    pending_vis = None
+                elif fc.type == "visibility_modifier":
+                    pending_vis = fc
+                elif fc.type == "attribute_item":
+                    pass
+                else:
+                    # fc is a type node — this is a tuple field
+                    if pending_vis is None:
+                        edits.append((fc.start_byte, fc.start_byte, b"pub "))
+                    else:
+                        vis_text = source_bytes[
+                            pending_vis.start_byte : pending_vis.end_byte
+                        ].strip()
+                        if vis_text != b"pub":
+                            edits.append((pending_vis.start_byte, pending_vis.end_byte, b"pub"))
+                    pending_vis = None
+            break
+
+    if not edits:
+        return translation
+
+    out = bytearray(source_bytes)
+    for start, end, replacement in sorted(edits, key=lambda item: item[0], reverse=True):
+        out[start:end] = replacement
+    return CodeRust(out.decode("utf-8"))
+
+
 def _write_cache(
     cache: Path | None,
     name: str,
     snippet: CodeC,
-    reference_code: CodeRust,
+    crate_code: CodeRust,
     dependent_code: CodeC,
     prior_translation: CodeRust,
     feedback: str,
@@ -392,7 +631,7 @@ def _write_cache(
             (
                 name,
                 str(snippet),
-                str(reference_code),
+                str(crate_code),
                 str(dependent_code),
                 str(prior_translation),
                 feedback,

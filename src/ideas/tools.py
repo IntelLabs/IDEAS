@@ -17,14 +17,8 @@ from typing import Any, Literal
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from .ast import CodeC
-
-
-TestCase = dict[str, None | str | int | float | list[int] | list[str] | list[float]]
 
 logger = logging.getLogger("ideas.tools")
-
-DEFAULT_TEST_TIMEOUT = 10.0  # seconds
 
 
 class VCS:
@@ -108,38 +102,21 @@ class VCS:
         return success, output + error
 
 
-class Workspace:
-    def __init__(
-        self,
-        cargo_toml: Path,
-        vcs: Literal["none", "git"] = "none",
-    ):
-        self.cargo_toml = cargo_toml.resolve()
-
-        workspace_dir = self.cargo_toml.parent
-        self.vcs = VCS(repo_dir=workspace_dir, vcs=vcs)
-
-        if not self.cargo_toml.exists():
-            # Create a new workspace
-            os.makedirs(workspace_dir, exist_ok=True)
-            contents = {"workspace": {"resolver": "3"}}
-            self.cargo_toml.write_text(tomlkit.dumps(contents))
-
-        # Initialize repository if needed
-        self.vcs.init(force_init=True)
-
-
 class Crate:
     def __init__(
         self,
         cargo_toml: Path,
         vcs: Literal["none", "git"] = "none",
         template: Literal["bin", "lib"] | None = None,
+        reinit: bool = False,
     ):
         self.cargo_toml = cargo_toml.resolve()
 
         crate_dir = self.cargo_toml.parent
         self.vcs = VCS(repo_dir=crate_dir, vcs=vcs)
+
+        if reinit and self.cargo_toml.exists():
+            self.cargo_toml.unlink()
 
         if not self.cargo_toml.exists():
             # Create a new crate with specified template, but without VCS
@@ -206,36 +183,55 @@ class Crate:
         return list(filter(lambda t: "bin" in t["kind"], self.root_package["targets"]))
 
     @property
-    def lib_targets(self) -> list[dict[str, Any]]:
-        return list(filter(lambda t: "lib" in t["kind"], self.root_package["targets"]))
+    def lib_target(self) -> dict[str, Any] | None:
+        all_targets = list(filter(lambda t: "lib" in t["kind"], self.root_package["targets"]))
+        if len(all_targets) == 1:
+            return all_targets[0]
+        if len(all_targets) == 0:
+            return None
+        raise ValueError(f"Multiple lib targets found in Cargo.toml: {self.cargo_toml=}")
 
     @property
-    def is_bin(self) -> bool:
-        if len(self.bin_targets) == 1 and len(self.lib_targets) == 0:
-            is_bin = True
-        elif len(self.bin_targets) == 0 and len(self.lib_targets) == 1:
-            is_bin = False
-        else:
-            raise ValueError(
-                f"Unhandled bin/lib targets configuration in Cargo.toml: {self.bin_targets=} {self.lib_targets=}"
+    def lib_name(self) -> str | None:
+        if self.lib_target is None:
+            return None
+        return self.lib_target["name"]
+
+    @property
+    def lib_src_path(self) -> Path | None:
+        if self.lib_target is None:
+            return None
+        return Path(self.lib_target["src_path"])
+
+    @property
+    def main_src_path(self) -> Path | None:
+        if len(self.bin_targets) == 1:
+            return Path(self.bin_targets[0]["src_path"])
+        if len(self.bin_targets) > 1:
+            raise NotImplementedError(
+                f"Multiple bin targets found in Cargo.toml: {self.cargo_toml=} {self.bin_targets=}"
             )
-        return is_bin
+        return None
 
     @property
-    def rust_src_path(self) -> Path:
-        if len(self.bin_targets) == 1 and len(self.lib_targets) == 0:
-            rust_src_path = Path(self.bin_targets[0]["src_path"])
-        elif len(self.bin_targets) == 0 and len(self.lib_targets) == 1:
-            rust_src_path = Path(self.lib_targets[0]["src_path"])
-        else:
+    def src_dir(self) -> Path:
+        src_paths: list[Path] = []
+        if self.lib_src_path is not None:
+            src_paths.append(self.lib_src_path.parent)
+        if self.main_src_path is not None:
+            src_paths.append(self.main_src_path.parent)
+
+        if not src_paths:
+            raise ValueError(f"Crate {self.name} has neither lib.rs nor main.rs!")
+        if len({path.resolve() for path in src_paths}) > 1:
             raise ValueError(
-                f"Unhandled bin/lib targets configuration in Cargo.toml: {self.bin_targets=} {self.lib_targets=}"
+                f"Crate {self.name} has inconsistent src directories: {src_paths!r}"
             )
-        return rust_src_path
+        return src_paths[0]
 
     @property
-    def c_src_path(self) -> Path:
-        return self.rust_src_path.with_suffix(".c")
+    def name(self) -> str:
+        return self.root_package["name"]
 
     def cargo_add(
         self, dep: str, section: str | None = None, features: list[str] | None = None
@@ -272,6 +268,30 @@ class Crate:
         self.cargo_toml.write_text(tomlkit.dumps(cargo_toml))
 
         # Invalidate cached metadata
+        self.invalidate_metadata()
+
+    def configure_target(
+        self,
+        section: Literal["bin", "lib"],
+        name: str,
+        test: bool = True,
+        doctest: bool = True,
+        crate_type: list[str] | None = None,
+    ) -> None:
+        content = tomlkit.loads(self.cargo_toml.read_text())
+        table = tomlkit.table()
+        table.add("name", name)
+        if crate_type is not None:
+            table.add("crate-type", crate_type)
+        table.add("test", test)
+        table.add("doctest", doctest)
+        # A crate can have multiple binaries, so [[bin]] must be an array of tables
+        if section == "bin":
+            aot = tomlkit.aot()
+            aot.append(table)
+            table = aot
+        content[section] = table
+        self.cargo_toml.write_text(tomlkit.dumps(content))
         self.invalidate_metadata()
 
     def add_workspace_dependencies(self, names: list[str]) -> None:
@@ -332,7 +352,7 @@ class Crate:
                 f"Failed to clean crate at {self.cargo_toml} with error:\n\n{output + error}"
             )
 
-    def cargo_build(self, fix_E0601: bool = True) -> tuple[bool, str]:
+    def cargo_build(self) -> tuple[bool, str]:
         cmd = [
             "cargo",
             "build",
@@ -341,15 +361,6 @@ class Crate:
             f"--manifest-path={self.cargo_toml}",
         ]
         builds, output, error, _ = run_subprocess(cmd)
-
-        # Work around E0601 error "No main function was found in a binary crate."
-        if fix_E0601 and "error[E0601]" in error:
-            rust_src = self.rust_src_path.read_text()
-            with self.rust_src_path.open("a") as f:
-                f.write('\n\nfn main() {\n    println!("Hello, world!");\n}\n')
-            builds, output, error, _ = run_subprocess(cmd)
-            self.rust_src_path.write_text(rust_src)
-
         return builds, output + error
 
     def cargo_test(
@@ -361,6 +372,7 @@ class Crate:
         build_only: bool = False,
         skip: list[str] | None = None,
         message_format: str | None = None,
+        lib: bool = False,
     ) -> tuple[bool, str, str, int | Literal["timeout"]]:
         cmd = [
             "cargo",
@@ -377,8 +389,12 @@ class Crate:
                 cmd.append("--quiet")
             else:
                 raise ValueError(f"Unsupported test harness: {test_harness}")
-        if name:
-            cmd.extend(["--test", name])
+        if lib:
+            cmd.append("--lib")
+            if name:
+                cmd.append(name)  # positional substring filter
+        elif name:
+            cmd.extend(["--test", name])  # integration test binary
         if build_only:
             cmd.append("--no-run")
 
@@ -398,19 +414,16 @@ class Crate:
                 cmd.append("--exact")
                 for test_name in skip:
                     cmd.extend(["--skip", test_name])
-
         return run_subprocess(cmd, env=env)
 
-    def cargo_nextest_config(self, slow: int = 30, terminate_after: int = 4) -> None:
-        nextest_config_path = self.workspace_root / ".config" / "nextest.toml"
-        nextest_config_path.parent.mkdir(exist_ok=True)
+    def cargo_nextest_config(
+        self, nextest_config_path: Path, slow: int = 30, terminate_after: int = 2
+    ) -> None:
+        nextest_config_path.parent.mkdir(parents=True, exist_ok=True)
         nextest_config = {
             "profile": {
                 "default": {
                     "slow-timeout": {"period": f"{slow}s", "terminate-after": terminate_after},
-                    "final-status-level": "none",
-                    "fail-fast": False,
-                    "failure-output": "never",
                     "test-threads": 1,
                 }
             }
@@ -423,38 +436,6 @@ class Crate:
             raise ValueError("path must not be absolute")
         path = self.cargo_toml.parent / path
         return path.write_text(data, **kwargs)
-
-
-def nextest_json_to_libtest(stdout: str) -> str:
-    """Convert nextest libtest-json output to vanilla `cargo test` text format."""
-    lines = []
-    summary = {}
-    for raw in stdout.splitlines():
-        obj = json.loads(raw)
-
-        if obj.get("type") == "test":
-            event = obj.get("event")
-            if event not in {"ok", "failed", "ignored"}:
-                continue
-
-            # nextest uses "$" to join binary::suite$test_name
-            name = obj["name"].rsplit("$", 1)[-1]
-            status = "FAILED" if event == "failed" else event
-            lines.append(f"test {name} ... {status}")
-
-        elif obj.get("type") == "suite" and obj.get("event") != "started":
-            summary = obj
-
-    # Append summary from the suite event (or zeros if missing)
-    p, f = summary.get("passed", 0), summary.get("failed", 0)
-    ig, m = summary.get("ignored", 0), summary.get("measured", 0)
-    fo = summary.get("filtered_out", 0)
-    result = "FAILED" if f else "ok"
-    lines.append(
-        f"test result: {result}. {p} passed; {f} failed; "
-        f"{ig} ignored; {m} measured; {fo} filtered out"
-    )
-    return "\n".join(lines) + "\n"
 
 
 def run_subprocess(
@@ -485,26 +466,6 @@ def run_subprocess(
         )
 
 
-def check_c(
-    code: CodeC,
-    *,
-    flags: list[str] | None = None,
-) -> tuple[bool, str]:
-    cmd = ["clang-21"]
-
-    if flags:
-        cmd.extend(flags)
-    else:
-        cmd.append("-Wall")
-
-    cmd.extend(["-march=native", "-x", "c"])
-    cmd.append("-")
-    cmd.extend(["-o", "/dev/null"])
-
-    success, output, error, _ = run_subprocess(cmd, input=str(code))
-    return success, output + error
-
-
 def check_rust(
     code: str,
     *,
@@ -531,69 +492,5 @@ def rustfmt(path: Path) -> None:
     run_subprocess(cmd)
 
 
-def run_test(
-    executable: Path | str,
-    test_case: TestCase,
-    timeout: float | None = DEFAULT_TEST_TIMEOUT,
-) -> tuple[bool, str]:
-    # Turn args into list[str]
-    args = test_case.get("args", []) or []
-    if not isinstance(args, list):
-        args = [args]
-    args = [str(arg) for arg in args]
-
-    # Turn stdin into list[str] then join on newlines
-    stdin = test_case.get("in", []) or []
-    if not isinstance(stdin, list):
-        stdin = [stdin]
-    stdin = [str(s) for s in stdin]
-    stdin = "\n".join(stdin)
-
-    # Run test and right-strip output of whitespace
-    success, output, error, _ = run_subprocess([str(executable), *args], stdin, timeout=timeout)
-    return success, output + error
-
-
-def check_test(
-    test_case: TestCase,
-    stdout: str,
-) -> bool:
-    # Turn out into list[str] then join on newlines
-    out = test_case["out"]
-    if not isinstance(out, list):
-        out = [out]
-    out = [str(o) for o in out]
-    if isinstance(out, list):
-        out = "\n".join(out)
-
-    # Make sure test returned and matches
-    return out.rstrip() == stdout.rstrip()
-
-
-def run_and_check_test(
-    executable: Path | str,
-    test_case: TestCase,
-    timeout: float | None = DEFAULT_TEST_TIMEOUT,
-):
-    _, stdout = run_test(executable, test_case, timeout=timeout)
-    return check_test(test_case, stdout)
-
-
-def run_and_check_tests(
-    executable: Path | str,
-    test_cases: list[TestCase],
-    timeout: float | None = DEFAULT_TEST_TIMEOUT,
-) -> int:
-    success = 0
-    for test_case in test_cases:
-        success += 1 if run_and_check_test(executable, test_case, timeout=timeout) else 0
-    return success
-
-
-def _in_env(var_name: str, default: bool = True) -> bool:
-    value = os.getenv(var_name, str(default))
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-LARGE_PROJECT = _in_env("LARGE_PROJECT", default=False)
 MAX_DEPENDENT_CHARS = int(os.environ.get("MAX_DEPENDENT_CHARS", "20000"))
+REDUCED_CONTEXT = os.environ.get("REDUCED_CONTEXT", "1") not in ("0", "", "false", "False")

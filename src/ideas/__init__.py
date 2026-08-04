@@ -9,7 +9,6 @@ from .model import ModelConfig, GenerateConfig
 from .translate_recurrent import RecurrentTranslator
 from .translate_snippet import SnippetTranslator
 from .wrapper import WrapperGenerator
-from .test_symbol import SymbolTester
 from clang.cindex import Config
 
 __all__ = [
@@ -21,7 +20,6 @@ __all__ = [
     "RecurrentTranslator",
     "SnippetTranslator",
     "WrapperGenerator",
-    "SymbolTester",
 ]
 
 # NOTE: .so is *nix specific
