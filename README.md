@@ -23,27 +23,28 @@ REDUCED_CONTEXT=0 make examples/C-project-name/translate
 Developed and tested on Ubuntu 24.04.
 
 IDEAS requires specific versions of the `clang` and Rust toolchains to translate C to Rust.
-A Docker image with the user-specific name `ideas-${UID}` can be built and launched in an interactive session using:
+A Docker image with the user-specific name `ideas-${UID}` can be built using:
 ```bash
-make docker
+make docker/build
 ```
 
 We strongly recommend launching all runs in the Docker image.
 
 > [!NOTE]
+> Setting the `TRANSLATION_DIR` environment is **mandatory** when mounting examples to the Docker image.  
 > If the `OPENROUTER_API_KEY` or `OPENAI_API_KEY` environment variables are set on the host, they will be automatically passed to the interactive session.
 
 # Quickstart
 To translate a single C project to a Rust workspace, ensure it uses CMake as a build system, place it in the `examples` folder, and generate an [OpenRouter API key](https://openrouter.ai/workspaces/default/keys).
 
-Then, build and launch the official Docker image:
+Then, build and mount your project and API key in an interactive Docker session:
 ```bash
-make docker
+TRANSLATION_DIR="translation.demo" OPENROUTER_API_KEY="your-key" make examples/C-project-name/docker 
 ```
 
 And trigger end-to-end translation:
 ```bash
-make examples/C-project-name/translate OPENROUTER_API_KEY="your-key"
+make examples/C-project-name/translate
 ```
 
 # Expected C project structure
@@ -76,11 +77,11 @@ All crates are organized under a Rust [workspace](https://doc.rust-lang.org/carg
 
 For example, running
 ```bash
-make docker
-TRANSLATION_DIR="translation.demo" make examples/templates/hello_world_lib/translate OPENROUTER_API_KEY="sk-..."
+TRANSLATION_DIR="translation.demo" OPENROUTER_API_KEY="sk-..." make examples/docker
+make examples/templates/hello_world_lib/translate
 ```
 
-This should produce the following translated folder structure:
+Should produce the following translated folder structure:
 ```
 📂examples/templates/hello_world_lib
  ┣ 📂test_case
@@ -129,7 +130,7 @@ The `MODEL` environment variable controls which LLM will be used, and should be 
 
 To run LLM-based memory-safe translation of a single project and save the translated Rust workspace in a newly created `TRANSLATION_DIR` sub-folder, run:
 ```bash
-TRANSLATION_DIR="translated_rust" make examples/C-project-name/translate OPENROUTER_API_KEY="sk-..."
+TRANSLATION_DIR="translation.demo" make examples/C-project-name/translate OPENROUTER_API_KEY="sk-..."
 ```
 
 If a project (library or executable) was not already found under `TRANSLATION_DIR`, our dependency chain will first trigger its memory-safe translation, followed by C FFI wrappers (only for libraries).
@@ -137,7 +138,7 @@ If a project (library or executable) was not already found under `TRANSLATION_DI
 # Usage with Anthropic API
 IDEAS can be used with any Anthropic model by setting the `PROVIDER`, `MODEL`, and `ANTHROPIC_API_KEY` variables:
 ```bash
-TRANSLATION_DIR="translated_rust" make examples/C-project-name/translate \
+TRANSLATION_DIR="translation.demo" make examples/C-project-name/translate \
   ANTHROPIC_API_KEY="sk-..." \
   PROVIDER="anthropic" \
   MODEL="claude-sonnet-4.6"
@@ -147,7 +148,7 @@ Note the `anthropic` prefix is missing from `MODEL` and is instead set as the `P
 # Usage with OpenAI API
 IDEAS can be used with any OpenAI model by setting the `PROVIDER`, `MODEL`, and `OPENAI_API_KEY` variables:
 ```bash
-TRANSLATION_DIR="translated_rust" make examples/C-project-name/translate \
+TRANSLATION_DIR="translation.demo" make examples/C-project-name/translate \
   OPENAI_API_KEY="sk-..." \
   PROVIDER="openai" \
   MODEL="gpt-5.4"
@@ -185,7 +186,7 @@ make VLLM_RECIPE=vllm serve Qwen/Qwen3.6-35B-A3B \
 
 Then, run IDEAS using:
 ```bash
-TRANSLATION_DIR="translated_rust" make examples/C-project-name/translate \
+TRANSLATION_DIR="translation.demo" make examples/C-project-name/translate \
   PROVIDER="hosted_vllm" \
   MODEL="Qwen/Qwen3.6-35B-A3B"
 ```
@@ -196,7 +197,7 @@ IDEAS has a submodule that automatically generates portable Rust C FFI tests for
 
 First, mount the project into the Docker image (from the host):
 ```bash
-TRANSLATION_DIR="translated_rust" make examples/templates/hello_world_lib/docker OPENROUTER_API_KEY="sk-..."
+TRANSLATION_DIR="translation.demo" make examples/templates/hello_world_lib/docker OPENROUTER_API_KEY="sk-..."
 ```
 
 This mounts the repository read-only and bind-mounts only `test_case` and `TRANSLATION_DIR` as writable, so the agent cannot reach the rest of the host.

@@ -25,9 +25,8 @@ VLLM_RECIPE = zai-org/GLM-5.2-FP8 \
     --reasoning-parser glm45 \
     --max-model-len auto## See https://recipes.vllm.ai/
 
-EXAMPLES_DIR := examples/Test-Corpus/Public-Tests
-EXAMPLES_BATTERY := B02_
-ALL_EXAMPLES := $(sort $(patsubst %/test_case,%,$(shell find ${EXAMPLES_DIR} -maxdepth 3 -name test_case -type d | grep -E '(${EXAMPLES_BATTERY})')))
+EXAMPLES_DIR := examples
+ALL_EXAMPLES := $(sort $(patsubst %/test_case,%,$(shell find ${EXAMPLES_DIR} -maxdepth 3 -name test_case -type d)))
 EXAMPLES ?= ${ALL_EXAMPLES}## List of examples to run on
 
 ifeq ($(EXAMPLES),)
