@@ -27,7 +27,7 @@ DOCKER_RUN = mkdir -p ${MAKEFILE_DIR}/docker/venv && docker run --rm \
     --mount type=bind,src=${MAKEFILE_DIR},dst=${MAKEFILE_DIR},readonly \
     --mount type=bind,src=${MAKEFILE_DIR}/docker/venv,dst=${MAKEFILE_DIR}/.venv \
     -w ${CURDIR} \
-    -e OPENROUTER_API_KEY -e OPENAI_API_KEY \
+    -e OPENROUTER_API_KEY -e ANTHROPIC_API_KEY -e OPENAI_API_KEY \
     -e RUSTFLAGS \
     -e GIT_AUTHOR_NAME -e GIT_AUTHOR_EMAIL
 USER_UID := $(shell id -u)

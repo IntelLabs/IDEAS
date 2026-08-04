@@ -130,7 +130,8 @@ The `MODEL` environment variable controls which LLM will be used, and should be 
 
 To run LLM-based memory-safe translation of a single project and save the translated Rust workspace in a newly created `TRANSLATION_DIR` sub-folder, run:
 ```bash
-TRANSLATION_DIR="translation.demo" make examples/C-project-name/translate OPENROUTER_API_KEY="sk-..."
+TRANSLATION_DIR="translation.demo" OPENROUTER_API_KEY="sk-..." make examples/C-project-name/docker
+make examples/C-project-name/translate 
 ```
 
 If a project (library or executable) was not already found under `TRANSLATION_DIR`, our dependency chain will first trigger its memory-safe translation, followed by C FFI wrappers (only for libraries).
@@ -138,8 +139,8 @@ If a project (library or executable) was not already found under `TRANSLATION_DI
 # Usage with Anthropic API
 IDEAS can be used with any Anthropic model by setting the `PROVIDER`, `MODEL`, and `ANTHROPIC_API_KEY` variables:
 ```bash
-TRANSLATION_DIR="translation.demo" make examples/C-project-name/translate \
-  ANTHROPIC_API_KEY="sk-..." \
+TRANSLATION_DIR="translation.demo" ANTHROPIC_API_KEY="sk-..." make examples/C-project-name/docker
+make examples/C-project-name/translate \
   PROVIDER="anthropic" \
   MODEL="claude-sonnet-4.6"
 ```
@@ -148,8 +149,8 @@ Note the `anthropic` prefix is missing from `MODEL` and is instead set as the `P
 # Usage with OpenAI API
 IDEAS can be used with any OpenAI model by setting the `PROVIDER`, `MODEL`, and `OPENAI_API_KEY` variables:
 ```bash
-TRANSLATION_DIR="translation.demo" make examples/C-project-name/translate \
-  OPENAI_API_KEY="sk-..." \
+TRANSLATION_DIR="translation.demo" OPENAI_API_KEY="sk-..." make examples/C-project-name/docker
+make examples/C-project-name/translate \
   PROVIDER="openai" \
   MODEL="gpt-5.4"
 ```
@@ -184,7 +185,7 @@ make VLLM_RECIPE=vllm serve Qwen/Qwen3.6-35B-A3B \
   --mm-encoder-tp-mode data vllm/serve
 ```
 
-Then, run IDEAS using:
+Then, run IDEAS on host using:
 ```bash
 TRANSLATION_DIR="translation.demo" make examples/C-project-name/translate \
   PROVIDER="hosted_vllm" \
@@ -195,9 +196,9 @@ TRANSLATION_DIR="translation.demo" make examples/C-project-name/translate \
 IDEAS has a submodule that automatically generates portable Rust C FFI tests for libraries and binary targets.
 `TRANSLATION_DIR` is overloaded to also hold the test generation results, so the same directory is used whether or not a translation was already produced in it.
 
-First, mount the project into the Docker image (from the host):
+First, mount the project into the Docker image:
 ```bash
-TRANSLATION_DIR="translation.demo" make examples/templates/hello_world_lib/docker OPENROUTER_API_KEY="sk-..."
+TRANSLATION_DIR="translation.demo" OPENROUTER_API_KEY="sk-..." make examples/templates/hello_world_lib/docker
 ```
 
 This mounts the repository read-only and bind-mounts only `test_case` and `TRANSLATION_DIR` as writable, so the agent cannot reach the rest of the host.
