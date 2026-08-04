@@ -6,13 +6,14 @@
 
 import logging
 from pathlib import Path
+from functools import cmp_to_key
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import astuple, dataclass, field, fields, replace
 from typing import get_args
 
 from clang.cindex import TranslationUnit, TranslationUnitLoadError, Diagnostic
-from clang.cindex import Cursor, CursorKind, SourceRange, TokenKind
+from clang.cindex import Cursor, CursorKind, SourceRange, TokenKind, Type, TypeKind
 from clang.cindex import PrintingPolicy, PrintingPolicyProperty, LinkageKind, StorageClass
 from clang.cindex import conf, SourceLocation, _CXString
 from ctypes import byref, pointer, c_size_t, c_char_p, c_uint
@@ -22,6 +23,109 @@ from .adapters import Code
 logger = logging.getLogger("ideas.ast")
 FILENAME = "file.c"
 CodeC = Code["c"]
+
+# Cursor kinds that become symbols, ranked by order in which they should be translated
+_KIND_RANK = {
+    CursorKind.ENUM_DECL: 0,
+    CursorKind.ENUM_CONSTANT_DECL: 0,
+    CursorKind.STRUCT_DECL: 1,
+    CursorKind.UNION_DECL: 1,
+    CursorKind.TYPEDEF_DECL: 1,
+    CursorKind.VAR_DECL: 2,
+    CursorKind.FUNCTION_DECL: 3,
+}
+
+
+@dataclass(frozen=True)
+class TypeShape:
+    # Declared hardest construct first, because `rank` reads the fields off in order. A
+    # `void *` leads: it cannot be given a meaningful Rust type until whatever it is cast
+    # to has been translated, and static analysis cannot recover that edge, so the more
+    # erased of two types sorts last.
+    void_pointers: int = 0
+    function_pointers: int = 0
+    unions: int = 0  # untagged unions need manual discrimination
+    pointers: int = 0
+    arrays: int = 0  # arrays and flexible array members
+    fields: int = 0
+
+    @property
+    def rank(self) -> tuple[int, ...]:
+        # Compared lexicographically, so the presence of a harder construct outweighs any
+        # amount of an easier one and no weights have to be invented to say which is worse
+        return astuple(self)
+
+    # Deliberately left unannotated so that `dataclass` does not treat these as fields
+    CURSOR_KINDS = (
+        CursorKind.STRUCT_DECL,
+        CursorKind.UNION_DECL,
+        CursorKind.TYPEDEF_DECL,
+        CursorKind.ENUM_DECL,
+    )
+    _ARRAY_KINDS = (
+        TypeKind.CONSTANTARRAY,
+        TypeKind.INCOMPLETEARRAY,
+        TypeKind.VARIABLEARRAY,
+        TypeKind.DEPENDENTSIZEDARRAY,
+    )
+    _FUNCTION_KINDS = (TypeKind.FUNCTIONPROTO, TypeKind.FUNCTIONNOPROTO)
+
+    @classmethod
+    def _ultimate_pointee(cls, c_type: Type) -> Type | None:
+        canonical = c_type.get_canonical()
+        while canonical.kind in cls._ARRAY_KINDS:
+            canonical = canonical.get_array_element_type().get_canonical()
+        if canonical.kind != TypeKind.POINTER:
+            return None
+        while canonical.kind == TypeKind.POINTER:
+            canonical = canonical.get_pointee().get_canonical()
+        return canonical
+
+    @classmethod
+    def from_cursor(cls, cursor: Cursor) -> "TypeShape":
+        if cursor.kind not in cls.CURSOR_KINDS:
+            return cls()
+
+        num_fields = num_void_ptrs = num_fn_ptrs = num_ptrs = num_arrays = num_unions = 0
+
+        # An inline anonymous record is presented both as a sibling declaration and as a
+        # child of the field that uses it, so nodes must only be counted once.
+        seen: set[tuple[str, str, str, str, int, int, int, int]] = set()
+
+        for node in cursor.walk_preorder():
+            if node.kind not in (CursorKind.UNION_DECL, CursorKind.FIELD_DECL):
+                continue
+            key = _cursor_key(node)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if node.kind == CursorKind.UNION_DECL:
+                num_unions += 1
+                continue
+
+            num_fields += 1
+            if node.type.get_canonical().kind in cls._ARRAY_KINDS:
+                num_arrays += 1
+
+            pointee = cls._ultimate_pointee(node.type)
+            if pointee is None:
+                continue
+            if pointee.kind == TypeKind.VOID:
+                num_void_ptrs += 1
+            elif pointee.kind in cls._FUNCTION_KINDS:
+                num_fn_ptrs += 1
+            else:
+                num_ptrs += 1
+
+        return cls(
+            void_pointers=num_void_ptrs,
+            function_pointers=num_fn_ptrs,
+            unions=num_unions,
+            pointers=num_ptrs,
+            arrays=num_arrays,
+            fields=num_fields,
+        )
 
 
 @dataclass(frozen=True)
@@ -38,8 +142,6 @@ class Symbol:
 
     # Symbol semantics
     is_definition: bool
-    is_variable: bool
-    is_function: bool
     is_global: bool
     is_system: bool
     is_top_level: bool
@@ -51,6 +153,15 @@ class Symbol:
     tu_preorder_index: int
     line_directive: CodeC | None
     declaration_line_directive: CodeC | None
+
+    # Structural summary of the type, empty for symbols that are not types
+    type_shape: TypeShape = field(default_factory=TypeShape)
+
+    @property
+    def difficulty(self) -> tuple[int, ...]:
+        # A sort key that puts the easiest symbol first: the symbol kind decides the
+        # ordering, and how complicated its type is only breaks ties within a kind.
+        return (_KIND_RANK[self.kind], *self.type_shape.rank)
 
     @classmethod
     def from_cursor(
@@ -74,8 +185,6 @@ class Symbol:
             declaration=get_cursor_code(decl, pretty_print=True) if decl else None,
             code=code,
             is_definition=cursor.is_definition(),
-            is_variable=cursor.kind == CursorKind.VAR_DECL,
-            is_function=cursor.kind == CursorKind.FUNCTION_DECL,
             is_global=cursor.linkage == LinkageKind.EXTERNAL,
             is_system=cursor.location.is_in_system_header,
             tu_path=Path(cursor.translation_unit.spelling).resolve(),
@@ -85,7 +194,28 @@ class Symbol:
             declaration_line_directive=_line_directive_for(decl),
             storage_class=cursor.storage_class,
             is_top_level=parent is None,
+            type_shape=TypeShape.from_cursor(parent_or_cursor),
         )
+
+    @property
+    def is_variable(self) -> bool:
+        return self.kind == CursorKind.VAR_DECL
+
+    @property
+    def is_function(self) -> bool:
+        return self.kind == CursorKind.FUNCTION_DECL
+
+    @property
+    def is_type(self) -> bool:
+        return self.kind in (
+            CursorKind.STRUCT_DECL,
+            CursorKind.UNION_DECL,
+            CursorKind.TYPEDEF_DECL,
+        )
+
+    @property
+    def is_struct(self) -> bool:
+        return self.kind == CursorKind.STRUCT_DECL
 
     def with_declaration(self, decl_symbol: "Symbol") -> "Symbol":
         return replace(
@@ -117,6 +247,7 @@ class TreeResult:
     complete_graph: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
     filename: str | None = None
     arguments: list[str] | None = None
+    local_names: frozenset[str] = field(default_factory=frozenset)
 
 
 def _synthesize_llm_context_declaration(cursor: Cursor, fallback_code: CodeC) -> str:
@@ -226,17 +357,14 @@ def extract_info_c(tu: TranslationUnit) -> TreeResult:
     )
     graph = {
         name: extract_referenced_symbols(reference_nodes[name], symbols.keys())
-        for name, symbol in symbols.items()
+        for name in symbols
     }
-    return TreeResult(symbols=symbols, complete_graph=graph)
-
-
-def extract_symbol_info_c(node: Cursor, parent: Cursor | None = None) -> dict[str, Symbol]:
-    tu_preorder_index_map = _cursor_order_map(node)
-    symbols, _ = _extract_symbol_info_c(
-        node, parent=parent, tu_preorder_index_map=tu_preorder_index_map
+    local_names = frozenset(
+        cursor.spelling
+        for cursor in tu.cursor.walk_preorder()
+        if cursor.spelling and not cursor.location.is_in_system_header
     )
-    return symbols
+    return TreeResult(symbols=symbols, complete_graph=graph, local_names=local_names)
 
 
 def _extract_symbol_info_c(
@@ -255,16 +383,7 @@ def _extract_symbol_info_c(
 
     # Add declarative nodes to symbols
     usr = node.get_usr()
-    # FIXME: Use node.kind.is_declaration()?
-    if node.kind in (
-        CursorKind.STRUCT_DECL,
-        CursorKind.UNION_DECL,
-        CursorKind.ENUM_DECL,
-        CursorKind.ENUM_CONSTANT_DECL,
-        CursorKind.FUNCTION_DECL,
-        CursorKind.VAR_DECL,
-        CursorKind.TYPEDEF_DECL,
-    ):
+    if node.kind in _KIND_RANK:
         symbols[usr] = Symbol.from_cursor(
             usr,
             node,
@@ -379,12 +498,12 @@ def get_cursor_code(cursor: Cursor, pretty_print: bool = False) -> CodeC:
     return code
 
 
-def clang_rename_(
-    tu: TranslationUnit, renames: dict[str, str], sources: dict[Path, bytes] | None = None
-):
-    logger.info(
-        f"Renaming {len(renames)} symbols in {tu.spelling}: {', '.join(renames.keys())}"
-    )
+def clang_rename(
+    tu: TranslationUnit, renames: dict[str, str]
+) -> dict[Path, dict[tuple[int, int], bytes]]:
+    renames_str = "\n    ".join([f"{k} => {v}" for k, v in renames.items()])
+    logger.info(f"Renaming {len(renames)} symbols in {tu.spelling}:\n    {renames_str}")
+
     # Group edits by file path and source offsets because cursor traversal may revisit tokens.
     edits_by_file: dict[Path, dict[tuple[int, int], bytes]] = {}
     assert tu.cursor is not None
@@ -412,11 +531,7 @@ def clang_rename_(
             extent = (token.extent.start.offset, token.extent.end.offset)
             edits_by_file.setdefault(file_path, {})[extent] = renames[target_usr].encode()
 
-    # Apply edits for each file and optionally save the pre-edit source snapshot.
-    for file_path, edits in edits_by_file.items():
-        if sources is not None and file_path not in sources:
-            sources[file_path] = file_path.read_bytes()
-        _apply_edits(file_path, edits)
+    return edits_by_file
 
 
 DEFINITION_START_TOKEN = {CursorKind.FUNCTION_DECL: "{", CursorKind.VAR_DECL: "="}
@@ -728,3 +843,110 @@ def mangle(name: str) -> str:
         name = "_" + name
 
     return name
+
+
+SymbolName = str
+SymbolGroup = tuple[SymbolName, ...]
+
+
+def create_symbol_lexical_key_fn(
+    symbols: dict[SymbolName, Symbol],
+    ast_order: dict[Path, TreeResult] | None = None,
+):
+    def compare_symbol_lexical(a: SymbolName | SymbolGroup, b: SymbolName | SymbolGroup) -> int:
+        # Support symbol groups by using the first symbol in the group.
+        a_name = a[0] if isinstance(a, tuple) else a
+        b_name = b[0] if isinstance(b, tuple) else b
+
+        a_symbol = symbols[a_name]
+        b_symbol = symbols[b_name]
+
+        a_tu = a_symbol.tu_path
+        b_tu = b_symbol.tu_path
+
+        # If symbols are from the same translation unit, compare their
+        # preorder traversal indices for lexical ordering.
+        if a_tu == b_tu:
+            return _cmp_symbol_tu_order(a_symbol, b_symbol)
+
+        if ast_order is None:
+            raise RuntimeError(
+                f"Cannot compare symbols from different translation units without ast_order: {a} ({a_tu}) vs {b} ({b_tu})."
+            )
+
+        # If a's USR appears in b's TU with matching code, both symbols are
+        # present in b_tu and can be compared by TU preorder index there.
+        b_ast = ast_order.get(b_tu)
+        if (
+            b_ast is not None
+            and a_name in b_ast.symbols
+            and b_ast.symbols[a_name].code == a_symbol.code
+        ):
+            return _cmp_symbol_tu_order(b_ast.symbols[a_name], b_symbol)
+
+        # If b's USR appears in a's TU with matching code, both symbols are
+        # present in a_tu and can be compared by TU preorder index there.
+        a_ast = ast_order.get(a_tu)
+        if (
+            a_ast is not None
+            and b_name in a_ast.symbols
+            and a_ast.symbols[b_name].code == b_symbol.code
+        ):
+            return _cmp_symbol_tu_order(a_symbol, a_ast.symbols[b_name])
+
+        # The symbol's USR is not shared across TUs, so fall back to ordering
+        # by the position of each symbol's TU in ast_order (source priority)
+        ast_rank = {path: i for i, path in enumerate(ast_order)}
+        try:
+            a_rank = ast_rank[a_tu]
+            b_rank = ast_rank[b_tu]
+        except KeyError as ex:
+            raise RuntimeError(
+                f"Cannot compare symbols because one or both translation units are missing from ast_order: {a_tu}, {b_tu}."
+            ) from ex
+
+        if a_rank < b_rank:
+            return -1
+        if a_rank > b_rank:
+            return 1
+        raise RuntimeError("Distinct translation units cannot have identical ranks!")
+
+    return cmp_to_key(compare_symbol_lexical)
+
+
+def create_symbol_ordering_key_fn(
+    symbols: dict[SymbolName, Symbol],
+    ast_order: dict[Path, TreeResult] | None = None,
+):
+    # Order symbols by translation difficulty, falling back to lexical source order. This
+    # only breaks ties between symbols that are incomparable in the dependency graph, so
+    # the difficulty preference is one the topological constraint silently overrides.
+    lexical_key = create_symbol_lexical_key_fn(symbols, ast_order)
+
+    def symbol_ordering_key(node: SymbolName | SymbolGroup):
+        # Rank a group by its hardest member, then break any remaining tie lexically
+        names = node if isinstance(node, tuple) else (node,)
+        return max(symbols[name].difficulty for name in names), lexical_key(node)
+
+    return symbol_ordering_key
+
+
+def _cmp_symbol_tu_order(symbol_a: Symbol, symbol_b: Symbol) -> int:
+    if symbol_a.tu_path != symbol_b.tu_path:
+        raise ValueError(
+            "Cannot compare TU preorder indices for symbols from different translation units:"
+            f" {symbol_a.name} @ {symbol_a.tu_path} vs {symbol_b.name} @ {symbol_b.tu_path}"
+        )
+
+    order_a = symbol_a.tu_preorder_index
+    order_b = symbol_b.tu_preorder_index
+    if order_a < order_b:
+        return -1
+    if order_b < order_a:
+        return 1
+    if symbol_a.name != symbol_b.name:
+        raise ValueError(
+            f"Unable to order distinct symbols with identical lexical priority and location:"
+            f" {symbol_a.name} @ {order_a} vs {symbol_b.name} @ {order_b}"
+        )
+    return 0

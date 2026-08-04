@@ -107,6 +107,10 @@ def validate_changes(code: CodeRust, template: CodeRust) -> OrderedDict[str, str
     template_nodes = get_nodes(template_root)
     allowed_change_nodes = get_macro_nodes(template_root, "unimplemented")
 
+    # If the template has no unimplemented!() markers there are no scope constraints
+    if not allowed_change_nodes:
+        return OrderedDict()
+
     scope_feedback = OrderedDict()
 
     # Check for top-level changes
@@ -172,9 +176,12 @@ def mangle(name: str) -> str:
     return name
 
 
-def _rust_node_signature(node: Node, source: bytes) -> str | None:
+def _rust_node_signature(node: Node, source: bytes, delete: bool = False) -> str | None:
     ntype = node.type
     if ntype in ("function_item", "function_signature_item"):
+        if delete:
+            return None
+
         # Find the block body and remove it
         body = node.child_by_field_name("body")
         if body:
@@ -186,7 +193,7 @@ def _rust_node_signature(node: Node, source: bytes) -> str | None:
     return source[node.start_byte : node.end_byte].decode()
 
 
-def get_signatures(code: CodeRust) -> CodeRust:
+def strip_fns(code: CodeRust, delete: bool = False) -> CodeRust:
     if not str(code).strip():
         return code
 
@@ -195,8 +202,8 @@ def get_signatures(code: CodeRust) -> CodeRust:
     parts: list[str] = []
 
     for node in root.children:
-        sig = _rust_node_signature(node, source)
-        if sig:
+        sig = _rust_node_signature(node, source, delete=delete)
+        if sig is not None:
             parts.append(sig)
 
     return CodeRust("\n".join(parts)) if parts else CodeRust("")

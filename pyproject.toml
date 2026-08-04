@@ -9,7 +9,7 @@ requires-python = "~=3.13.0"
 dependencies = [
     "clang==21.1.7",
     "dspy==3.1.2",
-    "kiss-agent-framework==2026.5.22",
+    "kiss-agent-framework[core]",
     "hydra-core==1.3.2",
     "networkx==3.6.1",
     "tomlkit>=0.14.0",
@@ -23,6 +23,7 @@ dev = [
     "pre-commit==4.2.0",
     "pytest==9.0.3",
     "ruff==0.13.0",
+    "vulture==2.16",
 ]
 
 [build-system]
@@ -47,3 +48,6 @@ line-length = 96
 # Ensure that the setuptools v81.0.0 is used whenever a package has a build dependency
 # on setuptools.
 build-constraint-dependencies = ["setuptools==81.0.0"]
+
+[tool.uv.sources]
+kiss-agent-framework = { git = "https://github.com/mariusarvinte/kiss_ai", rev = "f4f6cc1ef1fc5e2962aec6da71677be6e057f194" }
