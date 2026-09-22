@@ -6,12 +6,21 @@
 
 
 from textwrap import dedent
+
+import pytest
+
 from ideas import ast
-from clang.cindex import TranslationUnit, CursorKind
+from clang.cindex import TranslationUnit, CursorKind, Diagnostic
 
 
 def parse_c(code: str) -> TranslationUnit:
     return ast.create_translation_unit(ast.CodeC(code))
+
+
+def parse_errors(code: str) -> list[str]:
+    # Bypasses create_translation_unit, which raises instead of reporting diagnostics
+    tu = TranslationUnit.from_source("file.c", unsaved_files=[("file.c", code)])
+    return [d.spelling for d in tu.diagnostics if d.severity >= Diagnostic.Error]
 
 
 def test_basic_fns():
@@ -144,6 +153,60 @@ def test_forward_declaration():
     assert "c:@F@return_stuff" in tr.symbols
 
 
+def test_forward_declaration_of_anonymous_inline_tag_variable():
+    code = dedent(
+        """
+        struct { int x; } anon_var;
+        struct { int x; } anon_arr[3];
+        union { int a; float b; } anon_union_var;
+        enum { A, B } anon_enum_var;
+        struct Tag { int y; } tagged_var;
+        static struct StaticTag { int z; } static_tagged_var[] = {{0}};
+        """
+    )
+    tu = parse_c(code)
+    tr = ast.extract_info_c(tu)
+
+    declarations = {
+        symbol.spelling: symbol.forward_declaration
+        for symbol in tr.symbols.values()
+        if symbol.is_variable
+    }
+    assert declarations["anon_var"] is None
+    assert declarations["anon_arr"] is None
+    assert declarations["anon_union_var"] is None
+    assert declarations["anon_enum_var"] is None
+    assert str(declarations["tagged_var"]).strip() == "extern struct Tag tagged_var;"
+    # `static struct StaticTag static_tagged_var[];` is a tentative definition, and the tag
+    # it names is only completed by the definition this would stand in for
+    assert declarations["static_tagged_var"] is None
+
+
+def test_forward_declaration_of_anonymous_inline_tag_return_type():
+    # Each `struct { ... }` mints a distinct type, so repeating one in a prototype conflicts
+    # with the definition. No valid forward declaration exists for these.
+    code = dedent(
+        """
+        struct { int x; } anon_ret(void);
+        enum { A, B } anon_enum_ret(void);
+        struct Tag { int y; } tagged_ret(void);
+        int plain(int a);
+        """
+    )
+    tu = parse_c(code)
+    tr = ast.extract_info_c(tu)
+
+    declarations = {
+        symbol.spelling: symbol.forward_declaration
+        for symbol in tr.symbols.values()
+        if symbol.is_function
+    }
+    assert declarations["anon_ret"] is None
+    assert declarations["anon_enum_ret"] is None
+    assert str(declarations["tagged_ret"]).strip() == "struct Tag tagged_ret(void);"
+    assert str(declarations["plain"]).strip() == "int plain(int a);"
+
+
 def test_fake_quotes_unicode():
     # NOTE: Contains unicode character “
     code = dedent(
@@ -244,6 +307,50 @@ def test_nested_structs():
     # main depends upon x
     assert "c:@S@y" in tr.complete_graph["c:@F@main"]
     assert len(tr.complete_graph["c:@F@main"]) == 1
+
+
+def test_nested_structs_carry_their_bindgen_name():
+    code = dedent(
+        """
+        struct histindex {
+            struct record {
+                unsigned ptr;
+            } **records;
+        };
+
+        struct a {
+            struct b {
+                struct c {
+                    int x;
+                } cc;
+            } bb;
+        };
+
+        struct outer {
+            struct {
+                struct hidden { int x; } h;
+            } anon;
+        };
+
+        void use(struct histindex *h, struct a *p, struct outer *o) {}
+        """
+    )
+    tu = parse_c(code)
+    tr = ast.extract_info_c(tu)
+
+    # C keeps tags in a flat namespace, so the USR of a nested record is unqualified
+    assert tr.symbols["c:@S@histindex"].bindgen_name == "histindex"
+    assert tr.symbols["c:@S@record"].bindgen_name == "histindex_record"
+
+    # The whole chain is walked, not just the outermost declaration
+    assert tr.symbols["c:@S@c"].bindgen_name == "a_b_c"
+
+    # bindgen invents a counter-dependent name for an anonymous record, so it is as
+    # unnameable as anything nested inside it
+    assert tr.symbols["c:@S@hidden"].bindgen_name is None
+    assert any(
+        s.bindgen_name is None and s.kind == CursorKind.STRUCT_DECL for s in tr.symbols.values()
+    )
 
 
 def test_forward_typedef_struct():
@@ -708,6 +815,72 @@ def test_clang_make_extern_multiple_declarations(tmp_path):
     assert "{" not in transformed
 
 
+def test_clang_make_weak_definition_only(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            int f(int x);
+            int f(int x) {
+                return x + 1;
+            }
+            """
+        )
+    )
+
+    ast.clang_make_weak_(c_path, "f")
+    transformed = c_path.read_text()
+
+    assert "__attribute__((weak)) int f(int x) {" in transformed
+    assert transformed.count("__attribute__((weak))") == 1
+
+
+def test_clang_make_weak_is_idempotent(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            int f(int x) {
+                return x + 1;
+            }
+            """
+        )
+    )
+
+    ast.clang_make_weak_(c_path, "f")
+    once = c_path.read_text()
+    ast.clang_make_weak_(c_path, "f")
+
+    assert c_path.read_text() == once
+
+
+def test_clang_make_weak_missing_symbol(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text("int f(int x) { return x; }\n")
+
+    with pytest.raises(ValueError):
+        ast.clang_make_weak_(c_path, "main")
+
+
+def test_clang_make_extern_strips_weak_attribute(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            __attribute__((weak)) int f(int x) {
+                return x + 1;
+            }
+            """
+        )
+    )
+
+    ast.clang_make_extern_(c_path, "f")
+    transformed = c_path.read_text()
+
+    assert "__attribute__" not in transformed
+    assert transformed.strip() == "extern int f(int x);"
+
+
 def test_clang_make_global_multiple_declarations(tmp_path):
     c_path = tmp_path / "input.c"
     c_path.write_text(
@@ -727,6 +900,28 @@ def test_clang_make_global_multiple_declarations(tmp_path):
     assert "int v = 42;" in transformed
     assert "extern int v;" in transformed
     assert transformed.count("int v;") == 2
+
+
+def test_clang_make_global_variable_with_inline_struct_definition(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            static const struct typelen {
+                const char *type;
+                int length;
+            } typelen[] = {{"seconds", 1}, {"minutes", 60}};
+            """
+        )
+    )
+
+    ast.clang_make_global_(c_path, "typelen")
+    transformed = c_path.read_text()
+
+    assert "static" not in transformed
+    # The tag shares the variable's name, so a duplicated body would redefine the struct
+    assert transformed.count("struct typelen") == 1
+    assert parse_errors(transformed) == []
 
 
 def test_clang_make_bindable_function_multiple_declarations(tmp_path):
@@ -799,3 +994,172 @@ def test_clang_make_bindable_variable_array_without_initializer(tmp_path):
     transformed = c_path.read_text()
 
     assert transformed == "extern int array[3];\nint array[3];\n"
+
+
+def test_clang_make_bindable_variable_with_inline_struct_definition(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            static const struct typelen {
+                const char *type;
+                int length;
+            } typelen[] = {{"seconds", 1}, {"minutes", 60}};
+            """
+        )
+    )
+
+    ast.clang_make_bindable_(c_path, "typelen")
+    transformed = c_path.read_text()
+
+    # Aggregates already bind as `pub static`, so only the linkage change is needed and a
+    # synthesized declaration would redefine the tag
+    assert parse_errors(transformed) == []
+    assert "static" not in transformed
+    assert "extern" not in transformed
+    assert transformed.count("struct typelen") == 1
+
+
+def test_clang_make_bindable_variable_with_anonymous_struct_definition(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            static const struct {
+                int parent;
+                const char *name;
+            } items[] = {{1, "index"}, {2, "objects"}};
+            """
+        )
+    )
+
+    ast.clang_make_bindable_(c_path, "items")
+    transformed = c_path.read_text()
+
+    # An anonymous record has no spelling, so no extern declaration of `items` is expressible
+    assert parse_errors(transformed) == []
+    assert "static" not in transformed
+    assert "extern" not in transformed
+
+
+def test_clang_make_bindable_variable_with_inline_enum_values(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text("static const enum tag { A = 1, B = 2 } e = A;\n")
+
+    ast.clang_make_bindable_(c_path, "e")
+    transformed = c_path.read_text()
+
+    # The enumerator `=` must not be mistaken for the initializer
+    assert parse_errors(transformed) == []
+    assert transformed.count("enum tag") == 1
+
+
+def test_clang_rename_updates_declarations_and_call_sites(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            int main(int argc, char **argv);
+            int main(int argc, char **argv) {
+                return argv ? argc : 0;
+            }
+            int again(void) { return main(0, 0); }
+            """
+        )
+    )
+
+    ast.clang_rename_(c_path, {"main": "ideas_c_main"})
+    transformed = c_path.read_text()
+
+    assert parse_errors(transformed) == []
+    assert "main(" not in transformed.replace("ideas_c_main(", "")
+    assert transformed.count("ideas_c_main") == 3
+
+
+def test_clang_rename_typedef_leaves_same_spelled_tag_alone(tmp_path):
+    # Tags and ordinary identifiers are separate namespaces, so `typedef struct s s;`
+    # names two entities with one spelling; renaming the typedef must not touch the tag,
+    # whose definition may live in a file this rename never visits.
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            typedef struct session session;
+            struct session { int x; };
+            int get(session *s) { return s->x; }
+            """
+        )
+    )
+
+    tu = ast.create_translation_unit(c_path)
+    assert tu.cursor is not None
+    usr = next(
+        cursor.get_usr()
+        for cursor in tu.cursor.walk_preorder()
+        if cursor.kind == CursorKind.TYPEDEF_DECL and cursor.spelling == "session"
+    )
+    edits = ast.clang_rename(tu, {usr: "renamed_session"})[c_path.resolve()]
+    source = bytearray(c_path.read_bytes())
+    for (start, end), replacement in sorted(edits.items(), reverse=True):
+        source[start:end] = replacement
+    transformed = source.decode()
+
+    assert parse_errors(transformed) == []
+    assert "typedef struct session renamed_session;" in transformed
+    assert "struct session { int x; };" in transformed
+    assert "int get(renamed_session *s)" in transformed
+
+
+def test_clang_rename_updates_type_reference_in_macro_body(tmp_path):
+    header_path = tmp_path / "types.h"
+    header_path.write_text("typedef int old_type;\n#define CAST(value) ((old_type)(value))\n")
+    c_path = tmp_path / "input.c"
+    c_path.write_text('#include "types.h"\nold_type cast(int value) { return CAST(value); }\n')
+
+    tu = ast.create_translation_unit(c_path)
+    assert tu.cursor is not None
+    usr = next(
+        cursor.get_usr()
+        for cursor in tu.cursor.walk_preorder()
+        if cursor.kind == CursorKind.TYPEDEF_DECL and cursor.spelling == "old_type"
+    )
+    for path, edits in ast.clang_rename(tu, {usr: "new_type"}).items():
+        source = bytearray(path.read_bytes())
+        for (start, end), replacement in sorted(edits.items(), reverse=True):
+            source[start:end] = replacement
+        path.write_bytes(source)
+
+    assert "#define CAST(value) ((new_type)(value))" in header_path.read_text()
+    ast.create_translation_unit(c_path)
+
+
+def test_clang_rename_missing_symbol(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(ValueError):
+        ast.clang_rename_(c_path, {"main": "ideas_c_main"})
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        ("int main(void) { return 0; }\n", 0),
+        # Pre-C23 unspecified parameters read the same as `(void)` here
+        ("int main() { return 0; }\n", 0),
+        ("int main(int argc, char **argv) { return argv ? argc : 0; }\n", 2),
+        ("int main(int c, char **v, char **e) { return v && e ? c : 0; }\n", 3),
+    ],
+)
+def test_clang_function_arity(tmp_path, source, expected):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(source)
+
+    assert ast.clang_function_arity(c_path, "main") == expected
+
+
+def test_clang_function_arity_ignores_declarations(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text("int main();\nint main(int argc, char **argv) { return argc + !argv; }\n")
+
+    assert ast.clang_function_arity(c_path, "main") == 2

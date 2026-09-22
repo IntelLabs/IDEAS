@@ -81,18 +81,18 @@ class LinkCommand:
     def _is_link_command(arguments: list[str]) -> bool:
         if not arguments:
             return False
-        executable_basename = Path(arguments[0]).name
-        # Match exact names and versioned variants e.g. clang-21, gcc-13
-        if not any(
-            executable_basename == d or executable_basename.startswith(d + "-")
-            for d in _LINKERS
-        ):
+        if not _matches_tool(Path(arguments[0]).name, _LINKERS):
             return False
         # Must not be a compile-only step
         if "-c" in arguments:
             return False
         # Must have at least one object file input to distinguish from non-linker calls
         return any(arg.endswith(".o") for arg in arguments[1:])
+
+    @cached_property
+    def is_driver(self) -> bool:
+        # gcc/clang rather than the ld they exec
+        return _matches_tool(Path(self.arguments[0]).name, _COMPILERS)
 
     @classmethod
     def from_arguments(cls, arguments: list[str], working_dir: Path) -> "LinkCommand | None":
@@ -105,83 +105,134 @@ class LinkCommand:
         return cmd
 
     @cached_property
+    def _arg_pairs(self) -> list[tuple[str | None, str]]:
+        # argv normalized to (flag, operand) pairs; the glued `-L/opt` and separated
+        # `-L /opt` forms collapse to the same pair, and inputs come back as (None, arg)
+        pairs: list[tuple[str | None, str]] = []
+        it = iter(self.arguments[1:])  # skip argv[0]
+        for arg in it:
+            if arg in _IGNORED_FLAGS_WITH_ARG:
+                next(it, None)
+            elif flag := next((f for f in _LINK_FLAGS_WITH_ARG if arg.startswith(f)), None):
+                if value := arg[len(flag) :] or next(it, ""):
+                    pairs.append((flag, value))
+            elif not arg.startswith("-"):
+                pairs.append((None, arg))
+        return pairs
+
+    @cached_property
+    def _output_arg(self) -> str | None:
+        outputs = [v for flag, v in self._arg_pairs if flag == "-o"]
+        # No build generator emits two -o, so this means flags were injected from elsewhere
+        if len(outputs) > 1:
+            logger.warning(
+                "Linker invocation has %d -o flags (%s); using the last one as gcc/clang do",
+                len(outputs),
+                ", ".join(outputs),
+            )
+        return outputs[-1] if outputs else None
+
+    @cached_property
     def target(self) -> TargetName | None:
-        for i, arg in enumerate(self.arguments):
-            if arg == "-o" and i + 1 < len(self.arguments):
-                name = Path(self.arguments[i + 1]).name
-                # Strip version suffix from shared libraries: libfoo.so.1.2.3 -> libfoo.so
-                return re.sub(r"\.so(\.\d+)+$", ".so", name)
-        return None
+        if self._output_arg is None:
+            return None
+        # Strip version suffix from shared libraries: libfoo.so.1.2.3 -> libfoo.so
+        return re.sub(r"\.so(\.\d+)+$", ".so", Path(self._output_arg).name)
 
     @cached_property
     def output_path(self) -> Path | None:
-        for i, arg in enumerate(self.arguments):
-            if arg == "-o" and i + 1 < len(self.arguments):
-                p = Path(self.arguments[i + 1])
-                return (p if p.is_absolute() else self.working_dir / p).resolve()
-        return None
+        return None if self._output_arg is None else self._resolve(self._output_arg)
 
-    def _input_args(self) -> list[str]:
-        result = []
-        it = iter(self.arguments[1:])  # skip argv[0]
-        for arg in it:
-            if arg == "-o":
-                next(it, None)  # consume and discard the output path
-            elif not arg.startswith("-"):
-                result.append(arg)
-        return result
+    def _resolve(self, path: str) -> Path:
+        p = Path(path)
+        return (p if p.is_absolute() else self.working_dir / p).resolve()
 
     @cached_property
     def object_files(self) -> list[Path]:
-        objects: list[Path] = []
-        for arg in self._input_args():
-            p = Path(arg)
-            if p.suffix == ".o":
-                resolved = p if p.is_absolute() else self.working_dir / p
-                objects.append(resolved.resolve())
-        return objects
+        return [
+            self._resolve(v) for flag, v in self._arg_pairs if flag is None and v.endswith(".o")
+        ]
 
     @cached_property
-    def linked_binary_inputs(self) -> list[Path]:
-        binaries: list[Path] = []
-        for arg in self._input_args():
-            p = Path(arg)
-            if (".so" in p.name and p.suffix != ".o") or p.suffix == ".a":
-                resolved = p if p.is_absolute() else self.working_dir / p
-                binaries.append(resolved.resolve())
-        return binaries
+    def link_inputs(self) -> list[str | Path]:
+        # `-l` names (str) and library path inputs (Path) interleaved in command-line order:
+        # a library only resolves against inputs to its left, so the order is significant.
+        inputs: list[str | Path] = []
+        for flag, value in self._arg_pairs:
+            if flag == "-l":
+                inputs.append(value)
+            elif flag is None and is_library_file(Path(value)):
+                inputs.append(self._resolve(value))
+        return inputs
 
     @cached_property
-    def link_libs(self) -> list[str]:
-        return [arg[2:] for arg in self.arguments if arg.startswith("-l") and arg[2:]]
+    def link_search_dirs(self) -> list[Path]:
+        return [self._resolve(v) for flag, v in self._arg_pairs if flag == "-L"]
 
 
 _SOURCE_EXTS = {".c", ".cpp", ".cxx", ".cc", ".C", ".s", ".S", ".m"}
-_COMPILERS = {"gcc", "clang", "cc", "g++", "c++", "clang++"}
-_LINKERS = {
-    "gcc",
-    "clang",
-    "cc",
-    "g++",
-    "c++",
-    "clang++",
-    "ld",
-    "ld.bfd",
-    "ld.lld",
-    "ld.gold",
-    "lld",
-}
+_COMPILERS = frozenset({"gcc", "clang", "cc", "g++", "c++", "clang++"})
+_LINKERS = _COMPILERS | frozenset({"ld", "ld.bfd", "ld.lld", "ld.gold", "lld"})
 # CMake injects these dependency-tracking flags into every compile command.
 # They cause libclang to try writing .d files at relative paths that don't
 # exist during analysis, which fails TranslationUnit parsing.
 _DEP_FLAGS = frozenset({"-MD", "-MMD", "-MP", "-MG"})
 _DEP_FLAGS_WITH_ARG = frozenset({"-MF", "-MT", "-MQ"})
+# Linker flags whose operand may be glued to the flag or a separate argv entry
+_LINK_FLAGS_WITH_ARG = frozenset({"-o", "-L", "-l"})
+# Flags that likewise take a separate operand, but one we have no use for. Unlike the set
+# above these are matched exactly, never by prefix: the glued spellings that extend them
+# (-Bstatic, -fPIC, -znow) take no operand and would swallow the input that follows.
+_IGNORED_FLAGS_WITH_ARG = frozenset(
+    {
+        # file operands
+        "-plugin",
+        "-dynamic-linker",
+        "--dynamic-linker",
+        "-T",
+        "--script",
+        "-R",
+        "--just-symbols",
+        "-Map",
+        "--version-script",
+        "--dynamic-list",
+        "--retain-symbols-file",
+        "--out-implib",
+        "--exclude-libs",
+        "-F",
+        "--filter",
+        "-f",
+        "--auxiliary",
+        "--sysroot",
+        "-rpath",
+        "--rpath",
+        "-rpath-link",
+        "--rpath-link",
+        # name, symbol and value operands
+        "-h",
+        "-soname",
+        "--soname",
+        "-e",
+        "--entry",
+        "-u",
+        "--undefined",
+        "-y",
+        "--trace-symbol",
+        "--wrap",
+        "--defsym",
+        "-m",
+        "-z",
+        "-Xlinker",
+        "-B",
+    }
+)
 
 
 @dataclass
 class TargetOutputs:
     entries: list[CompileCommand]
-    link_libs: list[str]
+    link_inputs: list[str | Path]  # `-l` names and library paths, in link order
+    link_search_dirs: list[Path]  # the build's own -L flags
 
 
 @dataclass
@@ -221,72 +272,84 @@ class BuildDatabase:
         self,
         link_cmd: "LinkCommand",
         obj_map: dict[Path, CompileCommand],
-        binary_source_map: dict[Path, list[Path]],
-    ) -> list[CompileCommand]:
+        link_map: dict[Path, "LinkCommand"],
+    ) -> TargetOutputs:
         entries: list[CompileCommand] = []
+        link_inputs: list[str | Path] = []
+        search_dirs: list[Path] = []
         seen_sources: set[Path] = set()
         seen_binaries: set[Path] = set()
 
         def _collect(binary: Path) -> None:
-            if binary in seen_binaries:
+            if binary in seen_binaries or (producer := link_map.get(binary)) is None:
                 return
             seen_binaries.add(binary)
-            for inp in binary_source_map.get(binary, []):
-                if (entry := obj_map.get(inp)) is not None:
-                    # inp is a .o — add its compilation entry (dedup by source path)
+            # A flattened target inherits the link requirements of every library it absorbs
+            search_dirs.extend(producer.link_search_dirs)
+            for obj in producer.object_files:
+                if (entry := obj_map.get(obj)) is not None:
+                    # dedup by source path
                     if entry.source not in seen_sources:
                         seen_sources.add(entry.source)
                         entries.append(entry)
-                elif inp in binary_source_map:
-                    # inp is a .so/.a built in this project — recurse
-                    _collect(inp)
-                elif inp.suffix == ".o":
-                    # No compile command for this object file. System CRT objects
-                    # (crti.o, crtbeginS.o, etc.) under /usr are expected — log at
-                    # debug. Any other gap is unexpected and logged as a warning.
-                    if inp.is_relative_to(Path("/usr")):
-                        logger.debug(
-                            "Skipping system object file: %s (linked into %s)",
-                            inp,
-                            link_cmd.target,
-                        )
-                    else:
-                        logger.warning(
-                            "No compile command found for object file: %s (linked into %s)",
-                            inp,
-                            link_cmd.target,
-                        )
+                elif obj.is_relative_to(Path("/usr")):
+                    # System CRT objects (crti.o, crtbeginS.o, ...) have no compile command
+                    logger.debug(
+                        "Skipping system object file: %s (linked into %s)",
+                        obj,
+                        link_cmd.target,
+                    )
                 else:
-                    # External .so/.a not built in this project — skip but log so
-                    # the user can verify it is intentionally external.
-                    logger.debug("Skipping external binary input: %s", inp)
+                    logger.warning(
+                        "No compile command found for object file: %s (linked into %s)",
+                        obj,
+                        link_cmd.target,
+                    )
+            for inp in producer.link_inputs:
+                if isinstance(inp, Path) and inp in link_map:
+                    # a .so/.a built in this project — recurse, splicing its own link
+                    # requirements in at the position it occupied on the link line
+                    _collect(inp)
+                else:
+                    # an external library: keep it, path and all
+                    link_inputs.append(inp)
 
         if link_cmd.output_path:
             _collect(link_cmd.output_path)
-        return entries
+        return TargetOutputs(
+            entries=entries,
+            link_inputs=list(dict.fromkeys(link_inputs)),
+            link_search_dirs=list(dict.fromkeys(search_dirs)),
+        )
 
-    def resolve_targets(self) -> dict[TargetName, TargetOutputs]:
-        obj_map: dict[Path, CompileCommand] = {cmd.output: cmd for cmd in self.compile_commands}
-        binary_source_map: dict[Path, list[Path]] = {}
+    def _primary_link_commands(self) -> dict[Path, LinkCommand]:
+        # A driver execs ld, so bear captures two commands for one link. Keep the driver's since
+        # ld's line additionally carries CRT objects and the toolchain -l/-L the driver adds.
+        primary: dict[Path, LinkCommand] = {}
         for lc in self.link_commands:
             if lc.output_path is None:
                 continue
-            inputs = lc.object_files + lc.linked_binary_inputs
-            binary_source_map[lc.output_path] = inputs
+            prev = primary.get(lc.output_path)
+            if prev is None or lc.is_driver or not prev.is_driver:
+                primary[lc.output_path] = lc
+        return primary
+
+    def resolve_targets(self) -> dict[TargetName, TargetOutputs]:
+        obj_map: dict[Path, CompileCommand] = {cmd.output: cmd for cmd in self.compile_commands}
+        primary = self._primary_link_commands()
+        link_map: dict[Path, LinkCommand] = dict(primary)
+        for output_path, lc in primary.items():
             # Also index by the unversioned name (libfoo.so.1.2.3 → libfoo.so) so that
             # consumers referencing the symlink name are resolved transitively.
-            normalized = lc.output_path.parent / re.sub(
-                r"\.so(\.\d+)+$", ".so", lc.output_path.name
-            )
-            if normalized != lc.output_path:
-                binary_source_map[normalized] = inputs
+            normalized = output_path.parent / re.sub(r"\.so(\.\d+)+$", ".so", output_path.name)
+            if normalized != output_path:
+                link_map[normalized] = lc
         result: dict[TargetName, TargetOutputs] = {}
-        for link_cmd in self.link_commands:
+        for link_cmd in primary.values():
             assert link_cmd.target is not None
-            entries = self._collect_transitive_entries(link_cmd, obj_map, binary_source_map)
-            result[link_cmd.target] = TargetOutputs(
-                entries=entries, link_libs=link_cmd.link_libs
-            )
+            outputs = self._collect_transitive_entries(link_cmd, obj_map, link_map)
+            _warn_ambiguous_lib_files(link_cmd.target, outputs)
+            result[link_cmd.target] = outputs
         return result
 
     def write_outputs(self, output_dir: Path) -> None:
@@ -300,9 +363,40 @@ class BuildDatabase:
                 json.dumps([e.to_dict() for e in outputs.entries], indent=2)
             )
             link_entries: list[dict] = [{"source": str(e.source)} for e in outputs.entries]
-            link_entries += [{"lib": lib} for lib in outputs.link_libs]
+            link_entries += [{"search_dir": str(d)} for d in outputs.link_search_dirs]
+            link_entries += [
+                {"lib_path": str(i)} if isinstance(i, Path) else {"lib": i}
+                for i in outputs.link_inputs
+            ]
             (target_dir / "links.json").write_text(
                 json.dumps({"entries": link_entries}, indent=2)
+            )
+
+
+def is_library_file(path: Path) -> bool:
+    # libfoo.a, libfoo.so, versioned libfoo.so.1.2.13, and the unprefixed spelling
+    # (foo.so) that a CMake MODULE library or a plugin gets
+    return re.fullmatch(r".+\.(?:so(?:\.\d+)*|a)", path.name) is not None
+
+
+def _matches_tool(basename: str, tools: frozenset[str]) -> bool:
+    # exact names and versioned variants e.g. clang-21, gcc-13
+    return any(basename == t or basename.startswith(t + "-") for t in tools)
+
+
+def _warn_ambiguous_lib_files(target: TargetName, outputs: TargetOutputs) -> None:
+    # rustc can only re-link a path-named library as `-l:<file>` against a search path, so
+    # the exact directory is lost; warn when the filename is not unique across those dirs
+    lib_paths = [i for i in outputs.link_inputs if isinstance(i, Path)]
+    dirs = list(dict.fromkeys(outputs.link_search_dirs + [p.parent for p in lib_paths]))
+    for path in lib_paths:
+        matches = [d for d in dirs if (d / path.name).exists()]
+        if len(matches) > 1:
+            logger.warning(
+                "%s: %s exists in %s — the linker resolves it to the first match",
+                target,
+                path.name,
+                ", ".join(str(d) for d in matches),
             )
 
 

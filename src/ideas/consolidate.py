@@ -25,7 +25,8 @@ from ideas.tools import run_subprocess, Crate
 from ideas.ast_rust import mangle as mangle_rs
 from ideas.ast import extract_info_c, TreeResult, Symbol, clang_rename, mangle, CodeC
 from ideas.ast import SymbolName, SymbolGroup, create_symbol_lexical_key_fn
-from ideas.ast import create_symbol_ordering_key_fn
+from ideas.ast import create_symbol_ordering_key_fn, clang_make_weak_
+from ideas.agents.utils import write_instrumentation_script
 
 logger = logging.getLogger("ideas.consolidate")
 
@@ -69,18 +70,6 @@ def analyze(
     return symbols, sorted_symbol_groups
 
 
-def is_system_symbol(symbol: Symbol) -> bool:
-    if symbol.is_system:
-        logger.debug(f"Ignoring system symbol `{symbol.name}`")
-        return True
-    if symbol.presumed_path is None:
-        return False
-    if os.path.commonpath([symbol.presumed_path, symbol.tu_path]) == "/":
-        logger.debug(f"Ignoring system symbol {symbol.name}")
-        return True
-    return False
-
-
 def get_symbols_and_dependencies(
     asts: list[TreeResult],
     external_symbol_names: list[SymbolName] | None = None,
@@ -90,7 +79,7 @@ def get_symbols_and_dependencies(
     list_of_symbols: list[dict[SymbolName, Symbol]] = [ast.symbols for ast in asts]
     if filter_system_symbols:
         list_of_symbols = [
-            {name: symbol for name, symbol in symbols.items() if not is_system_symbol(symbol)}
+            {name: symbol for name, symbol in symbols.items() if not symbol.is_system}
             for symbols in list_of_symbols
         ]
 
@@ -111,9 +100,9 @@ def get_symbols_and_dependencies(
         external_symbol_names = [
             name
             for name, symbol in symbols.items()
-            if symbol.is_global
+            if symbol.is_externally_visible
             and (symbol.is_variable or (symbol.is_function and symbol.is_definition))
-            and not is_system_symbol(symbol)
+            and not symbol.is_system
         ]
     if external_symbol_names:
         paths = nx.multi_source_dijkstra_path(project_dependencies, external_symbol_names)
@@ -300,42 +289,102 @@ def _get_ast(
     return tree
 
 
+def _agreeing_types(
+    symbols_with_spelling: dict[SymbolSpelling, list[Symbol]],
+    type_references: dict[SymbolSpelling, set[SymbolSpelling]],
+) -> set[SymbolSpelling]:
+    # A tag spelling carries its keyword, so only a typedef can share a key with a function
+    # or a variable. Judging that key by anything but its type symbols would let an
+    # unrelated function decide what the typedef denotes.
+    types_with_spelling = {
+        spelling: type_symbols
+        for spelling, symbols in symbols_with_spelling.items()
+        if (type_symbols := [sym for sym in symbols if sym.is_type])
+    }
+    # Start from the types whose text agrees across TUs, then withdraw any that is written
+    # in terms of one that does not, until nothing changes: disagreement travels up the
+    # chain, so `typedef struct parser parser;` stops naming one type the moment the two
+    # `struct parser` completions differ. Only definitions are compared, because a TU that
+    # leaves a tag incomplete says nothing about what it is.
+    agreeing = {
+        spelling
+        for spelling, symbols in types_with_spelling.items()
+        if len({str(sym.code) for sym in symbols if sym.is_definition}) <= 1
+    }
+    # A spelling the corpus completes at most once has a single reading whatever it is
+    # written in terms of, so there is no second reading for disagreement to travel to.
+    settled = {
+        spelling
+        for spelling, symbols in types_with_spelling.items()
+        if sum(sym.is_definition for sym in symbols) <= 1
+    }
+    while withdrawn := {
+        s for s in agreeing - settled if not type_references.get(s, set()) <= agreeing
+    }:
+        agreeing -= withdrawn
+    return agreeing
+
+
+def _denotes_one_entity(definitions: list[Symbol], agreeing_types: set[SymbolSpelling]) -> bool:
+    # Identical text is never proof on its own, because text carries no context: what it
+    # means depends on what the names in it resolve to, and that is decided per TU.
+    if len({str(sym.code) for sym in definitions}) > 1:
+        return False
+
+    symbol = definitions[0]
+
+    # A type has no linkage to appeal to, so its identity is structural
+    if symbol.is_type:
+        return symbol.qualified_spelling in agreeing_types
+
+    # Only linkage joins separately written functions and variables into one entity, and
+    # internal linkage means each TU owns its own copy
+    if symbol.kind in (CursorKind.FUNCTION_DECL, CursorKind.VAR_DECL):
+        return all(sym.is_externally_visible and sym.is_top_level for sym in definitions)
+
+    return True
+
+
 def _get_conflicting_symbols(
     asts: list[TreeResult],
 ) -> dict[Path, dict[SymbolName, SymbolSpelling]]:
     # Gather best representative symbol per spelling per AST into a single dict
     symbols_with_spelling: dict[SymbolSpelling, list[Symbol]] = {}
+    # Pooled across TUs, because a type only has to disagree in one of them to be two types
+    type_references: dict[SymbolSpelling, set[SymbolSpelling]] = {}
     for ast in asts:
         seen: dict[SymbolSpelling, Symbol] = {}
-        for symbol in ast.symbols.values():
-            spelling = symbol.spelling
-            if not spelling:
+        for usr, symbol in ast.symbols.items():
+            if not symbol.spelling:
                 continue
+            spelling = symbol.qualified_spelling
 
-            if symbol.kind == CursorKind.STRUCT_DECL:
-                spelling = "struct " + spelling
-            if symbol.kind == CursorKind.UNION_DECL:
-                spelling = "union " + spelling
-            if symbol.kind == CursorKind.ENUM_DECL:
-                spelling = "enum " + spelling
+            # Save this symbol if we haven't seen it before, or replace it if it's a
+            # definition and the existing symbol is a declaration
+            if spelling not in seen or (
+                symbol.is_definition and not seen[spelling].is_definition
+            ):
+                seen[spelling] = symbol
 
-            # Save this symbol if we haven't seen it before
-            if spelling not in seen:
-                seen[spelling] = symbol
-            # Or replace it if it's a definition and existing symbol is a declaration
-            elif symbol.is_definition and not seen[spelling].is_definition:
-                seen[spelling] = symbol
+            if symbol.is_type:
+                type_references.setdefault(spelling, set()).update(
+                    ast.symbols[dep].qualified_spelling
+                    for dep in ast.complete_graph.get(usr, ())
+                    if ast.symbols[dep].is_type
+                )
         for spelling, sym in seen.items():
             symbols_with_spelling.setdefault(spelling, []).append(sym)
+
+    agreeing_types = _agreeing_types(symbols_with_spelling, type_references)
 
     # Find symbols with common spelling but different definitions across ASTs.
     # Group definitions by code to avoid O(n^2) pairwise comparison.
     tu_renames: dict[Path, dict[SymbolName, SymbolSpelling]] = {}
-    used_spellings = set(symbols_with_spelling.keys())
+    used_spellings = {sym.spelling for syms in symbols_with_spelling.values() for sym in syms}
     for ast in asts:
         used_spellings.update(ast.local_names)
     new_spellings: dict[tuple[Path, SymbolSpelling], SymbolSpelling] = {}
-    for spelling, symbols in symbols_with_spelling.items():
+    for symbols in symbols_with_spelling.values():
         # Only definitions and variables can conflict
         definitions = [s for s in symbols if s.is_definition or s.is_variable]
         if len(definitions) <= 1:
@@ -345,27 +394,17 @@ def _get_conflicting_symbols(
         if len({sym.presumed_path or sym.tu_path for sym in definitions}) <= 1:
             continue
 
-        # Byte-identical definitions are one entity redeclared, not a conflict
-        if len({str(sym.code) for sym in definitions}) <= 1:
+        # One entity redeclared in several TUs is not a conflict
+        if _denotes_one_entity(definitions, agreeing_types):
             continue
 
-        # Multiple distinct definitions exist - rename any symbol that can safely be
-        # renamed. Only true linker symbols (global functions and global variables) must
-        # preserve their spelling across TUs. Struct/union/enum tags and typedefs have
-        # no linker visibility in C, so they can differ freely between TUs. However,
-        # clang reports EXTERNAL linkage for all of these — including anonymous tags that
-        # inherit the name of their enclosing typedef — so we cannot rely on is_global
-        # to filter them out and must check the cursor kind explicitly.
-        NON_LINKED_KINDS = (
-            CursorKind.STRUCT_DECL,
-            CursorKind.UNION_DECL,
-            CursorKind.ENUM_DECL,
-            CursorKind.TYPEDEF_DECL,
-        )
+        # Distinct entities share a spelling, so rename the ones that can be renamed. A
+        # global function or variable is a linker symbol and has to keep its spelling; a
+        # type has no linker presence, so each TU may spell it however it likes.
         for sym in definitions:
-            if sym.is_system:
+            if sym.in_system_header:
                 continue
-            if sym.is_global and sym.is_top_level and sym.kind not in NON_LINKED_KINDS:
+            if sym.is_externally_visible and sym.is_top_level and not sym.is_type:
                 continue
 
             path = sym.presumed_path or sym.tu_path
@@ -458,16 +497,15 @@ def consolidate(
     for group in symbol_order:
         # Add forward declarations if more than one symbol in group
         if len(group) > 1:
+            # A synthesized declaration has no source line of its own to point at.
             for name in group:
                 symbol = symbols[name]
-                declaration = symbol.declaration
+                declaration = symbol.forward_declaration
                 if declaration is None:
                     continue
                 if declaration in sources:
                     continue
                 sources[declaration] = None
-                if include_line_directives and symbol.declaration_line_directive is not None:
-                    sources[declaration] = str(symbol.declaration_line_directive)
 
         # Add symbol code
         for name in group:
@@ -485,7 +523,7 @@ def consolidate(
     )
 
 
-def _generate_build_rs(extra_link_libs: list[str]) -> str:
+def _generate_build_rs(link_inputs: list[tuple[str, str]], link_search_dirs: list[str]) -> str:
     body_lines = [
         'println!("cargo:rerun-if-changed=src/lib.c");',
         'let ubsan = std::env::var("CARGO_FEATURE_CC_UBSAN").is_ok();',
@@ -506,7 +544,8 @@ def _generate_build_rs(extra_link_libs: list[str]) -> str:
         "}",
         "",
         "if asan {",
-        '    build.flag("-fsanitize=address")',
+        '    build.flag("-fsanitize=address,pointer-compare")',
+        '        .flag("-ftrivial-auto-var-init=pattern")',
         '        .flag("-fno-sanitize-recover=all");',
         "}",
         "",
@@ -525,8 +564,16 @@ def _generate_build_rs(extra_link_libs: list[str]) -> str:
         '    println!("cargo:rustc-link-lib=static=clang_rt.asan-x86_64");',
         "}",
     ]
-    for lib in extra_link_libs:
-        body_lines.append(f'println!("cargo:rustc-link-lib=dylib={lib}");')
+    # rustc-link-lib cannot express a path, so a library the C build named by absolute path
+    # has to be re-resolved as `-l:<file>` against a search dir added for its own directory
+    search_dirs = link_search_dirs + [
+        str(Path(value).parent) for kind, value in link_inputs if kind == "lib_path"
+    ]
+    for search_dir in dict.fromkeys(search_dirs):
+        body_lines.append(f'println!("cargo:rustc-link-search=native={search_dir}");')
+    for kind, value in link_inputs:
+        spec = f"dylib:+verbatim={Path(value).name}" if kind == "lib_path" else f"dylib={value}"
+        body_lines.append(f'println!("cargo:rustc-link-lib={spec}");')
     body = textwrap.indent("\n".join(body_lines), "    ")
     return f"fn main() {{\n{body}\n}}\n"
 
@@ -535,12 +582,12 @@ def _generate_bindings(symbols: dict[SymbolName, Symbol], c_src_path: Path) -> s
     allowed_functions = [
         mangle_rs(s.spelling)
         for s in symbols.values()
-        if s.is_global and s.is_function and s.is_definition and not is_system_symbol(s)
+        if s.is_externally_visible and s.is_function and s.is_definition and not s.is_system
     ]
     allowed_variables = [
         mangle_rs(s.spelling)
         for s in symbols.values()
-        if s.is_global and s.is_variable and not is_system_symbol(s)
+        if s.is_externally_visible and s.is_variable and not s.is_system
     ]
     return _bindgen(
         c_src_path,
@@ -586,12 +633,17 @@ def _main(cfg: ConsolidateConfig):
     # Read source priority and link libs from the links file.
     links_data = json.loads(cfg.links.read_text())
     source_priority: list[Path] = []
-    extra_link_libs: list[str] = []
+    link_inputs: list[tuple[str, str]] = []
+    link_search_dirs: list[str] = []
     for entry in links_data.get("entries", []):
         if "source" in entry:
             source_priority.append(Path(entry["source"]).resolve())
         elif "lib" in entry:
-            extra_link_libs.append(entry["lib"])
+            link_inputs.append(("lib", entry["lib"]))
+        elif "lib_path" in entry:
+            link_inputs.append(("lib_path", entry["lib_path"]))
+        elif "search_dir" in entry:
+            link_search_dirs.append(entry["search_dir"])
 
     symbols, symbol_order = analyze(cfg.compile_commands, source_priority)
     logger.info(
@@ -601,13 +653,37 @@ def _main(cfg: ConsolidateConfig):
     assert crate.lib_src_path is not None, "Expected lib.rs to exist in -sys crate!"
     c_src_path = crate.lib_src_path.with_suffix(".c")
 
-    # Consolidate and write C code to disk
+    # Consolidate and write C code to disk, then check that it compiles
     c_src = consolidate(symbols, symbol_order, cfg.include_line_directives)
     c_src_path.parent.mkdir(exist_ok=True, parents=True)
     c_src_path.write_text(str(c_src))
+    ok, _, error, _ = run_subprocess(["clang", "-fsyntax-only", "-w", str(c_src_path)])
+    if not ok:
+        raise ValueError(f"Consolidated C in {c_src_path} does not compile!\n{error}")
+
+    if cfg.template == "bin":
+        # The -sys bin target is `#![no_main]`, so C must own the entrypoint, and until `main`
+        # is wrapped it has to stay weak to avoid colliding with the libtest harness `main`
+        assert any(sym.spelling == "main" and sym.is_definition for sym in symbols.values()), (
+            f"Expected a `main` definition in {cfg.compile_commands}!"
+        )
+        clang_make_weak_(c_src_path, "main")
+
+        # Add dev dependencies for driving the binary through its entrypoint
+        crate.cargo_add(dep="assert_cmd@2.0.17", section="dev")
+        crate.cargo_add(dep="predicates@3.1.3", section="dev")
+
+    # Add dev dependencies common to every -sys crate
+    crate.cargo_add(dep="libc@0.2", section="dev")
+    crate.cargo_add(dep="insta@1.48.0", section="dev", features=["json"])
+    crate.cargo_add(dep="serde@1", section="dev", features=["derive"])
+    crate.cargo_add(dep="serde_json@1", section="dev")
+    crate.cargo_add(dep="walkdir@2", section="dev")
 
     # Write build.rs to disk with dependencies and the sanitizer/coverage config
-    (crate.cargo_toml.parent / "build.rs").write_text(_generate_build_rs(extra_link_libs))
+    (crate.cargo_toml.parent / "build.rs").write_text(
+        _generate_build_rs(link_inputs, link_search_dirs)
+    )
     crate.cargo_add("cc@1.2.53", section="build")
     crate.cargo_feature(cc_ubsan=[], cc_asan=[], cc_coverage=[])
 
@@ -616,17 +692,29 @@ def _main(cfg: ConsolidateConfig):
     if crate.main_src_path is not None:
         assert crate.lib_name is not None, "Expected a library target in the -sys crate!"
         crate.main_src_path.write_text(f"#![no_main]\nuse {crate.lib_name}::*;\n")
+        # `#![no_main]` suppresses the libtest harness `main` too, so a `--test` build of this
+        # bin target is just the C entrypoint; nextest would then choke on `--list`
+        crate.configure_target("bin", name=crate.name, test=False, doctest=False)
 
     # Write cargo configurations to disk
     # NOTE: We configure nextest for both the crate and the workspace such that the -sys crate is standalone
     crate.cargo_nextest_config(crate.cargo_toml.parent / ".config" / "nextest.toml")
     crate.cargo_nextest_config(crate.workspace_root / ".config" / "nextest.toml")
+    crate.vcs.add(crate.workspace_root / ".config")
+
+    # Write instrumentation script
+    write_instrumentation_script(
+        crate.cargo_toml.parent / "instrument.sh", features=["cc_asan", "cc_ubsan"]
+    )
 
     # Commit the crate
     crate.vcs.add(crate.cargo_toml.parent)
     workspace_cargo_toml = crate.workspace_root / "Cargo.toml"
     if workspace_cargo_toml != crate.cargo_toml and workspace_cargo_toml.exists():
         crate.vcs.add(workspace_cargo_toml)
+    workspace_cargo_lock = crate.workspace_root / "Cargo.lock"
+    if workspace_cargo_lock.exists():
+        crate.vcs.add(workspace_cargo_lock)
     crate.vcs.commit(f"Created C bindings crate '{crate.name}'")
 
 

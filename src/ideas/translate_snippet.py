@@ -7,23 +7,21 @@
 import logging
 import sqlite3
 from pathlib import Path
-from collections.abc import Callable
+from dataclasses import dataclass
 
 import dspy
-from dspy.utils.exceptions import AdapterParseError
-from dspy.utils.usage_tracker import track_usage
-from dspy.dsp.utils.settings import settings
 
 from .ast import CodeC
 from .ast_rust import CodeRust
-from .model import format_usage
+from .refine import CodeAttempt, Feedback, PredictSession
+from .model import predict
 
 
 logger = logging.getLogger("ideas.translate_snippet")
 
 
 class SnippetTranslatorSignature(dspy.Signature):
-    """
+    r"""
     Generate an idiomatic, memory-safe Rust translation of a single C definition.
 
     # Inputs
@@ -31,7 +29,10 @@ class SnippetTranslatorSignature(dspy.Signature):
     - `reference_code`: Existing Rust code the translation must build on. Use it as-is; do not refactor it.
     - `snippet`: The single C definition to translate.
     - `dependent_code`: C code that uses the snippet. Use it to determine concrete types for opaque and void pointers, ownership, lifetimes, and memory-management requirements; do not translate it.
-    - `prior_translation` and `feedback`: If provided, treat the feedback as a critique of the prior translation and address it in the new translation.
+    - `prior_translation`: a previous translation to fix, if any.
+    - `feedback`: a critique of `prior_translation` from running the program it was part of. Address it in the new translation.
+    - `build_feedback`: errors from `cargo build`. Address them.
+    - `scope_feedback`: violations of the hard constraints below. Address them.
 
     # Hard constraints
 
@@ -46,7 +47,7 @@ class SnippetTranslatorSignature(dspy.Signature):
 
     # Faithfulness to C semantics
 
-    The overarching rule: reproduce the C code's runtime behavior exactly. Do not "fix", simplify, or second-guess the C code's intent. For type definitions, use idiomatic Rust types that are semantically equivalent rather than structurally identical.
+    The overarching rule: reproduce the C code's runtime behavior exactly. Do not "fix", simplify, or second-guess the C code's intent. For type definitions, use idiomatic Rust types that are semantically equivalent rather than structurally identical. A Rust `std` method whose name resembles a C library function is rarely a drop-in for it; derive the behavior from the C function's definition rather than from the `std` method that matches its name.
 
     ## Arithmetic and expressions
 
@@ -61,7 +62,7 @@ class SnippetTranslatorSignature(dspy.Signature):
     ## Integer text parsing
 
     - Accept the full range of C-valid inputs, including negatives that wrap into unsigned types (`-1i32 as u8 == 255`).
-    - Always parse into a wide intermediate type that can represent the full C-valid input range before the final wrapping cast (at minimum `i64` for both narrow signed and narrow unsigned targets; `u64` is also acceptable where appropriate for unsigned-only flows), then apply a wrapping cast to the destination. Never parse digits directly as a narrow or unsigned destination type — that path rejects negatives and can overflow before the wrapping cast can run.
+    - Always parse into a wide intermediate type that can represent the full C-valid input range before the final wrapping cast (at minimum `i64` for both narrow signed and narrow unsigned targets; `u64` is also acceptable where appropriate for unsigned-only flows), then apply a wrapping cast to the destination. Never parse digits directly as a narrow or unsigned destination type, because that path rejects negatives and can overflow before the wrapping cast can run.
     - When the C code uses `scanf`/`sscanf`-style conversion, accept a leading numeric prefix and ignore trailing non-digit characters. Do not use bare `str::parse::<T>()` on the full trimmed string.
 
     ## scanf / sscanf behavior
@@ -75,46 +76,52 @@ class SnippetTranslatorSignature(dspy.Signature):
 
     - Treat any length-sensitive operation on a C string buffer (`strlen`, `%s`-style usage, comparisons, hashing, etc.) as ending at the first NUL byte.
     - For pointer+length inputs, classify semantics before decoding: if the C code treats the data as a string (`strcmp`, `strlen`, `%s`, token parsing, command dispatch, pattern matching), normalize at ingress by truncating at the first `\0`; if the C path is fixed-length or binary, preserve embedded `\0` bytes and honor the explicit length.
-    - When converting a NUL-terminated C string buffer into a Rust `String` for storage or downstream text processing, truncate at the first `\\0` *at the point of conversion*, not at the point of use. Stored string values that model C strings must never contain bytes at or after the NUL.
+    - When converting a NUL-terminated C string buffer into a Rust `String` for storage or downstream text processing, truncate at the first `\0` *at the point of conversion*, not at the point of use. Stored string values that model C strings must never contain bytes at or after the NUL.
     - Before any comparison, pattern match, token parse, or command dispatch on C-origin string data, normalize at ingress by truncating at the first NUL byte.
     - Apply the same normalization policy to all operands in the same logical operation. Do not compare a length-decoded value that still includes trailing `\0` bytes against a C-string-decoded value already truncated at `\0`.
     - When both pointer and length are present for string-style data, use length only as a safety bound for reads; derive semantic content from C string termination and stop at the first `\0`.
     - Truncate once at the ingestion boundary and pass only normalized string values to downstream logic. Do not defer truncation to arbitrary leaf helpers when values are stored or reused across operations.
     - Do not compare raw decoded Rust `String` values that may include trailing NUL bytes when those values represent C strings.
-    - This rule applies only when the original C code is treating the data as a NUL-terminated string (for example `strlen`, `%s`, string comparison, or string parsing). Do not truncate fixed-length, length-delimited, or binary buffers merely because they may contain `\\0`; preserve embedded NUL bytes unless the C code's semantics require string termination.
+    - This rule applies only when the original C code is treating the data as a NUL-terminated string (for example `strlen`, `%s`, string comparison, or string parsing). Do not truncate fixed-length, length-delimited, or binary buffers merely because they may contain `\0`; preserve embedded NUL bytes unless the C code's semantics require string termination.
 
     ## Fixed-buffer line input (`fgets`)
 
     - Do not replace `fgets(buf, N, stdin)` with `read_line` or a bulk `io::stdin().read()`. Both consume too much input.
-    - Replicate `fgets`: read at most N-1 bytes, stop after the first `'\\n'`, and leave all remaining input in stdin. Read byte-by-byte or use `BufRead::fill_buf` + `consume`.
-    - When storing or comparing `fgets` output as a Rust `String`, truncate at the first `'\\n'` or `'\\0'`, whichever comes first. `fgets` retains the newline before the NUL, and keeping it breaks C-style trimmed comparisons.
+    - Replicate `fgets`: read at most N-1 bytes, stop after the first `'\n'`, and leave all remaining input in stdin. Read byte-by-byte or use `BufRead::fill_buf` + `consume`.
+    - When storing or comparing `fgets` output as a Rust `String`, truncate at the first `'\n'` or `'\0'`, whichever comes first. `fgets` retains the newline before the NUL, and keeping it breaks C-style trimmed comparisons.
 
     ## Return values and pointer arithmetic
 
     - Return exactly what the C function returns. If C returns a success/failure code, do not substitute a byte count or length.
+    - C `main`'s return value becomes the process exit status, and a Rust `main` that returns `()` always exits 0. Translate a C `main` that can return non-zero as `pub fn main() -> std::process::ExitCode`, or call `std::process::exit` on those paths. Writing the error message to stderr without also setting the status is not a faithful translation.
     - C pointer subtraction (`end - start`) yields a count of elements, not bytes. Preserve the exact value.
 
     ## Pointer identity
 
     - When C compares pointers for identity, compare identity-equivalent Rust references. Cloning or copying changes identity and breaks the comparison.
     - Translate a C function that returns a pointer into a global/static container (e.g., `return &table[i]`) as a function returning `&T` into that container, not an owned clone.
-    - If the container is locked: acquire the lock in the caller and borrow `&T` from the held guard. If the existing accessor locks internally and returns an owned value, the caller must bypass it — lock the container directly, borrow references from the guard, and finish all identity comparisons before releasing.
+    - If the container is locked: acquire the lock in the caller and borrow `&T` from the held guard. If the existing accessor locks internally and returns an owned value, the caller must bypass it: lock the container directly, borrow references from the guard, and finish all identity comparisons before releasing.
 
     ## Void pointers (`void *`)
 
-    - A `void *` field or parameter is not inherently polymorphic. Inspect `dependent_code` to find every cast applied to the value. If all casts resolve to the same concrete type, translate the field using that concrete type (e.g., `Option<Box<ConcreteType>>`). Do not use `Box<dyn Any>`, `Box<dyn Trait>`, or any other type-erasure mechanism unless the pointer is genuinely polymorphic — i.e., cast to multiple structurally unrelated types in different code paths.
+    - A `void *` field or parameter is not inherently polymorphic. Inspect `dependent_code` to find every cast applied to the value. If all casts resolve to the same concrete type, translate the field using that concrete type (e.g., `Option<Box<ConcreteType>>`). Do not use `Box<dyn Any>`, `Box<dyn Trait>`, or any other type-erasure mechanism unless the pointer is genuinely polymorphic, i.e., cast to multiple structurally unrelated types in different code paths.
     - A `void *` used solely to break a forward-declaration cycle is not polymorphic. Resolve the concrete type from the casts and use it directly.
-    - When the `void *` is nullable in C (compared to `NULL`, initialized to `0`, or conditionally assigned), translate it as `Option<Box<T>>` if the containing struct owns the allocation (evidenced by `free` being called through this field), or as `Option<&T>` / `Option<&mut T>` if it is a non-owning reference.
+    - When the `void *` is nullable in C (compared to `NULL`, initialized to `0`, or conditionally assigned) and null is how C marks the field absent (see "What `Option` means"), translate it as `Option<Box<T>>` if the containing struct owns the allocation (evidenced by `free` being called through this field), or as `Option<&T>` / `Option<&mut T>` if it is a non-owning reference.
 
     ## Pointer fields in structs (`T *`, `T **`)
 
     Determine ownership from `dependent_code` before choosing a Rust type:
 
-    - If `free(field)` or equivalent is called through the struct, the struct owns the pointee. Use `Box<T>` for a single value or `Vec<T>` for a heap-allocated array. Wrap in `Option<>` if the pointer may be null.
+    - If `free(field)` or equivalent is called through the struct, the struct owns the pointee. Use `Box<T>` for a single value or `Vec<T>` for a heap-allocated array. Wrap in `Option<...>` only if null is how C marks this field absent (see "What `Option` means").
     - If the pointer is never freed through the struct (it aliases data owned elsewhere): use `&T` or `&mut T` with an appropriate lifetime.
     - If the field stores a heap array whose length is tracked separately (a C dynamic array): use `Vec<T>`, not `Box<[T]>`.
     - If the field is a fixed-length C array (`T arr[N]`): use `[T; N]`.
     - Do not use raw pointers (`*mut T`, `*const T`) as a shortcut when a safe owned or borrowed type is available.
+
+    ## What `Option` means
+
+    - When a field becomes `Option<...>`, `None` must correspond to exactly the condition the C code tests for absence. Find that test in `dependent_code` before choosing the type. It is often a null pointer, but it may equally be a sentinel index, a zero length or count, a tag selecting a union member, or a bit in a sibling flags word. An `Option` whose `None` means "the pointer was null" when C means "the bitmap says this slot is empty" is a different type, and every consumer of it will be wrong.
+    - Do not encode the same fact twice. If a sibling field already carries the validity, occupancy, or length information, keep that field authoritative and leave the governed field non-optional. A struct holding two encodings of one fact that can disagree has no correct interpretation.
 
     ## Mutable global state and locking
 
@@ -125,7 +132,7 @@ class SnippetTranslatorSignature(dspy.Signature):
     ## Binary parsers and slice contracts
 
     - Validate every length-derived slice with an explicit bounds check before slicing or copying.
-    - Never reinterpret payload bytes as headers, and never re-derive a chunk's length by re-parsing its payload — use `slice.len()` on the bytes the helper was given.
+    - Never reinterpret payload bytes as headers, and never re-derive a chunk's length by re-parsing its payload; instead use `slice.len()` on the bytes the helper was given.
     - When consuming bytes from a state-machine bitreader/bytestream, read directly from the reader. Do not reconstruct a backing slice and index into it; reconstructed slices may be short.
     - When the C source reads sequentially from a composite buffer (e.g., a primary `&[u32]` plus a trailing partial word), iterate through every component in order. Do not read only the primary array and silently drop the tail.
 
@@ -169,7 +176,6 @@ class SnippetTranslatorSignature(dspy.Signature):
 
     # Allowed External Crates
 
-    - `libc`: Raw FFI bindings to platform libraries like libc.
     - `openssl`: OpenSSL bindings
     - `flate2`: DEFLATE compression and decompression exposed as Read/BufRead/Write streams. Supports miniz_oxide and multiple zlib implementations. Supports zlib, gzip, and raw deflate streams.
     - `regex`: An implementation of regular expressions for Rust. This implementation uses finite automata and guarantees linear time matching on all inputs.
@@ -182,15 +188,80 @@ class SnippetTranslatorSignature(dspy.Signature):
     dependent_code: CodeC = dspy.InputField()
     prior_translation: CodeRust = dspy.InputField()
     feedback: str = dspy.InputField()
+    build_feedback: str = dspy.InputField()
+    scope_feedback: str = dspy.InputField()
     translation: CodeRust = dspy.OutputField()
 
 
-def _default_feedback_fn(translation: CodeRust) -> str:
-    return ""
+@dataclass(kw_only=True)
+class TranslationAttempt(CodeAttempt):
+    translation: CodeRust
+    name: str
+    snippet: CodeC
+
+    @property
+    def summary(self) -> str:
+        verb = "Translated" if self.success else "Failed to translate"
+        return f"{verb} snippet `{self.name}`"
 
 
-def _default_on_attempt(msg: str, pred: dspy.Prediction) -> None:
-    pass
+@dataclass
+class TranslationSession(PredictSession[TranslationAttempt, CodeRust]):
+    translator: "SnippetTranslator"
+    name: str
+    crate_code: CodeRust
+    reference_code: CodeRust
+    snippet: CodeC
+    dependent_code: CodeC
+    prior_translation: CodeRust | None = None
+    feedback: Feedback = Feedback()
+
+    @property
+    def _max_iters(self) -> int:
+        return max(self.translator.max_iters, 1)
+
+    def _prime(self) -> CodeRust | None:
+        # Use cache when no prior translation
+        if self.prior_translation is not None:
+            logger.info("Ignoring snippet cache...")
+            return None
+        # Special case for empty snippets: fall back to a static comment
+        if not str(self.snippet):
+            return CodeRust(f"// Empty snippet `{self.name}`")
+        translation = _read_cache(self.translator.cache, self.name, self.snippet)
+        return _make_public(translation) if translation is not None else None
+
+    def _attempt(
+        self, prior: TranslationAttempt | None, replay: CodeRust | None
+    ) -> TranslationAttempt:
+        if prior is None:
+            feedback, prior_translation = self.feedback, self.prior_translation
+        else:
+            feedback, prior_translation = prior.next_feedback, prior.translation
+        pred = self.translator.translate(
+            reference_code=self.reference_code,
+            snippet=self.snippet,
+            dependent_code=self.dependent_code,
+            prior_translation=prior_translation,
+            feedback=feedback.review,
+            build_feedback=feedback.build,
+            scope_feedback=feedback.scope,
+            translation=replay,
+        )
+
+        translation = pred.translation
+        assert isinstance(translation, CodeRust)
+        if translation in self.crate_code:
+            translation = CodeRust(f"// duplicate snippet `{self.name}` detected")
+        if translation == prior_translation:
+            logger.warning("Snippet translation loop detected!")
+        return TranslationAttempt(
+            translation=translation,
+            pred=pred,
+            prior_feedback=feedback,
+            name=self.name,
+            snippet=self.snippet,
+        )
 
 
 class SnippetTranslator(dspy.Module):
@@ -206,7 +277,7 @@ class SnippetTranslator(dspy.Module):
         self.max_iters = max_iters
         self.cache = _init_cache(cache)
 
-    def forward(
+    def session(
         self,
         name: str,
         crate_code: CodeRust,
@@ -214,87 +285,18 @@ class SnippetTranslator(dspy.Module):
         snippet: CodeC,
         dependent_code: CodeC,
         prior_translation: CodeRust | None = None,
-        feedback: str = "",
-        feedback_fn: Callable[[CodeRust], str] | None = None,
-        on_attempt: Callable[[str, dspy.Prediction], None] | None = None,
-    ) -> dspy.Prediction:
-        if feedback_fn is None:
-            feedback_fn = _default_feedback_fn
-        if on_attempt is None:
-            on_attempt = _default_on_attempt
-
-        logger.info(f"Translating snippet `{name}` ...")
-
-        # Use cache when no prior translation
-        if prior_translation is None and not str(snippet):
-            # Special case for empty snippets: fall back to a static comment
-            translation = CodeRust(f"// Empty snippet `{name}`")
-        elif prior_translation is None:
-            translation = _read_cache(self.cache, name, snippet)
-            if translation is not None:
-                translation = _make_public(translation)
-        else:
-            logger.info("Ignoring snippet cache...")
-            translation = None
-
-        pred = dspy.Prediction(feedback=feedback)
-        for i in range(max(self.max_iters, 1)):
-            # Use the translation from the prior iteration as feedback for the next iteration
-            if i > 0:
-                prior_translation = translation
-
-            # Use prior translation as the translation on first iteration only.
-            # This allows static translations that violate safety, which will be fixed by the LLM!
-            try:
-                pred = self.translate(
-                    reference_code=reference_code,
-                    snippet=snippet,
-                    dependent_code=dependent_code,
-                    prior_translation=prior_translation,
-                    feedback=pred.feedback,
-                    translation=translation if i == 0 else None,
-                )
-            except AdapterParseError:
-                logger.exception(
-                    f"DSPy exception while translating snippet `{name}` on iteration {i + 1}/{self.max_iters}!"
-                )
-                # If this is the last iteration, raise
-                if i == max(self.max_iters, 1) - 1:
-                    raise
-                # Otherwise attempt again before any build logic
-                continue
-
-            translation = pred.translation
-            assert isinstance(translation, CodeRust)
-            if translation in crate_code:
-                translation = CodeRust(f"// duplicate snippet `{name}` detected")
-            if translation == prior_translation:
-                logger.warning("Snippet translation loop detected!")
-            pred.name = name
-            pred.snippet = snippet
-            pred.crate_code = crate_code
-            pred.dependent_code = dependent_code
-            pred.prior_translation = prior_translation or CodeRust()
-            pred.translation = translation
-
-            parts = []
-            if CodeRust("#![forbid(unsafe_code)]") in translation:
-                parts.append("Do not include `#![forbid(unsafe_code)]` in the translation!")
-            if feedback := feedback_fn(translation):
-                parts.append(feedback)
-            pred.feedback = "\n\n".join(parts)
-            pred.success = not pred.feedback
-
-            if pred.success:
-                msg = f"Translated snippet `{name}`: {format_usage(pred)}"
-                logger.info(msg)
-                on_attempt(msg, pred)
-                break
-            else:
-                msg = f"Failed to translate snippet `{name}` ({i + 1}/{self.max_iters}): {format_usage(pred)}"
-                logger.error(msg)
-                on_attempt(msg, pred)
-        return pred
+        feedback: Feedback = Feedback(),
+    ) -> TranslationSession:
+        return TranslationSession(
+            translator=self,
+            name=name,
+            crate_code=crate_code,
+            reference_code=reference_code,
+            snippet=snippet,
+            dependent_code=dependent_code,
+            prior_translation=prior_translation,
+            feedback=feedback,
+        )
 
     def translate(
         self,
@@ -303,53 +305,25 @@ class SnippetTranslator(dspy.Module):
         dependent_code: CodeC,
         prior_translation: CodeRust | None,
         feedback: str,
+        build_feedback: str,
+        scope_feedback: str,
         translation: CodeRust | None,
     ) -> dspy.Prediction:
-        parent_usage_tracker = settings.usage_tracker
-        if translation is not None:
-            pred = dspy.Prediction(translation=translation)
-            if parent_usage_tracker is not None:
-                pred.set_lm_usage({})
-        else:
-            if parent_usage_tracker is None:
-                pred = self._translate(
-                    reference_code=reference_code,
-                    snippet=snippet,
-                    dependent_code=dependent_code,
-                    prior_translation=prior_translation or CodeRust(),
-                    feedback=feedback,
-                )
-            else:
-                with track_usage() as local_usage_tracker:
-                    pred = self._translate(
-                        reference_code=reference_code,
-                        snippet=snippet,
-                        dependent_code=dependent_code,
-                        prior_translation=prior_translation or CodeRust(),
-                        feedback=feedback,
-                    )
-                lm_usage = local_usage_tracker.get_total_tokens()
-                pred.set_lm_usage(lm_usage)
-                for lm_name, usage_entry in lm_usage.items():
-                    parent_usage_tracker.add_usage(lm_name, usage_entry)
-        return pred
+        inputs = {
+            "reference_code": reference_code,
+            "snippet": snippet,
+            "dependent_code": dependent_code,
+            "prior_translation": prior_translation or CodeRust(),
+            "feedback": feedback,
+            "build_feedback": build_feedback,
+            "scope_feedback": scope_feedback,
+        }
+        return predict(self._translate, inputs, "translation", translation)
 
-    def write_cache(self, pred: dspy.Prediction) -> None:
-        # If prediction was not generated by an LM then don't write it to cache
-        if not pred.get_lm_usage():
-            return
-
-        _write_cache(
-            self.cache,
-            pred.name,
-            pred.snippet,
-            pred.crate_code,
-            pred.dependent_code,
-            pred.prior_translation,
-            pred.feedback,
-            pred.translation,
-            pred.success,
-        )
+    def write_cache(self, attempt: TranslationAttempt) -> None:
+        # Re-caching a cache hit would just duplicate the entry it came from
+        if attempt.success and attempt.pred.get("was_generated", False):
+            _write_cache(self.cache, attempt.name, attempt.snippet, attempt.translation)
 
 
 def _init_cache(cache: Path | None) -> Path | None:
@@ -370,10 +344,6 @@ def _init_cache(cache: Path | None) -> Path | None:
                 success           INTEGER NOT NULL
             )
             """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_snippet_lookup"
-            " ON snippet_translations (name, snippet)"
         )
     return cache
 
@@ -406,7 +376,7 @@ def _make_public(translation: CodeRust) -> CodeRust:
     source = str(translation)
     from typing import Any
     from tree_sitter import Language, Parser, Query, QueryCursor
-    from tree_sitter_rust import language as rust_language
+    from tree_sitter_rust_orchard import language as rust_language
 
     language = Language(rust_language())
     parser = Parser(language)
@@ -612,30 +582,15 @@ def _write_cache(
     cache: Path | None,
     name: str,
     snippet: CodeC,
-    crate_code: CodeRust,
-    dependent_code: CodeC,
-    prior_translation: CodeRust,
-    feedback: str,
     translation: CodeRust,
-    success: bool,
 ):
     if cache is None:
         return
     with sqlite3.connect(cache) as conn:
         conn.execute(
-            """
-            INSERT INTO snippet_translations
-                (name, snippet, reference_code, dependent_code, prior_translation, feedback, translation, success)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                name,
-                str(snippet),
-                str(crate_code),
-                str(dependent_code),
-                str(prior_translation),
-                feedback,
-                str(translation),
-                int(success),
-            ),
+            "INSERT INTO snippet_translations"
+            " (name, snippet, reference_code, dependent_code, prior_translation, feedback,"
+            "  translation, success)"
+            " VALUES (?, ?, '', '', '', '', ?, 1)",
+            (name, str(snippet), str(translation)),
         )

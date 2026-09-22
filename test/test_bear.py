@@ -4,9 +4,24 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import logging
 from pathlib import Path
 
-from ideas.bear import BuildDatabase, CompileCommand, LinkCommand
+from ideas.bear import (
+    BuildDatabase,
+    CompileCommand,
+    LinkCommand,
+    TargetOutputs,
+    is_library_file,
+)
+
+
+def _libs(outputs: TargetOutputs) -> list[str]:
+    return [i for i in outputs.link_inputs if isinstance(i, str)]
+
+
+def _lib_files(outputs: TargetOutputs) -> list[str]:
+    return [i.name for i in outputs.link_inputs if isinstance(i, Path)]
 
 
 def test_resolve_targets_sphincs_build():
@@ -141,7 +156,7 @@ def test_resolve_targets_sphincs_build():
     assert "-DBLAKE_TR=1" not in next(
         e.arguments for e in targets["libblake.so"].entries if e.source == utils_c
     )
-    assert targets["libblake.so"].link_libs == []
+    assert _libs(targets["libblake.so"]) == []
 
     # libsphincs_core_det.so: sphincs sources, utils.c has -DBLAKE_TR=1
     sphincs_sources = [e.source for e in targets["libsphincs_core_det.so"].entries]
@@ -149,7 +164,7 @@ def test_resolve_targets_sphincs_build():
     assert "-DBLAKE_TR=1" in next(
         e.arguments for e in targets["libsphincs_core_det.so"].entries if e.source == utils_c
     )
-    assert targets["libsphincs_core_det.so"].link_libs == []
+    assert _libs(targets["libsphincs_core_det.so"]) == []
 
     # driver: transitive sources in order; utils.c appears exactly once (sphincs version)
     driver_sources = [e.source for e in targets["driver"].entries]
@@ -158,7 +173,98 @@ def test_resolve_targets_sphincs_build():
     assert "-DBLAKE_TR=1" in next(
         e.arguments for e in targets["driver"].entries if e.source == utils_c
     )
-    assert targets["driver"].link_libs == ["crypto"]
+    assert _libs(targets["driver"]) == ["crypto"]
+
+
+def test_resolve_targets_sqlite_tcl_absolute_library_path():
+    """
+    Models the sqlite build where `find_package(TCL)` makes CMake link the Tcl runtime by
+    absolute path (/usr/lib/x86_64-linux-gnu/libtcl8.6.so) instead of emitting -ltcl. The
+    library must be reported as a link lib, including transitively through libsqlite3.so.
+    """
+    build = Path("/build/test_case")
+    src = Path("/src/test_case/src")
+
+    sqlite3_c = src / "sqlite3.c"
+    tclsqlite_c = src / "tclsqlite.c"
+    shell_c = src / "shell.c"
+
+    lib_dir = build / "CMakeFiles/sqlite3_shared.dir/src"
+    shell_dir = build / "CMakeFiles/sqlite3_shell.dir/src"
+
+    libtcl = Path("/usr/lib/x86_64-linux-gnu/libtcl8.6.so")
+    libsqlite3 = build / "libsqlite3.so"
+    shell = build / "sqlite3"
+
+    compile_cmds = [
+        CompileCommand.from_arguments(
+            ["clang", "-c", str(sqlite3_c), "-o", str(lib_dir / "sqlite3.c.o")],
+            working_dir=build,
+        ),
+        CompileCommand.from_arguments(
+            ["clang", "-c", str(tclsqlite_c), "-o", str(lib_dir / "tclsqlite.c.o")],
+            working_dir=build,
+        ),
+        CompileCommand.from_arguments(
+            ["clang", "-c", str(shell_c), "-o", str(shell_dir / "shell.c.o")],
+            working_dir=build,
+        ),
+    ]
+    link_cmds = [
+        LinkCommand.from_arguments(
+            [
+                "clang",
+                "-shared",
+                "-o",
+                str(libsqlite3),
+                str(lib_dir / "sqlite3.c.o"),
+                str(lib_dir / "tclsqlite.c.o"),
+                str(libtcl),
+                "-lm",
+            ],
+            working_dir=build,
+        ),
+        LinkCommand.from_arguments(
+            [
+                "clang",
+                "-o",
+                str(shell),
+                str(shell_dir / "shell.c.o"),
+                str(libsqlite3),
+                str(libtcl),
+                "-lm",
+            ],
+            working_dir=build,
+        ),
+    ]
+    db = BuildDatabase(
+        compile_commands=[c for c in compile_cmds if c is not None],
+        link_commands=[lc for lc in link_cmds if lc is not None],
+    )
+    targets = db.resolve_targets()
+
+    assert [e.source for e in targets["libsqlite3.so"].entries] == [sqlite3_c, tclsqlite_c]
+    assert _libs(targets["libsqlite3.so"]) == ["m"]
+    assert _lib_files(targets["libsqlite3.so"]) == ["libtcl8.6.so"]
+
+    # The shell links libtcl8.6.so both directly and through libsqlite3.so — report it once
+    assert [e.source for e in targets["sqlite3"].entries] == [shell_c, sqlite3_c, tclsqlite_c]
+    assert _libs(targets["sqlite3"]) == ["m"]
+    assert _lib_files(targets["sqlite3"]) == ["libtcl8.6.so"]
+
+
+def test_is_library_file():
+    for name, expected in [
+        ("libtcl8.6.so", True),
+        ("libz.so.1.2.13", True),
+        ("libcrypto.a", True),
+        ("libssl.so", True),
+        ("tcl8.6.so", True),  # a plugin/MODULE library has no `lib` prefix
+        ("libfoo.dat", False),  # not a library
+        ("main.c.o", False),  # an object file, not a library
+        ("foo.sources", False),  # contains `.so` but is not one
+    ]:
+        assert is_library_file(Path("/usr/lib") / name) == expected, name
 
 
 def test_compile_command_strips_dep_tracking_flags():
@@ -293,6 +399,75 @@ def test_link_command_versioned_linker_recognized():
         assert cmd is not None, f"{linker} should be recognized as a linker"
 
 
+def test_link_command_ignores_operands_of_non_input_flags():
+    # shape of the internal `ld` invocation gcc execs: its flag operands look like inputs
+    build = Path("/build")
+    cmd = LinkCommand.from_arguments(
+        [
+            "ld",
+            "-plugin",
+            "/usr/lib/gcc/x86_64-linux-gnu/11/liblto_plugin.so",
+            "-m",
+            "elf_x86_64",
+            "-dynamic-linker",
+            "/lib64/ld-linux-x86-64.so.2",
+            "-z",
+            "now",
+            "-soname",
+            "libfoo.so.1",
+            "-R",
+            "syms.o",
+            "-o",
+            str(build / "libfoo.so.1"),
+            str(build / "main.c.o"),
+            "-lm",
+        ],
+        working_dir=build,
+    )
+    assert cmd is not None
+    assert cmd.target == "libfoo.so"
+    assert cmd.object_files == [build / "main.c.o"]
+    assert cmd.link_inputs == ["m"]
+
+
+def test_resolve_targets_prefers_driver_over_internal_ld():
+    # gcc execs ld, so both are captured for one link; the ld line adds CRT objects and
+    # toolchain libs that are not part of the build
+    build = Path("/build")
+    src = Path("/src")
+    main_o = build / "main.c.o"
+    mybin = build / "mybin"
+
+    compile_cmd = CompileCommand(
+        source=src / "main.c", output=main_o, arguments=[], working_dir=build
+    )
+    driver = LinkCommand.from_arguments(
+        ["gcc", "-o", str(mybin), str(main_o), "-lm"], working_dir=build
+    )
+    internal_ld = LinkCommand.from_arguments(
+        [
+            "ld",
+            "-o",
+            str(mybin),
+            "/usr/lib/x86_64-linux-gnu/Scrt1.o",
+            str(main_o),
+            "-L/usr/lib/gcc/x86_64-linux-gnu/11",
+            "-lm",
+            "-lgcc",
+            "-lc",
+        ],
+        working_dir=build,
+    )
+    assert driver is not None and internal_ld is not None
+
+    # the ld event is recorded second, so it must not win on ordering alone
+    db = BuildDatabase(compile_commands=[compile_cmd], link_commands=[driver, internal_ld])
+    targets = db.resolve_targets()
+    assert list(targets) == ["mybin"]
+    assert targets["mybin"].link_inputs == ["m"]
+    assert targets["mybin"].link_search_dirs == []
+
+
 def test_resolve_targets_static_archive_traversed():
     # A .a archive in linked_binary_inputs should be transitively traversed
     # just like a .so, as long as it has a corresponding link command.
@@ -333,9 +508,9 @@ def test_resolve_targets_static_archive_traversed():
     assert [e.source for e in targets["mybin"].entries] == [src / "main.c", src / "lib.c"]
 
 
-def test_resolve_targets_external_so_silently_skipped():
-    # A .so passed directly to the linker but not produced by any link command
-    # in the database (e.g. libssl.so) should be skipped without error.
+def test_resolve_targets_external_so_recorded_as_link_lib():
+    # A .so passed directly to the linker but not produced by any link command in the
+    # database (e.g. libssl.so) contributes no sources, but must still be linked.
     build = Path("/build")
     src = Path("/src")
 
@@ -361,6 +536,7 @@ def test_resolve_targets_external_so_silently_skipped():
     targets = db.resolve_targets()
     assert "mybin" in targets
     assert [e.source for e in targets["mybin"].entries] == [src / "main.c"]
+    assert _lib_files(targets["mybin"]) == ["libssl.so"]
 
 
 def test_resolve_targets_versioned_so_traversed():
@@ -405,3 +581,140 @@ def test_resolve_targets_versioned_so_traversed():
 
     assert "driver" in targets
     assert [e.source for e in targets["driver"].entries] == [src / "main.c", src / "lib.c"]
+
+
+def test_resolve_targets_link_search_dirs():
+    # `-lbar` only resolves if its directory is searched, so a library outside the default
+    # linker search path must contribute a search dir — whether it arrived as an absolute
+    # path or as `-L`. Both must also propagate from a nested project library.
+    build = Path("/build")
+    src = Path("/src")
+
+    lib_c_o = build / "lib.c.o"
+    main_c_o = build / "main.c.o"
+    libhelper = build / "libhelper.so"
+
+    compile_cmds = [
+        CompileCommand.from_arguments(
+            ["clang", "-c", str(src / "lib.c"), "-o", str(lib_c_o)],
+            working_dir=build,
+        ),
+        CompileCommand.from_arguments(
+            ["clang", "-c", str(src / "main.c"), "-o", str(main_c_o)],
+            working_dir=build,
+        ),
+    ]
+    link_cmds = [
+        LinkCommand.from_arguments(
+            [
+                "clang",
+                "-shared",
+                "-o",
+                str(libhelper),
+                str(lib_c_o),
+                "-L/opt/acme/lib",
+                "-lacme",
+            ],
+            working_dir=build,
+        ),
+        LinkCommand.from_arguments(
+            [
+                "clang",
+                "-o",
+                str(build / "mybin"),
+                str(main_c_o),
+                str(libhelper),
+                "/opt/zlib/lib/libz.so.1.2.13",
+                "-L",  # separated form
+                "../vendor/lib",
+                "-lm",
+            ],
+            working_dir=build,
+        ),
+    ]
+    db = BuildDatabase(
+        compile_commands=[c for c in compile_cmds if c is not None],
+        link_commands=[lc for lc in link_cmds if lc is not None],
+    )
+    targets = db.resolve_targets()
+
+    # `-L ../vendor/lib` must not be mistaken for an input, and resolves against working_dir
+    assert [e.source for e in targets["mybin"].entries] == [src / "main.c", src / "lib.c"]
+    # link order is preserved across both kinds, and libz keeps the full path it was
+    # named by rather than degrading to `-lz`
+    assert targets["mybin"].link_inputs == [
+        "acme",
+        Path("/opt/zlib/lib/libz.so.1.2.13"),
+        "m",
+    ]
+    assert targets["mybin"].link_search_dirs == [
+        Path("/vendor/lib"),
+        Path("/opt/acme/lib"),
+    ]
+
+
+def test_resolve_targets_warns_on_ambiguous_lib_file(tmp_path, caplog):
+    # `-l:libz.so.1.2.13` resolves against the search dirs in order, so the same filename
+    # in two of them may not be the file the C build pinned by absolute path.
+    vendor = tmp_path / "vendor"
+    zlib = tmp_path / "zlib"
+    for d in (vendor, zlib):
+        d.mkdir()
+        (d / "libz.so.1.2.13").touch()
+
+    build = tmp_path / "build"
+    main_o = build / "main.c.o"
+
+    compile_cmds = [
+        CompileCommand.from_arguments(
+            ["clang", "-c", str(tmp_path / "main.c"), "-o", str(main_o)],
+            working_dir=build,
+        ),
+    ]
+    link_cmds = [
+        LinkCommand.from_arguments(
+            [
+                "clang",
+                "-o",
+                str(build / "mybin"),
+                str(main_o),
+                f"-L{vendor}",
+                str(zlib / "libz.so.1.2.13"),
+            ],
+            working_dir=build,
+        ),
+    ]
+    db = BuildDatabase(
+        compile_commands=[c for c in compile_cmds if c is not None],
+        link_commands=[lc for lc in link_cmds if lc is not None],
+    )
+    with caplog.at_level(logging.WARNING, logger="ideas.bear"):
+        targets = db.resolve_targets()
+
+    assert _lib_files(targets["mybin"]) == ["libz.so.1.2.13"]
+    assert any(
+        "libz.so.1.2.13" in r.message and str(vendor) in r.message and str(zlib) in r.message
+        for r in caplog.records
+    )
+
+
+def test_link_command_repeated_output_warns(caplog):
+    # No generator emits two -o, but the drivers accept it and take the last — so do we
+    build = Path("/build")
+    with caplog.at_level(logging.WARNING, logger="ideas.bear"):
+        cmd = LinkCommand.from_arguments(
+            [
+                "clang",
+                "-o",
+                str(build / "first"),
+                str(build / "main.c.o"),
+                "-o",
+                str(build / "second"),
+            ],
+            working_dir=build,
+        )
+
+    assert cmd is not None
+    assert cmd.target == "second"
+    assert cmd.output_path == build / "second"
+    assert any("2 -o flags" in r.message for r in caplog.records)

@@ -5,37 +5,28 @@
 #
 
 
-import sys
-import os
 import logging
+import shutil
 import tempfile
 import textwrap
 import time
-import shutil
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 
 import hydra
 from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 
-from ideas import create_translation_unit, extract_info_c
 from ideas.agents.printer import ConsoleTee, LoggingConsolePrinter
-from ideas.agents.utils import (
-    RESTRICT_COVERAGE,
-    strip_line_directives,
-    write_instrumentation_script,
-    write_assert_script,
-    write_collect_script,
-    write_profile_list,
-)
-from ideas.consolidate import get_symbols_and_dependencies, is_system_symbol
+from ideas.agents.utils import finalize_tests, strip_line_directives, write_test_templates
+from ideas.agents.utils import TESTGEN_BOTTOM_UP, TESTGEN_FINISH_EARLY
+from ideas.agents.verifiers import get_fresh_copy, verification_service
 from ideas.tools import Crate
 
 from kiss.agents.sorcar.useful_tools import UsefulTools
 from kiss.core.kiss_agent import KISSAgent
-from kiss.core.kiss_error import KISSError
+from kiss.core.kiss_error import KISSError, BudgetExceededError
 
 logger = logging.getLogger("ideas.agents.generate_io_tests")
 
@@ -51,377 +42,289 @@ class TestgenConfig:
     budget: float = 4.0  # USD
     steps: int = 100
 
+    vcs: str = "none"
+
+
+class TestgenAgent(KISSAgent):
+    """Give the model its step count without token or budget telemetry."""
+
+    def _get_usage_info_string(self) -> str:
+        return f"Steps: {self.step_count}/{self.max_steps}"
+
+    def _can_finish(self) -> bool:
+        return self.step_count >= self._finish_step_threshold() or TESTGEN_FINISH_EARLY
+
+    def _finish_tool_description(self) -> str:
+        # The base description advertises the step gate that TESTGEN_FINISH_EARLY lifts.
+        if not TESTGEN_FINISH_EARLY:
+            return super()._finish_tool_description()
+        return (
+            "Finish with the final answer. Call this only once the inventory is exhausted: every "
+            "public function or mode is tested and verified, the coverage target is met, and every "
+            "remaining branch has been proven unreachable. Difficulty, slow progress, a long "
+            "trajectory, and the number of passing tests never justify finishing."
+        )
+
 
 @dataclass
 class TestgenInstructions:
-    overview: str = textwrap.dedent(
+    introduction: str = textwrap.dedent(
         """
-        # Overview
-        The working directory is {work_dir}. All paths are relative to the working directory.
-        You must work **strictly** inside {work_dir} and never read, write, or list anything outside it.
-        This directory is self-contained and holds everything you need.
-        Never use absolute paths that leave it, never use `..` to climb above it, and never `cd` out of it.
+        # Goal
+        Work **strictly** inside `{work_dir}`; all paths below are relative to it.
 
-        {work_dir} contains a Rust crate that links C code through the Rust C FFI.
-        Everything you need to know must be derived from the C source in `src/lib.c`.
-        The C source is amalgamated and has no `#include` directives.
-        Every declaration and definition you need is in the file.
-        Do not test or look for the definition of any functions with an `extern` declaration.
+        Your goal is to generate input/output tests in `{test_path}` and
+        reach at least {target_coverage}%% branch coverage without Undefined Behavior (UB).
 
-        Do not edit the `src/lib.c` file.
-        """
-    )
+        The amalgamated `src/lib.c` is the source of truth for the implementation-under-test.
+        Never edit it, its Rust bindings, the build files, `{instrument_path}`, or the supplied helpers.
+        Do not test or search for definitions of functions declared `extern`. Do not run `git``;
+        repository metadata is not provided, so inspect and compare files directly.
 
-    analyze_library: str = textwrap.dedent(
-        """
-        Public (exported) functions have pre-generated FFI bindings using `bindgen` in `src/lib.rs`.
-        The bindings and build files are correct and must not be changed.
-
-        Understand the C source and, for each public function, determine which parameters are input-only,
-        which are output-only (written by the callee) and which are modified in place.
-        This tells you how to set up inputs and where to capture outputs.
-
-        Note any logic that can loop forever and the conditions that trigger it.
-        Identify any input that would cause undefined behavior so you can avoid it.
-        The code can only be driven through calling public functions with their arguments set up,
-        environment variables (if any are used), and any input files it reads.
-        You cannot call private functions or edit the program to reach more code.
+        Identify and avoid all code paths that lead to infinite loops or hang execution waiting for
+        interactive inputs or network requests.
         """
     )
 
-    analyze_binary: str = textwrap.dedent(
+    library_top_down: str = textwrap.dedent(
         """
-        The C `main` function (correctly placed in `src/lib.c` and linked in)
-        is the entry point of the final executable.
-        The build files are correct and must not be changed.
-
-        Understand the C source and determine how the program uses `argc`/`argv`, whether it reads from stdin,
-        what it prints to stdout and stderr, and which exit codes it returns.
-
-        Decide whether the program is batch (runs and exits) or interactive (loops on stdin).
-        If interactive, find its exit condition.
-        Note any input that can loop forever, and any input that would cause undefined behavior so you can avoid it.
-        The code can only be driven through the `main` function: command-line arguments, stdin, environment
-        variables, and any input files it reads.
-        You cannot call any other function directly or edit the program to reach more code.
+        Start generating tests from the highest-level public functions: use implementation call
+        relationships to identify entry points and orchestration APIs that exercise substantial project
+        behavior. Give each one its smallest focused real-work success case, then work downward through
+        lower-level public primitives without skipping any inventory item or combining unrelated APIs.
         """
     )
 
-    analyze_instrumentation: str = textwrap.dedent(
+    library_bottom_up: str = textwrap.dedent(
         """
-        # Instrumentation
-        The `{instrument_path}` script instruments the tests for coverage and sanitizers.
-        It should not be modified and should always be executed to get accurate coverage results.
-        It takes a single argument selecting which test file to run, either `collect` or `io`:
+        Start generating tests from the lowest-level public functions: use implementation call
+        relationships to identify leaf APIs and foundational primitives used throughout the project.
+        Give each one its smallest focused real-work success case, then work upward through higher-level
+        entry points and orchestration APIs without skipping any inventory item or combining unrelated APIs.
+        """
+    )
+
+    library_scope: str = textwrap.dedent(
+        """
+        Do not change `src/lib.rs` or any build file. Inventory every public function by subsystem,
+        including inputs, outputs, mutations, return paths, errors, and file or environment effects. Read
+        each implementation and avoid inputs that hang or cause UB.
+
+        {library_breadth_order}
+
+        Drive the code only through public FFI bindings, environment variables, and input files. Never
+        call private functions or edit the program to reach code. Assert outputs, mutations, return values,
+        and file-system effects.
+        """
+    ).replace(
+        "{library_breadth_order}",
+        (library_bottom_up if TESTGEN_BOTTOM_UP else library_top_down).strip(),
+    )
+
+    binary_scope: str = textwrap.dedent(
+        """
+        Do not change any build file. Read C `main` completely and follow every dispatch entry and handler.
+        Understand every mode or subcommand with its flags, arguments, stdin, stdout, stderr, exit codes,
+        and file effects. Derive exit conditions and dangerous inputs from implementations, dispatch
+        tables, option parsers, and usage strings.
+
+        Drive the program through `main` using arguments, stdin, environment, and files, and reach what
+        `main` cannot by calling public functions directly through the `{lib_name}` FFI bindings already
+        imported by the test files. **Never** edit the program to reach code.
+
+        When calling `main`, assert stdout, stderr, exit codes, return values, mutations, and file-system effects.
+        """
+    )
+
+    portability: str = textwrap.dedent(
+        """
+        # Linux portability and isolation
+        Generated tests must behave identically in any fresh compatible Linux container; assume only the
+        supplied harness and project-declared dependencies.
+        Documented Linux kernel and `libc` contracts are allowed.
+
+        Every expected value and asserted file must trace to project code, a literal, an explicit test-owned input,
+        or such an OS contract; sandbox containment does not make an ambient value portable.
+        Generated tests may invoke only the target through supplied FFI or helpers. Neither a test nor its result may
+        depend, directly or indirectly, on unrelated executables, installed package data, daemons, network or DNS,
+        system or user configuration, caches, templates, account databases, or their presence, version, or contents.
+
+        Assume every environment value not fixed by the harness or test may be absent or arbitrary. Never use inherited
+        identity, account details, hostnames, paths, locale, timezone, proxy or tool settings, or other host values
+        to select a case, construct input, or form an exact expectation; assert only stable structure if exposed.
+
+        When the target searches defaults or imports external data, supply literal sandbox-owned data through its
+        public interface; never copy ambient files or discover host programs for fixtures.
+        A portability obstacle never permits skipping an item: replace the ambient input or assert a stable,
+        host-independent invariant, verify it, and continue the inventory.
+        """
+    )
+
+    workflow: str = textwrap.dedent(
+        """
+        If `src/lib.c` is too large for your context, never sample it or read it front to back. Locate
+        what you need with pinpointed searches: `rg` or `grep -n` for text such as strings, dispatch
+        tables, call sites, enums, and macros, and `ast-grep` for structure such as definitions,
+        signatures, and call patterns. Turn each match's line number into a bounded read with
+        `sed -n 'START,ENDp'`, widening the range only until the definition is complete. Record the
+        symbols and line ranges you resolve so you can return to them without rescanning.
+
+        Build a complete inventory and track every item as untested, basic, deep, or temporarily blocked.
+        Complete a test generation pass across the entire program before spending many attempts on one branch,
+        then return item by item.
+
+        **Never** give up early, test only a convenient subset, or leave a
+        large subsystem unexamined. Source size, complexity, slow coverage growth, and repeated failures
+        never justify narrowing the scope.
+
+        Call a branch unreachable only after reading its guard, tracing its public input path, and trying
+        the simplest safe input that satisfies it.
+
+        # Workflow
+        Read `{instrument_path}` once before editing so you understand every check, log, and reported
+        result; never edit it. Run tests only through:
         ```bash
         {instrument_path} collect
         {instrument_path} io
         ```
+        A successful `collect` prints only JSON values that changed in that run; all case files remain
+        under `{json_dir}` if you need to inspect one again.
 
-        Carefully read and understand this script, it is **critical** for correct measurements.
+        On failure, read the complete relevant
+        logs under `{sanitizer_dir}` and `{coverage_dir}`, classify the cause as UB, a wrong expectation,
+        or a hang, and fix the input or test. Count one test failing in several builds as one problem.
+        Never set sanitizer environment variables or assert sanitizer failure as expected.
+        Keep each test's body, inputs, calls, and expectations identical in every build;
+        never branch on Cargo features or sanitizer state.
 
-        Coverage is measured only if every test passes under every sanitizer build; if anything
-        fails, the script exits early and none of the coverage outputs below are generated.
-        {coverage_scope}
-          - `{coverage_dir}/coverage_summary.log`: the aggregate per-file and TOTAL coverage
-            summary table. Also printed to stdout under `Coverage summary:`.
-          - `{coverage_dir}/coverage_report.log`: the full per-line annotated coverage report,
-            including branch coverage details.
-          - `{coverage_dir}/uncovered_branches.log`: just the uncovered branches (a branch
-            whose True or False count is zero), or `none` if fully covered. Also printed to
-            stdout under `Uncovered branches:`.
+        Work in batches of generated tests:
+        1. Append collection cases to `{collect_path}` and run `{instrument_path} collect`.
+        2. Mirror them in `{test_path}` and run `{instrument_path} io`.
 
-        Running this script and inspecting its logs is the **only** allowed way to run the tests and get metrics.
-        You must never invoke `cargo test`, `cargo nextest`, `cargo llvm-cov`, or any other test runner directly,
-        and you must never derive coverage or output data by any other means.
-        Every test run must go through `{instrument_path} collect` or `{instrument_path} io`.
-        No ad-hoc or manual run can replace this script.
+        Run both steps before adding another batch. In `{collect_path}`, serialize outputs for assertion
+        tests; do not assert them. Append rather than rewriting the file or accumulating an unverified
+        batch. Target one public operation or mode that covers as many code branches as possible,
+        with only necessary setup and cleanup.
 
-        A sanitizer `FAIL` only means the test failed under that sanitizer build.
-        It does not necessarily mean the test exercises undefined behavior.
-        The script does not tell the two apart, so read `{sanitizer_dir}/<feature>.log`:
-          - A sanitizer diagnostic (`ERROR: AddressSanitizer:`, `runtime error:`,
-            `SUMMARY: UndefinedBehaviorSanitizer:`, or a stack trace into the C source) means the
-            input drives the C code into UB. Change that input, or drop the case.
-          - A Rust panic (`assertion ... failed`, `panicked at tests/...`) with no sanitizer
-            diagnostic is a normal test failure. Your expected value is wrong, so fix the test.
-          - A test killed for running too long is a hang, usually a program waiting on stdin.
-            Give it the input it waits for, or close its stdin.
+        Add the minimum state needed for behavior direct calls cannot reach;
+        then add interactions only when one call must create state for another.
+        Help, usage, version, and immediate validation failures do not count as basic
+        coverage. Give every test fresh state and one named behavior.
+        Prefer one call over a short chain and a short chain over a long one.
 
-        Read the whole report, not just the last error: a sanitizer diagnostic often appears inside
-        an assertion message. The same test failing under several features is one problem, not many.
-
-        The sanitizers are configured by this script.
-        Do not set or override `ASAN_OPTIONS`, `UBSAN_OPTIONS`, `LSAN_OPTIONS`, or any other sanitizer
-        variable, whether in a test, in the environment, or in a config file.
-        Never mark a test `#[ignore]`, comment it out, or otherwise skip it to get past a failure.
-        Silencing a check invalidates the whole result.
+        ## Test readability
+        **Always** prefer more shorter and simpler tests over fewer, longer, and more complex ones,
+        and prefer tests that use short, self-contained files over files containing an amalgamation of
+        tested behaviors.
         """
     )
 
-    goal_library: str = textwrap.dedent(
+    collection: str = textwrap.dedent(
         """
-        # Goal
-        Your goal is to write input/output C FFI tests to `{test_path}` that call public C functions
-        directly and verify their outputs with `assert!` or `assert_eq!`.
-        """
-    )
+        In `{collect_path}`, append below the marker and keep `use {lib_name}::*;` exactly as written. Call
+        public C functions through FFI. Record return values, output parameters, and mutations. Allocate
+        pointed-to data locally by idiomatically populating Rust `struct`s where needed.
+        Use NUL-terminated C strings. Do not hard-code addresses.
 
-    goal_binary: str = textwrap.dedent(
-        """
-        # Goal
-        Your goal is to write input/output tests to `{test_path}` that run the binary
-        and verify its stdout, stderr, and exit code.
+        Give every file test its own `sandbox("<test-name>")` and keep all paths inside it. Use `snapshot`
+        when the complete tree matters; otherwise record the relevant relative paths, existence or removal,
+        and stable bytes directly. Do not substitute hashes or sizes for contents. Finish each test with
+        one `save_case("<test-name>", &case)` containing every input and observed output.
         """
     )
 
-    goal_common: str = textwrap.dedent(
+    binary_collection: str = textwrap.dedent(
         """
-        You must achieve a branch coverage of at least {target_coverage}%.
-        You can **never** exercise UB (undefined behavior) in any test.
-        If you can no longer improve branch coverage (e.g., unreachable code without UB), you may early stop.
+        Give every test that calls `main` its own `sandbox("<test-name>")` and invoke it only with
+        `run(&dir, ...)`. The helper uses that sandbox for both the working directory and `HOME` and
+        records its file effects. Keep every path inside the sandbox and preserve the helper's normalized
+        `<program>` placeholder.
 
-        Reach this goal in three steps:
-
-        1. Collect input/output pairs in `{collect_path}`.
-           Use the `{instrument_path} collect` command to instrument the tests for coverage and sanitizers.
-
-        2. Improve branch coverage by appending more collection tests to `{collect_path}`.
-           Any data collection attempt that exercises UB will be detected by the instrumentation and rejected.
-
-        3. Write pure assertion I/O tests to `{test_path}` from the collected data.
-           Use the `{instrument_path} io` command to run a final verification of the coverage and sanitizers.
-           The coverage should exactly match the outcome of `{instrument_path} collect` and all tests should pass without exercising UB.
+        Record every program invocation in order. When file contents matter, read the relevant sandbox
+        files after the call and serialize that observation alongside the calls.
         """
     )
 
-    collect_common: str = textwrap.dedent(
+    assertion: str = textwrap.dedent(
         """
-        ## Step 1: Collect input/output pairs
+        In `{test_path}`, create exactly one pure assertion test per collection test. Hard-code expected
+        values as Rust literals; never read `{json_dir}` or `{collect_path}` or use `serde` or `serde_json`.
+        Replay calls in order and assert every return value, output, mutation, and file effect after each
+        step. Assert unrelated values separately and do not omit or weaken an assertion to make a test pass.
 
-        Collect input/output pairs of data by writing tests to `{collect_path}`.
+        Append below the marker and keep the statement `use {lib_name}::*;` **exactly** as written.
+        Reach C only through imported library items; never add raw `extern` declarations.
+        Compare integers and booleans exactly, floats with a small relative epsilon,
+        and pointed-to values rather than addresses.
 
-        These tests should not assert outputs, but serialize them using `serde` for later conversion
-        to expected value tests.
-
-        Build up complexity gradually, in two passes:
-
-        1a. Start with the simplest possible tests: one isolated invocation each, with straightforward inputs.
-            Cover the common path of every entry point this way before doing anything more elaborate.
-        1b. Only once the simple tests are collected and passing, add chained tests that perform several
-            invocations in sequence, where earlier invocations set up the state for later ones.
-
-        Prefer the simplest test that reaches a given behavior. Reach for a chained test only when the
-        behavior genuinely cannot be reached by a single invocation.
-
-        Keep tests short and contained, if possible: one behavior per test, named after that behavior.
-        Never grow an existing test to cover something new. Many small tests are better than a few large ones.
+        Give file tests their own sandbox. Assert a complete `snapshot` when the whole tree is behaviorally
+        relevant; otherwise assert relevant relative paths, existence or removal, and stable bytes directly.
+        Assert in-place state after every call in a chain.
         """
     )
 
-    collect_library: str = textwrap.dedent(
+    binary_assertion: str = textwrap.dedent(
         """
-        The `{collect_path}` file is pre-populated and imports every
-        FFI binding for the C library: all functions and all data structures.
-        Use them exactly as imported; do not redeclare or wrap them.
-
-        It also provides a helper that must be used and must not be changed:
-          - `save_case(name, case)` serializes any `Serialize` value to `{json_dir}/<name>.json`.
-
-        Append each new test below the
-        `// ==== Add collection tests below this line ====` marker.
-
-        Call each C function through its FFI binding, set up all of its inputs, and capture the resulting state.
-        For pointer parameters, allocate the pointed-to data as a local variable and pass a raw pointer to it;
-        never use hard-coded addresses. NUL-terminate any C strings, or the data will be silently corrupted.
-
-        Start with one test per public function, calling that function exactly once. Only after those exist
-        should you write chained tests that call several functions in sequence on shared state (for example an
-        init/update/finalize sequence, or a function whose output feeds the next function's input).
-
-        In a chained test, capture the intermediate state after every call,
-        not just the final one, so each step can be asserted later.
-
-        If a function reads or writes files, run it inside a fresh temporary directory unique to the test.
-        Create any input files there first, then capture the files the function creates or modifies
-        (their paths and contents) as part of the output state. Never touch shared or absolute system paths,
-        so the collection and I/O tests stay isolated and reproducible.
-
-        Each collection test should finish with a single `save_case("<test-name>", &case)`, writing one JSON
-        file to `{json_dir}/<test-name>.json` per collection test.
-        Write both inputs and outputs using the same data structure across all collection tests.
-        This data structure should contain the input and output state of all inputs
-        (in case functions modify data in-place) and any return value.
+        After every `main` call, assert stdout, stderr, exit code, changed and removed paths,
+        and no disk change where none was recorded.
         """
     )
 
-    collect_binary: str = textwrap.dedent(
+    completion_gated: str = textwrap.dedent(
         """
-        The `{collect_path}` file is pre-populated with two helpers that must be used and must not be changed:
-          - `run(args, stdin) -> Call` runs the binary once and returns its `stdout`, `stderr`,
-            and `exit_code`.
-          - `save_case(name, calls)` serializes an ordered slice of calls to `{json_dir}/<name>.json`.
+        Before the explicit `Only N steps left` warning, you can never call `finish`.
+        Difficulty, slow progress, and the number of passing tests do not change this gate.
 
-        Push every `Call` into a local `Vec` in the order it was made, and finish each test with a single
-        `save_case("<test-name>", &calls)`, passing the test's own function name.
-
-        Write one `#[test]` per collection test.
-        Append each new test to the end of the file, below the `// ==== Add collection tests below this line ====`
-        marker. Leave the helpers above that marker unchanged.
-
-        Start with tests that call `run` exactly once, covering each subcommand or mode on its own with simple
-        arguments and stdin. Only after those exist should you write chained tests that call `run` several times
-        in sequence, where earlier invocations set up state (files, configuration) for later ones. In a chained
-        test, push every call, so each intermediate invocation can be asserted later.
-
-        For programs with multiple subcommands or modes, cover each one, and cover sequential invocations
-        of subcommands in any relevant combination.
-
-        If the program reads or writes files, set up a fresh temporary directory unique to the test.
-        Create any input files there first, then capture the files the program creates or modifies
-        (their paths and contents) as part of the collected output. Never touch shared or absolute system paths,
-        so tests stay isolated and reproducible.
-
-        Each collection test produces one file, `{json_dir}/<test-name>.json`, holding the test `name`
-        and its ordered `calls`. Each call has its `args` and `stdin` inputs and its `stdout`, `stderr`,
-        and `exit_code` outputs. The script empties `{json_dir}` before every collection run, so the
-        files left there always match the tests in `{collect_path}`.
+        Once the warning appears, make `{test_path}` mirror `{collect_path}` exactly,
+        run `{instrument_path} io`, and call `finish` with a brief report.
         """
     )
 
-    improvement: str = textwrap.dedent(
+    completion_early: str = textwrap.dedent(
         """
-        # Step 2: Improve branch coverage
+        You may call `finish` only once the inventory is exhausted: every item is tested and verified,
+        the coverage target is met, and every branch you left uncovered has been proven unreachable by
+        reading its guard and tracing its public input path. Difficulty, slow progress, a long
+        trajectory, repeated failures, and the number of passing tests never justify finishing; keep
+        working item by item while any untested item or untried input remains.
 
-        After initial data collection, focus on adding more tests to increase branch coverage.
-        Ensure that additions do not introduce undefined behavior (UB).
-
-        To review the current coverage status, execute:
-        ```bash
-        cat {coverage_dir}/coverage_summary.log
-        ```
-
-        To review a summary of the current uncovered code branches, execute:
-        ```bash
-        cat {coverage_dir}/uncovered_branches.log
-        ```
-
-        To review the current uncovered code branches in detail and the complete report, execute:
-        ```bash
-        cat {coverage_dir}/coverage_report.log
-        ```
-
-        Carefully reason about code paths and behavior to identify program states that may lead to uncovered branches.
-
-        Keep preferring the simplest test that covers a branch: first try new inputs to a single invocation,
-        and only chain invocations when a branch depends on state left behind by an earlier one.
+        Before finishing, make `{test_path}` mirror `{collect_path}` exactly,
+        run `{instrument_path} io`, and call `finish` with a brief report.
+        If the `Only N steps left` warning arrives first, wrap up as instructed and finish then.
         """
     )
 
-    assert_common: str = textwrap.dedent(
+    completion: str = textwrap.dedent(
         """
-        # Step 3: Write pure assertion I/O tests
-
-        Once branch coverage is satisfactory, write the pure assertion I/O tests to `{test_path}`
-        using the data collected in the `{json_dir}` JSON files.
-
-        Write one I/O test per collection test, reading the expected values from the matching JSON file.
-        These tests must be pure: hard-code the expected values as plain Rust literals and do not depend on
-        `serde`, `serde_json`, the `{json_dir}` files, or the `{collect_path}` file in any way. Each test must
-        set up its own inputs and assert every recorded output, so it still passes if moved to another crate.
-
-        An I/O test must mirror the structure of the collection test it came from. For a chained collection test,
-        replay the same sequence in the same order and assert the recorded intermediate state after every step,
-        not only the final result. An intermediate step that is not asserted is a missing assertion.
-
-        Do not skip any assertion, and do not weaken one just to make a test pass.
+        # Completion
+        A passing instrumentation or pristine verification run proves only that the current batch is
+        valid; it never means the task is complete.
+        {completion_gate}
         """
-    )
-
-    assert_library: str = textwrap.dedent(
-        """
-        The `{test_path}` file is pre-populated with `use {lib_name}::*;`, the same FFI bindings
-        `{collect_path}` imports. Append each new test to the end of the file, below the
-        `// ==== Add assertion tests below this line ====` marker.
-
-        For each JSON file, reconstruct the recorded input state as Rust literals, call the C function through
-        its FFI binding, and assert that every output field matches the recorded output state:
-          - use `assert_eq!` for integer and boolean fields;
-          - for floating-point fields, compare with a small relative epsilon rather than exact equality;
-          - for pointer outputs, dereference the pointer and compare the pointed-to value, not the address;
-          - for files the function created or modified, recreate the recorded inputs in a fresh temporary
-            directory and assert the resulting file paths and contents.
-
-        For a chained case, call the same functions in the same order and assert the recorded state after each
-        call, including any state modified in place by an earlier call.
-        """
-    )
-
-    assert_binary: str = textwrap.dedent(
-        """
-        The `{test_path}` file is pre-populated with a helper that must be used and must not be changed:
-          - `run(args, stdin) -> Call` runs the binary once and returns its `stdout`, `stderr`,
-            and `exit_code`.
-
-        This is the only way you may run the binary. It uses `stdbuf -e0 -o0`, exactly like the
-        collection helper, so it sees the same unbuffered output the recorded values came from.
-        Never use `Command::cargo_bin` or `std::process::Command` in this file.
-        It is the collection helper without the recording, so a collection test body carries over as is:
-        drop the `Vec` and the `save_case` call, and assert each `Call` instead.
-
-        Append each new test to the end of the file, below the
-        `// ==== Add assertion tests below this line ====` marker, and leave the helper above it unchanged.
-
-        For each JSON file, replay its `calls` in order and assert each one against literals:
-
-        ```rust
-        let call = run(&["-E", "-"], Some("int x;\\n"));
-        assert_eq!(call.exit_code, 0);
-        assert_eq!(call.stdout, "int x;\\n");
-        assert_eq!(call.stderr, "");
-        /// TODO: File state assertions, if any
-        ```
-
-        When a value changes between runs (temporary paths, PIDs), assert the stable part with
-        `predicates::str::contains`. For files the program created or changed, recreate the recorded
-        inputs in a fresh temporary directory and assert the resulting paths and contents.
-
-        Assert every call in the sequence, not just the last one.
-        """
-    )
-
-    finish: str = textwrap.dedent(
-        """
-        Once the target coverage is achieved and all I/O tests are written, exit immediately.
-        Do not generate extensive reports or perform redundant sanity checks.
-        """
+    ).replace(
+        "{completion_gate}",
+        (completion_early if TESTGEN_FINISH_EARLY else completion_gated).strip(),
     )
 
     library: str = (
-        overview
-        + analyze_library
-        + analyze_instrumentation
-        + goal_library
-        + goal_common
-        + collect_common
-        + collect_library
-        + improvement
-        + assert_common
-        + assert_library
-        + finish
+        introduction
+        + library_scope
+        + portability
+        + workflow
+        + collection
+        + assertion
+        + completion
     )
     binary: str = (
-        overview
-        + analyze_binary
-        + analyze_instrumentation
-        + goal_binary
-        + goal_common
-        + collect_common
-        + collect_binary
-        + improvement
-        + assert_common
-        + assert_binary
-        + finish
+        introduction
+        + binary_scope
+        + portability
+        + workflow
+        + collection
+        + binary_collection
+        + assertion
+        + binary_assertion
+        + completion
     )
 
 
@@ -429,20 +332,18 @@ cs = ConfigStore.instance()
 cs.store(name="generate_io_tests", node=TestgenConfig)
 
 
-def get_tools():
-    useful_tools = UsefulTools()
+def get_tools(work_dir: Path):
+    useful_tools = UsefulTools(work_dir=str(work_dir))
     return [useful_tools.Bash, useful_tools.Read, useful_tools.Edit, useful_tools.Write]
 
 
 def _wrapup_notice(collect_path: Path, test_path: Path) -> str:
     return (
-        "Stop starting new work and consolidate what you already have: finish any "
-        f"test you left half-written, and make `{test_path}` mirror `{collect_path}` "
-        "exactly, one assertion test per collected case. Running out of steps is not "
-        "a reason to cut corners: keep every assertion, do not weaken or drop one to "
-        "make a test pass, do not mark tests `#[ignore]`, and do not touch the "
-        "sanitizer configuration. If a case cannot be finished properly, remove it "
-        "from both files rather than leaving a broken version of it behind."
+        "Stop adding cases. Finish the current batch and make "
+        f"`{test_path}` mirror `{collect_path}` exactly, with one assertion test per "
+        "collected case and every output and file effect asserted. Never weaken, "
+        "ignore, or change sanitizer behavior to pass. Remove any unfinished case "
+        "from both files, run `./instrument.sh io`, and exit."
     )
 
 
@@ -459,122 +360,81 @@ def _main(cfg: TestgenConfig) -> None:
     logger_trajectory.addHandler(fh)
     # Simultaneous print and log to file
     printer = LoggingConsolePrinter(logger=logger_trajectory)
-    agent = KISSAgent(name="C code reviewer")
+    agent = TestgenAgent(name="C code reviewer")
 
     # -sys crate setup
-    sys_crate = Crate(cfg.manifest)
+    sys_crate = Crate(cfg.manifest, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
     sys_root = sys_crate.cargo_toml.parent
     sys_test_dir = sys_root / "tests"
-    sys_json_dir = sys_root / "json"
     sys_test_dir.mkdir(parents=True, exist_ok=True)
-    sys_json_dir.mkdir(parents=True, exist_ok=True)
-
-    # Analyze consolidated code to find all reachable symbols
-    template = "bin" if len(sys_crate.bin_targets) > 0 else "lib"
-    assert sys_crate.lib_src_path is not None, "Expected lib.rs to exist in -sys crate!"
-    c_src_path = sys_crate.lib_src_path.with_suffix(".c")
-    tu = create_translation_unit(c_src_path)
-    asts = [extract_info_c(tu)]
-    symbols, _ = get_symbols_and_dependencies(
-        asts, external_symbol_names=["c:@F@main"] if template == "bin" else None
-    )
-    profile_list = None
-    if RESTRICT_COVERAGE:
-        profile_functions = [
-            s.spelling
-            for s in symbols.values()
-            if s.is_function and s.is_definition and not is_system_symbol(s)
-        ]
-        if profile_functions:
-            logger.info(f"Restricting coverage to {len(profile_functions)} functions")
-            profile_list = write_profile_list(sys_root / "profile.lst", profile_functions)
-        else:
-            logger.warning("No instrumentable functions found, coverage stays unrestricted!")
-
-    # Add testing dependencies
-    if template == "bin":
-        sys_crate.cargo_add(dep="assert_cmd@2.0.17", section="dev")
-        sys_crate.cargo_add(dep="predicates@3.1.3", section="dev")
-        sys_crate.cargo_add(dep="libc@0.2", section="dev")
-    sys_crate.cargo_add(dep="serde@1", section="dev", features=["derive"])
-    sys_crate.cargo_add(dep="serde_json@1", section="dev")
-    sys_crate.invalidate_metadata()
 
     # Write instrumentation and test scripts
-    write_collect_script(
-        sys_test_dir / "collect.rs",
-        template=template,
-        lib_name=sys_crate.lib_name if template == "lib" else None,
-    )
-    write_assert_script(
-        sys_test_dir / "io.rs",
-        template=template,
-        lib_name=sys_crate.lib_name if template == "lib" else None,
-    )
-    write_instrumentation_script(
-        sys_root / "instrument.sh", features=["cc_asan", "cc_ubsan"], profile_list=profile_list
-    )
+    template = "bin" if len(sys_crate.bin_targets) > 0 else "lib"
+    lib_name = sys_crate.lib_name
+    write_test_templates(sys_test_dir, template=template, lib_name=lib_name)
 
     # Isolate the crate
     work_dir = Path(tempfile.mkdtemp()) / sys_root.name
     shutil.copytree(
-        sys_root, work_dir, dirs_exist_ok=True, ignore=shutil.ignore_patterns("*.log", ".*")
+        sys_root,
+        work_dir,
+        dirs_exist_ok=True,
+        ignore=lambda _directory, entries: {
+            entry
+            for entry in entries
+            if entry.endswith(".log") or (entry.startswith(".") and entry != ".config")
+        },
     )
+    work_crate = Crate(work_dir / "Cargo.toml")
+
+    # Copy the crate pre-agent for verification under a random package and target name
+    fresh_copy_parent = Path(tempfile.mkdtemp())
+    fresh_crate = get_fresh_copy(sys_crate, fresh_copy_parent)
 
     # Strip line directives
     for c_file in (work_dir / "src").glob("*.c"):
         strip_line_directives(c_file)
 
-    # If this is a binary, remove the `lib.rs` file and simplify `main.rs`
-    if template == "bin":
-        lib_rs = work_dir / "src" / "lib.rs"
-        assert lib_rs.exists(), "Expected to find lib.rs in -sys crate"
-        lib_rs.unlink()
-        main_rs = work_dir / "src" / "main.rs"
-        main_rs.write_text("#![no_main]\n")
-
     # Build the task prompt
     task_description = (
-        TestgenInstructions.library if template == "lib" else TestgenInstructions.binary
+        TestgenInstructions.binary if template == "bin" else TestgenInstructions.library
     ).strip()
     collect_path = (sys_test_dir / "collect.rs").relative_to(sys_root)
     test_path = (sys_test_dir / "io.rs").relative_to(sys_root)
-    coverage_scope = (
-        f"Coverage is restricted to the program's own functions through `{profile_list.name}`;"
-        " libc and system code is never counted, so do not try to cover it, and never modify"
-        " that file:"
-        if profile_list is not None
-        else "The coverage outputs are:"
-    )
     task_description = task_description.format(
         work_dir=work_dir,
-        instrument_path="instrument.sh",
+        instrument_path="./instrument.sh",
         target_coverage=cfg.coverage,
         collect_path=collect_path,
         test_path=test_path,
-        json_dir=sys_json_dir.relative_to(sys_root),
+        json_dir="json",
         sanitizer_dir="sanitizer_logs",
         coverage_dir="coverage_logs",
-        coverage_scope=coverage_scope,
-        lib_name=sys_crate.lib_name or "",
+        lib_name=lib_name or "",
     )
 
-    # Run the agent
-    os.chdir(work_dir)
-    agent.wrapup_steps = 10
+    # Expose the direct pristine verifier only while the agent is running.
+    agent.wrapup_steps = cfg.steps // 10
     agent.wrapup_notice = _wrapup_notice(collect_path, test_path)
-    try:
-        agent.run(
-            model_name=cfg.model,
-            prompt_template=task_description,
-            max_steps=cfg.steps,
-            max_budget=cfg.budget,
-            tools=get_tools(),
-            printer=printer,
-            verbose=True,
-        )
-    except KISSError as e:
-        logger.warning(f"Agent claims it failed with error: {e}")
+    with verification_service(work_crate, fresh_crate):
+        try:
+            agent.run(
+                model_name=cfg.model,
+                prompt_template=task_description,
+                max_steps=cfg.steps,
+                max_budget=cfg.budget,
+                tools=get_tools(work_dir),
+                printer=printer,
+                verbose=True,
+            )
+        except BudgetExceededError as error:
+            message = f"Budget of ${cfg.budget} exhausted, keeping tests so far: {error}"
+            logger.warning(message)
+        except KISSError as error:
+            message = (
+                f"Agent {agent.name} completed {cfg.steps} steps without finishing: {error}"
+            )
+            logger.warning(message)
 
     # Copy the generated tests back
     work_test_dir = work_dir / "tests"
@@ -584,33 +444,20 @@ def _main(cfg: TestgenConfig) -> None:
         if src.exists():
             shutil.copy2(src, sys_test_dir / name)
 
-    # Copy the collected JSON data back
-    work_json_dir = work_dir / "json"
-    if work_json_dir.is_dir():
-        shutil.copytree(work_json_dir, sys_json_dir, dirs_exist_ok=True)
-    else:
-        logger.warning("The agent removed the JSON directory!")
-
-    # Guarantee tests are generated
-    placeholder = "#[test]\nfn placeholder() {\n    assert_eq!(1, 1);\n}\n"
-    for name in ("collect.rs", "io.rs"):
-        test_file = sys_test_dir / name
-        if not test_file.exists():
-            test_file.write_text(placeholder)
-            logger.warning(
-                f"{name} not generated by the agent, writing always-pass placeholder!"
-            )
-    sys_crate.vcs.add(sys_test_dir / "collect.rs", sys_test_dir / "io.rs", sys_json_dir)
+    sys_crate.vcs.init(force_init=True)
+    sys_crate.vcs.add(sys_test_dir / "collect.rs", sys_test_dir / "io.rs")
     sys_crate.vcs.commit("Generated I/O equivalence tests")
+
+    # Run post-agent verification on the copied tests
+    finalize_tests(
+        sys_crate, fresh_crate, ["collect", "io"], ["cc_asan", "cc_ubsan", "cc_coverage"]
+    )
+    shutil.rmtree(fresh_copy_parent)
 
 
 @hydra.main(version_base=None, config_name="generate_io_tests")
 def main(cfg: TestgenConfig) -> None:
-    try:
-        _main(cfg)
-    except Exception as e:
-        logger.exception(e)
-        sys.exit(1)
+    _main(cfg)
 
 
 if __name__ == "__main__":

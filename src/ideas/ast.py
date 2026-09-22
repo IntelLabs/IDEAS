@@ -4,25 +4,29 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import os
 import logging
 from pathlib import Path
 from functools import cmp_to_key
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import astuple, dataclass, field, fields, replace
+from dataclasses import astuple, dataclass, field, fields
 from typing import get_args
 
 from clang.cindex import TranslationUnit, TranslationUnitLoadError, Diagnostic
-from clang.cindex import Cursor, CursorKind, SourceRange, TokenKind, Type, TypeKind
+from clang.cindex import Cursor, CursorKind, SourceRange, Token, TokenKind, Type, TypeKind
 from clang.cindex import PrintingPolicy, PrintingPolicyProperty, LinkageKind, StorageClass
-from clang.cindex import conf, SourceLocation, _CXString
+from clang.cindex import conf, SourceLocation, File, _CXString, c_object_p
 from ctypes import byref, pointer, c_size_t, c_char_p, c_uint
 
 from .adapters import Code
+from .ast_rust import BindgenName, mangle as rust_mangle
 
 logger = logging.getLogger("ideas.ast")
 FILENAME = "file.c"
 CodeC = Code["c"]
+
+_VA_LIST_DESUGARED = "struct __va_list_tag *"
 
 # Cursor kinds that become symbols, ranked by order in which they should be translated
 _KIND_RANK = {
@@ -34,6 +38,15 @@ _KIND_RANK = {
     CursorKind.VAR_DECL: 2,
     CursorKind.FUNCTION_DECL: 3,
 }
+
+# C keeps tags in a namespace of their own, so only the keyword tells `struct parser` apart
+# from a typedef `parser`. Every other kind in `_KIND_RANK` is an ordinary identifier.
+_TAG_PREFIX = {
+    CursorKind.STRUCT_DECL: "struct ",
+    CursorKind.UNION_DECL: "union ",
+    CursorKind.ENUM_DECL: "enum ",
+}
+_TAG_KEYWORDS = frozenset(prefix.strip() for prefix in _TAG_PREFIX.values())
 
 
 @dataclass(frozen=True)
@@ -136,14 +149,13 @@ class Symbol:
     kind: CursorKind
 
     # Rendered C snippets
-    llm_context_declaration: str
-    declaration: CodeC | None
+    forward_declaration: CodeC | None
     code: CodeC
 
     # Symbol semantics
     is_definition: bool
-    is_global: bool
-    is_system: bool
+    is_externally_visible: bool
+    in_system_header: bool
     is_top_level: bool
     storage_class: StorageClass
 
@@ -152,10 +164,17 @@ class Symbol:
     presumed_path: Path | None
     tu_preorder_index: int
     line_directive: CodeC | None
-    declaration_line_directive: CodeC | None
 
     # Structural summary of the type, empty for symbols that are not types
     type_shape: TypeShape = field(default_factory=TypeShape)
+
+    is_struct: bool = False
+
+    # `typedef struct Foo Foo;` — a second name for a tag that already has it
+    is_alias_typedef: bool = False
+
+    # The name bindgen gives this symbol, or None when bindgen's name is unpredictable
+    bindgen_name: BindgenName | None = None
 
     @property
     def difficulty(self) -> tuple[int, ...]:
@@ -169,7 +188,6 @@ class Symbol:
         name: str,
         cursor: Cursor,
         parent: Cursor | None = None,
-        decl: Cursor | None = None,
         tu_preorder_index: int = -1,
     ) -> "Symbol":
         parent_or_cursor = parent or cursor
@@ -179,27 +197,37 @@ class Symbol:
             name=name,
             spelling=cursor.spelling,
             kind=cursor.kind,
-            llm_context_declaration=_synthesize_llm_context_declaration(
-                cursor, fallback_code=code
-            ),
-            declaration=get_cursor_code(decl, pretty_print=True) if decl else None,
+            forward_declaration=_synthesize_forward_declaration(cursor),
             code=code,
             is_definition=cursor.is_definition(),
-            is_global=cursor.linkage == LinkageKind.EXTERNAL,
-            is_system=cursor.location.is_in_system_header,
+            is_externally_visible=_is_externally_visible(cursor),
+            in_system_header=cursor.location.is_in_system_header,
             tu_path=Path(cursor.translation_unit.spelling).resolve(),
             presumed_path=Path(presumed_location[0]) if presumed_location is not None else None,
             tu_preorder_index=tu_preorder_index,
             line_directive=_line_directive_for(parent_or_cursor),
-            declaration_line_directive=_line_directive_for(decl),
             storage_class=cursor.storage_class,
             is_top_level=parent is None,
             type_shape=TypeShape.from_cursor(parent_or_cursor),
+            is_struct=cursor.kind == CursorKind.STRUCT_DECL
+            or _inline_struct(cursor) is not None,
+            is_alias_typedef=_is_alias_typedef(cursor),
+            bindgen_name=_bindgen_name(cursor),
         )
 
     @property
     def is_variable(self) -> bool:
         return self.kind == CursorKind.VAR_DECL
+
+    @property
+    def is_system(self) -> bool:
+        # A symbol whose presumed path shares nothing but "/" with its translation unit comes
+        # from outside the project even when clang does not flag it as a system header
+        if self.in_system_header:
+            return True
+        if self.presumed_path is None:
+            return False
+        return os.path.commonpath([self.presumed_path, self.tu_path]) == "/"
 
     @property
     def is_function(self) -> bool:
@@ -210,19 +238,13 @@ class Symbol:
         return self.kind in (
             CursorKind.STRUCT_DECL,
             CursorKind.UNION_DECL,
+            CursorKind.ENUM_DECL,
             CursorKind.TYPEDEF_DECL,
         )
 
     @property
-    def is_struct(self) -> bool:
-        return self.kind == CursorKind.STRUCT_DECL
-
-    def with_declaration(self, decl_symbol: "Symbol") -> "Symbol":
-        return replace(
-            self,
-            declaration=decl_symbol.code,
-            declaration_line_directive=decl_symbol.line_directive,
-        )
+    def qualified_spelling(self) -> str:
+        return _TAG_PREFIX.get(self.kind, "") + self.spelling
 
     def __getstate__(self) -> dict[str, object]:
         state = dict(self.__dict__)
@@ -250,34 +272,137 @@ class TreeResult:
     local_names: frozenset[str] = field(default_factory=frozenset)
 
 
-def _synthesize_llm_context_declaration(cursor: Cursor, fallback_code: CodeC) -> str:
-    # Synthesize forward declaration from cursor
-    if cursor.kind == CursorKind.FUNCTION_DECL:
-        result_type = cursor.result_type.spelling if cursor.result_type else "void"
-        params = ", ".join(
-            p.type.spelling + (" " + p.spelling if p.spelling else "")  # type: ignore[reportOptionalMemberAccess]
-            for p in cursor.get_arguments()
-        )
-        return f"{result_type} {cursor.spelling}({params});"
-    elif cursor.kind in (
+def _bindgen_name(cursor: Cursor) -> BindgenName | None:
+    # bindgen names a record after its tag and renders the typedef as a separate alias, so
+    # `typedef struct Tag { ... } Alias;` is wrapped as `Tag`.
+    if (inline := _inline_struct(cursor)) is not None and not inline.is_anonymous():
+        cursor = inline
+
+    # bindgen names an anonymous record `parent__bindgen_ty_N`, where `N` counts across the
+    # whole run, so neither it nor anything nested inside it has a predictable name
+    if cursor.is_anonymous():
+        return None
+
+    # Walk the lexical parents: C puts every tag in a flat namespace, so the semantic parent
+    # of a nested record is the translation unit, but the record is still written inside
+    # another record, and bindgen names it after that whole ancestor chain, so
+    # `struct record` inside `struct histindex` becomes `histindex_record`.
+    parts = [cursor.spelling]
+    parent = cursor.lexical_parent
+    while parent is not None and parent.kind in (
         CursorKind.STRUCT_DECL,
         CursorKind.UNION_DECL,
-        CursorKind.ENUM_DECL,
     ):
-        kind_name = {
-            CursorKind.STRUCT_DECL: "struct",
-            CursorKind.UNION_DECL: "union",
-            CursorKind.ENUM_DECL: "enum",
-        }[cursor.kind]
-        return f"{kind_name} {cursor.spelling};"
-    elif cursor.kind == CursorKind.TYPEDEF_DECL:
-        underlying = cursor.underlying_typedef_type.spelling
-        return f"typedef {underlying} {cursor.spelling};"
-    elif cursor.kind == CursorKind.VAR_DECL:
-        return f"{cursor.type.spelling} {cursor.spelling};"
+        if parent.is_anonymous():
+            return None
+        parts.append(parent.spelling)
+        parent = parent.lexical_parent
 
-    # Fallback: return full code
-    return str(fallback_code)
+    # Mangled here so the value is always usable as the Rust identifier it names
+    return BindgenName(rust_mangle("_".join(reversed(parts))))
+
+
+def _is_externally_visible(cursor: Cursor) -> bool:
+    # A typedef name has no linkage of its own, so clang reports NO_LINKAGE unless the
+    # typedef supplies the name for an otherwise unnamed tag. Inherit from the type it
+    # denotes instead, so `typedef struct Tag {...} alias;` is as visible as `struct Tag`.
+    if cursor.kind == CursorKind.TYPEDEF_DECL:
+        decl = cursor.underlying_typedef_type.get_canonical().get_declaration()
+        if decl.kind != CursorKind.NO_DECL_FOUND:
+            cursor = decl
+    return cursor.linkage == LinkageKind.EXTERNAL
+
+
+def _inline_struct(cursor: Cursor) -> Cursor | None:
+    if cursor.kind != CursorKind.TYPEDEF_DECL:
+        return None
+
+    # Only a typedef that writes the body inline owns a struct. A typedef that merely
+    # aliases one (`typedef struct Tag Alias;`) has a `TYPE_REF` child instead, which also
+    # keeps out aliases of aliases and opaque types, neither of which has fields to convert.
+    return next(
+        (
+            child
+            for child in cursor.get_children()
+            if child.kind == CursorKind.STRUCT_DECL and child.is_definition()
+        ),
+        None,
+    )
+
+
+def _is_alias_typedef(cursor: Cursor) -> bool:
+    if cursor.kind != CursorKind.TYPEDEF_DECL:
+        return False
+
+    # A typedef that writes the body inline declares the tag; only one that refers to an
+    # existing tag, and so has nothing but `TYPE_REF` children, can be redundant.
+    if any(child.kind != CursorKind.TYPE_REF for child in cursor.get_children()):
+        return False
+
+    # `typedef struct Tag Alias;` still has to become `pub type Alias = Tag;`
+    decl = cursor.underlying_typedef_type.get_declaration()
+    return (
+        decl.kind in (CursorKind.STRUCT_DECL, CursorKind.UNION_DECL, CursorKind.ENUM_DECL)
+        and decl.spelling == cursor.spelling
+    )
+
+
+def _synthesize_forward_declaration(cursor: Cursor) -> CodeC | None:
+    # A name sits inside its declarator, so `static int (*callbacks[])(void)` cannot be built
+    # by appending a name to a type spelling. Let clang print the declarator instead.
+    if cursor.kind in (CursorKind.FUNCTION_DECL, CursorKind.VAR_DECL):
+        inline_tags = [
+            child
+            for child in cursor.get_children()
+            if child.kind in _TAG_PREFIX and child.is_definition()
+        ]
+        # `struct { int x; } v;` has no type name to declare `v` with, and clang prints the
+        # placeholder `struct (unnamed struct at f.c:1:1)` rather than failing.
+        if any(tag.is_anonymous() for tag in inline_tags):
+            return None
+        # `static` keeps the declaration a tentative definition, which needs a complete type,
+        # and a tag written inside this declarator is completed nowhere else.
+        if (
+            inline_tags
+            and cursor.kind == CursorKind.VAR_DECL
+            and cursor.storage_class == StorageClass.STATIC
+        ):
+            return None
+
+        policy = PrintingPolicy.create(cursor)
+        policy.set_property(PrintingPolicyProperty.TerseOutput, 1)
+        policy.set_property(PrintingPolicyProperty.SuppressInitializers, 1)
+        # `()` is an unprototyped declaration, a different declaration before C23
+        policy.set_property(PrintingPolicyProperty.UseVoidForZeroParams, 1)
+        policy.set_property(PrintingPolicyProperty.IncludeTagDefinition, 0)
+        policy.set_property(PrintingPolicyProperty.Bool, 0)
+        declaration = (
+            cursor.pretty_printed(policy).replace(_VA_LIST_DESUGARED, "va_list").strip()
+        )
+        if not declaration:
+            return None
+        # Without `extern` a variable declaration is a tentative definition; `static` already
+        # says the same thing and has to be kept anyway to preserve internal linkage.
+        if cursor.kind == CursorKind.VAR_DECL and cursor.storage_class not in (
+            StorageClass.STATIC,
+            StorageClass.EXTERN,
+        ):
+            declaration = f"extern {declaration}"
+        return CodeC(f"{declaration};")
+
+    # An anonymous record has no tag, so there is nothing to refer to it by. clang lends a
+    # typedef's name to an unnamed tag and both anonymity predicates only cover C11
+    # anonymous members, so the written tokens are what decide.
+    if cursor.kind in (CursorKind.STRUCT_DECL, CursorKind.UNION_DECL):
+        tokens = [token.spelling for token in cursor.get_tokens()][:2]
+        if not cursor.spelling or tokens[1:] == ["{"]:
+            return None
+        kind_name = "struct" if cursor.kind == CursorKind.STRUCT_DECL else "union"
+        return CodeC(f"{kind_name} {cursor.spelling};")
+
+    # No other kind has a forward declaration form: `enum Tag;` is not valid ISO C and a
+    # typedef cannot be redeclared before C11.
+    return None
 
 
 def _line_directive_for(cursor: Cursor | None) -> CodeC | None:
@@ -411,7 +536,7 @@ def _extract_symbol_info_c(
                 reference_nodes[child_name] = child_refs[child_name]
             elif not symbols[child_name].is_definition and child_symbol.is_definition:
                 # Previous symbol was a declaration so replace it with new definitional symbol
-                symbols[child_name] = child_symbol.with_declaration(symbols[child_name])
+                symbols[child_name] = child_symbol
                 reference_nodes[child_name] = child_refs[child_name]
             elif symbols[child_name].is_definition and not child_symbol.is_definition:
                 if not symbols[child_name].is_system or not child_symbol.is_system:
@@ -482,7 +607,9 @@ def get_cursor_prettyprinted(cursor: Cursor) -> CodeC:
     policy.set_property(PrintingPolicyProperty.IncludeTagDefinition, include_tag_definition)
     # Emit C99 builtin spelling to avoid dependence on stdbool.h macro context.
     policy.set_property(PrintingPolicyProperty.Bool, 0)
-    return CodeC(cursor.pretty_printed(policy))
+    # Clang desugars array-typed va_list parameters to a prototype-scoped struct tag,
+    # making otherwise compatible callbacks appear to use distinct types.
+    return CodeC(cursor.pretty_printed(policy).replace(_VA_LIST_DESUGARED, "va_list"))
 
 
 def get_cursor_code(cursor: Cursor, pretty_print: bool = False) -> CodeC:
@@ -510,6 +637,7 @@ def clang_rename(
     for cursor in tu.cursor.walk_preorder():
         target_usr = cursor.get_usr()
         target_spelling = cursor.spelling
+        target_is_tag = cursor.kind in _TAG_PREFIX
 
         # If the cursor itself is not a symbol we want to rename, check if it's a reference to one.
         if target_usr not in renames:
@@ -518,14 +646,44 @@ def clang_rename(
                 continue
             target_usr = referenced.get_usr()
             target_spelling = referenced.spelling
+            target_is_tag = referenced.kind in _TAG_PREFIX
             if target_usr not in renames:
                 continue
         if not target_spelling:
             continue
 
+        # Cursor tokens point at the expansion site for macros; the spelling location
+        # points at the referenced identifier in the macro body.
+        spelling_file, spelling_offset = c_object_p(), c_uint()
+        conf.lib.clang_getSpellingLocation(
+            cursor.location, byref(spelling_file), None, None, byref(spelling_offset)
+        )
+        if spelling_file:
+            file = File(spelling_file)
+            location = SourceLocation.from_offset(tu, file, spelling_offset.value)
+            spelling = target_spelling.encode()
+            end = SourceLocation.from_offset(tu, file, spelling_offset.value + len(spelling))
+            extent = SourceRange.from_locations(location, end)
+            if (
+                not location.is_in_system_header
+                and get_code_from_tu_range(tu, extent).code.rstrip() == target_spelling
+            ):
+                file_path = Path(file.name).resolve()
+                offsets = (
+                    spelling_offset.value,
+                    spelling_offset.value + len(spelling),
+                )
+                edits_by_file.setdefault(file_path, {})[offsets] = renames[target_usr].encode()
+
         # Record edits for all tokens that match the symbol's spelling and are not in system headers
-        for token in _get_tokens(cursor):
+        tokens = list(_get_tokens(cursor))
+        for index, token in enumerate(tokens):
             if token.spelling != target_spelling or token.location.is_in_system_header:
+                continue
+            # Tags live in a namespace of their own, so `typedef struct s s;` spells two
+            # entities the same way and only the keyword before the token tells them apart.
+            # A token that opens the extent has no keyword to read, so leave it alone.
+            if index > 0 and (tokens[index - 1].spelling in _TAG_KEYWORDS) != target_is_tag:
                 continue
             file_path = Path(token.location.file.name).resolve()
             extent = (token.extent.start.offset, token.extent.end.offset)
@@ -534,55 +692,78 @@ def clang_rename(
     return edits_by_file
 
 
-DEFINITION_START_TOKEN = {CursorKind.FUNCTION_DECL: "{", CursorKind.VAR_DECL: "="}
-
-
-def clang_make_global_(path: Path, spelling: str):
+def clang_rename_(path: Path, renames: dict[str, str]):
     tu = create_translation_unit(path)
     tu_path = Path(tu.spelling).resolve()
-    edits: dict[tuple[int, int], bytes] = {}
 
-    for cursor in _find_cursors(tu, spelling):
-        # We don't handle cursors not in the provided translation unit or anything without a definition
-        if (
-            cursor.location.file is None
-            or Path(cursor.location.file.name).resolve() != tu_path
-            or Path(cursor.extent.start.file.name).resolve() != tu_path
-            or Path(cursor.extent.end.file.name).resolve() != tu_path
-        ):
-            raise NotImplementedError(f"Found `{spelling}` cursor {cursor}` not in {tu_path}!")
-        if cursor.kind not in DEFINITION_START_TOKEN:
-            raise ValueError(f"Unhandled cursor kind {cursor.kind}!")
+    usr_renames: dict[str, str] = {}
+    missing: list[str] = []
+    for spelling, new_spelling in renames.items():
+        found = False
+        for cursor in _find_cursors(tu, spelling):
+            if usr := cursor.get_usr():
+                usr_renames[usr] = new_spelling
+                found = True
+        if not found:
+            missing.append(spelling)
 
-        tokens = list(_get_tokens(cursor))
-        assert len(tokens) > 0
+    if missing:
+        raise ValueError(f"Unable to find symbol(s) {missing} in {tu_path}!")
 
-        for i, token in enumerate(tokens):
-            # Remove storage specifiers from declaration while preserving offsets
-            if token.kind == TokenKind.KEYWORD and token.spelling in ("static", "inline"):
-                assert i + 1 < len(tokens), "storage specifier should always come before name"
-                start_offset = token.extent.start.offset
-                # Use start of next token as end offset to remove any whitespace
-                end_offset = tokens[i + 1].extent.start.offset
-                edits[(start_offset, end_offset)] = b""
+    edits_by_file = clang_rename(tu, usr_renames)
+    if outside := sorted(p for p in edits_by_file if p != tu_path):
+        raise NotImplementedError(
+            f"Renaming {sorted(renames)} would edit {outside}, not {tu_path}!"
+        )
 
-            # Don't change anything after definition start
-            elif (
-                token.kind == TokenKind.PUNCTUATION
-                and token.spelling == DEFINITION_START_TOKEN[cursor.kind]
-            ):
-                break
-
-    if edits:
+    if edits := edits_by_file.get(tu_path):
         _apply_edits(path, edits)
 
 
-def clang_make_extern_(path: Path, spelling: str):
+def clang_function_arity(path: Path, spelling: str) -> int:
+    tu = create_translation_unit(path)
+
+    for cursor in _find_cursors(tu, spelling):
+        if cursor.kind != CursorKind.FUNCTION_DECL or not cursor.is_definition():
+            continue
+        return len(list(cursor.get_arguments()))
+
+    raise ValueError(f"Unable to find a definition of function `{spelling}`")
+
+
+DEFINITION_START_TOKEN = {CursorKind.FUNCTION_DECL: "{", CursorKind.VAR_DECL: "="}
+WEAK_ATTRIBUTE = b"__attribute__((weak))"
+
+
+def _find_weak_attribute(tokens: list[Token]) -> tuple[int, int] | None:
+    # Locates `__attribute__((weak))` as the half-open token index range [start, end)
+    for i, token in enumerate(tokens):
+        if token.kind != TokenKind.KEYWORD or token.spelling != "__attribute__":
+            continue
+        depth = 0
+        for j in range(i + 1, len(tokens)):
+            if tokens[j].spelling == "(":
+                depth += 1
+            elif tokens[j].spelling == ")":
+                depth -= 1
+                if depth == 0:
+                    if any(token.spelling == "weak" for token in tokens[i + 2 : j]):
+                        return i, j + 1
+                    # Another attribute may still carry `weak`
+                    break
+    return None
+
+
+def clang_make_weak_(path: Path, spelling: str):
     tu = create_translation_unit(path)
     tu_path = Path(tu.spelling).resolve()
     edits: dict[tuple[int, int], bytes] = {}
 
     for cursor in _find_cursors(tu, spelling):
+        # Weakness only has to be attached to the definition to take effect
+        if not cursor.is_definition():
+            continue
+
         # We don't handle cursors not in the provided translation unit or anything without a definition
         if (
             cursor.location.file is None
@@ -596,55 +777,188 @@ def clang_make_extern_(path: Path, spelling: str):
 
         tokens = list(_get_tokens(cursor))
         assert len(tokens) > 0
+        if _find_weak_attribute(tokens) is not None:
+            continue
 
-        is_extern = False
-        definition_start_token_idx = None
-
-        for i, token in enumerate(tokens):
-            # Remove storage specifiers from declaration while preserving offsets
-            if token.kind == TokenKind.KEYWORD and token.spelling in ("static", "inline"):
-                assert i + 1 < len(tokens), "storage specifier should always come before name"
-                start_offset = token.extent.start.offset
-                # Use start of next token as end offset to remove any whitespace
-                end_offset = tokens[i + 1].extent.start.offset
-                edits[(start_offset, end_offset)] = b""
-
-            # Check if extern keyword already present
-            elif token.kind == TokenKind.KEYWORD and token.spelling == "extern":
-                is_extern = True
-
-            # Record the first definition-opening token.
-            elif (
-                definition_start_token_idx is None
-                and token.kind == TokenKind.PUNCTUATION
-                and token.spelling == DEFINITION_START_TOKEN[cursor.kind]
-            ):
-                definition_start_token_idx = i
-                break
-
-        # Replace definition portion with ';'
-        if definition_start_token_idx is not None:
-            assert definition_start_token_idx > 0
-            # Use end of prior token as end offset to remove any whitespace
-            start_pos = tokens[definition_start_token_idx - 1].extent.end.offset
-            end_pos = cursor.extent.end.offset
-            edits[(start_pos, end_pos)] = b";"
-
-        # Add 'extern ' prefix if not already present
-        if not is_extern:
-            extern_insert_pos = cursor.extent.start.offset
-            edits[(extern_insert_pos, extern_insert_pos)] = b"extern "
+        insert_pos = cursor.extent.start.offset
+        edits[(insert_pos, insert_pos)] = WEAK_ATTRIBUTE + b" "
 
     if edits:
         _apply_edits(path, edits)
 
 
-def clang_make_bindable_(path: Path, spelling: str):
+def _as_spellings(spellings: str | Iterable[str]) -> list[str]:
+    return [spellings] if isinstance(spellings, str) else list(dict.fromkeys(spellings))
+
+
+def clang_make_global_(path: Path, spellings: str | Iterable[str]):
+    tu = create_translation_unit(path)
+    tu_path = Path(tu.spelling).resolve()
+    edits: dict[tuple[int, int], bytes] = {}
+
+    for spelling, cursors in _find_cursors_by_spelling(tu, _as_spellings(spellings)).items():
+        for cursor in cursors:
+            # We don't handle cursors not in the provided translation unit or anything without a definition
+            if (
+                cursor.location.file is None
+                or Path(cursor.location.file.name).resolve() != tu_path
+                or Path(cursor.extent.start.file.name).resolve() != tu_path
+                or Path(cursor.extent.end.file.name).resolve() != tu_path
+            ):
+                raise NotImplementedError(
+                    f"Found `{spelling}` cursor {cursor}` not in {tu_path}!"
+                )
+            if cursor.kind not in DEFINITION_START_TOKEN:
+                raise ValueError(f"Unhandled cursor kind {cursor.kind}!")
+
+            tokens = list(_get_tokens(cursor))
+            assert len(tokens) > 0
+
+            for i, token in enumerate(tokens):
+                # Remove storage specifiers from declaration while preserving offsets
+                if token.kind == TokenKind.KEYWORD and token.spelling in ("static", "inline"):
+                    assert i + 1 < len(tokens), (
+                        "storage specifier should always come before name"
+                    )
+                    start_offset = token.extent.start.offset
+                    # Use start of next token as end offset to remove any whitespace
+                    end_offset = tokens[i + 1].extent.start.offset
+                    edits[(start_offset, end_offset)] = b""
+
+                # Don't change anything after definition start
+                elif (
+                    token.kind == TokenKind.PUNCTUATION
+                    and token.spelling == DEFINITION_START_TOKEN[cursor.kind]
+                ):
+                    break
+
+    if edits:
+        _apply_edits(path, edits)
+
+
+def clang_function_definitions(path: Path) -> list[str]:
+    tu = create_translation_unit(path)
+    tu_path = Path(tu.spelling).resolve()
+
+    spellings: list[str] = []
+    assert tu.cursor is not None
+    for cursor in tu.cursor.walk_preorder():
+        if cursor.kind != CursorKind.FUNCTION_DECL or not cursor.is_definition():
+            continue
+        if cursor.semantic_parent is None:
+            continue
+        if cursor.semantic_parent.kind != CursorKind.TRANSLATION_UNIT:
+            continue
+        if cursor.location.file is None:
+            continue
+        if Path(cursor.location.file.name).resolve() != tu_path:
+            continue
+        spellings.append(cursor.spelling)
+
+    return list(dict.fromkeys(spellings))
+
+
+def clang_make_extern_(path: Path, spellings: str | Iterable[str]):
+    tu = create_translation_unit(path)
+    tu_path = Path(tu.spelling).resolve()
+    edits: dict[tuple[int, int], bytes] = {}
+
+    for spelling, cursors in _find_cursors_by_spelling(tu, _as_spellings(spellings)).items():
+        for cursor in cursors:
+            # We don't handle cursors not in the provided translation unit or anything without a definition
+            if (
+                cursor.location.file is None
+                or Path(cursor.location.file.name).resolve() != tu_path
+                or Path(cursor.extent.start.file.name).resolve() != tu_path
+                or Path(cursor.extent.end.file.name).resolve() != tu_path
+            ):
+                raise NotImplementedError(
+                    f"Found `{spelling}` cursor `{cursor}` not in {tu_path}!"
+                )
+            if cursor.kind not in DEFINITION_START_TOKEN:
+                raise ValueError(f"Unhandled cursor kind {cursor.kind}!")
+
+            tokens = list(_get_tokens(cursor))
+            assert len(tokens) > 0
+
+            # Dropping the body would otherwise turn a weak definition into a weak *reference*,
+            # which resolves to NULL instead of erroring when nothing else defines the symbol
+            extern_insert_pos = cursor.extent.start.offset
+            weak_span = _find_weak_attribute(tokens)
+            if weak_span is not None:
+                weak_start = tokens[weak_span[0]].extent.start.offset
+                weak_end_idx = weak_span[1]
+                weak_end = (
+                    tokens[weak_end_idx].extent.start.offset
+                    if weak_end_idx < len(tokens)
+                    else tokens[-1].extent.end.offset
+                )
+                edits[(weak_start, weak_end)] = b""
+                if weak_start == cursor.extent.start.offset:
+                    extern_insert_pos = weak_end
+            is_extern = False
+            definition_start_token_idx = None
+
+            for i, token in enumerate(tokens):
+                # Remove storage specifiers from declaration while preserving offsets
+                if token.kind == TokenKind.KEYWORD and token.spelling in ("static", "inline"):
+                    assert i + 1 < len(tokens), (
+                        "storage specifier should always come before name"
+                    )
+                    start_offset = token.extent.start.offset
+                    # Use start of next token as end offset to remove any whitespace
+                    end_offset = tokens[i + 1].extent.start.offset
+                    edits[(start_offset, end_offset)] = b""
+
+                # Check if extern keyword already present
+                elif token.kind == TokenKind.KEYWORD and token.spelling == "extern":
+                    is_extern = True
+
+                # Record the first definition-opening token.
+                elif (
+                    definition_start_token_idx is None
+                    and token.kind == TokenKind.PUNCTUATION
+                    and token.spelling == DEFINITION_START_TOKEN[cursor.kind]
+                ):
+                    definition_start_token_idx = i
+                    break
+
+            # Replace definition portion with ';'
+            if definition_start_token_idx is not None:
+                assert definition_start_token_idx > 0
+                # Use end of prior token as end offset to remove any whitespace
+                start_pos = tokens[definition_start_token_idx - 1].extent.end.offset
+                end_pos = cursor.extent.end.offset
+                edits[(start_pos, end_pos)] = b";"
+
+            # Add 'extern ' prefix if not already present
+            if not is_extern:
+                edits[(extern_insert_pos, extern_insert_pos)] = b"extern "
+
+    if edits:
+        _apply_edits(path, edits)
+
+
+def clang_make_bindable_(path: Path, spellings: str | Iterable[str]):
     source = path.read_bytes()
     tu = create_translation_unit(path)
     tu_path = Path(tu.spelling).resolve()
     edits: dict[tuple[int, int], bytes] = {}
-    cursors = _find_cursors(tu, spelling)
+
+    for spelling, cursors in _find_cursors_by_spelling(tu, _as_spellings(spellings)).items():
+        _collect_bindable_edits(spelling, cursors, source, tu_path, edits)
+
+    if edits:
+        _apply_edits(path, edits)
+
+
+def _collect_bindable_edits(
+    spelling: str,
+    cursors: list[Cursor],
+    source: bytes,
+    tu_path: Path,
+    edits: dict[tuple[int, int], bytes],
+) -> None:
     has_variable_initializer_definition = any(
         cursor.kind == CursorKind.VAR_DECL
         and any(
@@ -715,14 +1029,33 @@ def clang_make_bindable_(path: Path, spelling: str):
         assert cursor.kind == CursorKind.VAR_DECL
 
         declaration_end_idx = None
+        has_inline_body = False
+        depth = 0
         for i, token in enumerate(tokens):
             if token.kind != TokenKind.PUNCTUATION:
                 continue
-            if token.spelling in ("=", ";"):
+            # An inline record or enum body brings its own `;` and `=`, so only a
+            # terminator outside every brace ends the declarator
+            if token.spelling == "{":
+                depth += 1
+                has_inline_body = True
+            elif token.spelling == "}":
+                depth -= 1
+            elif depth == 0 and token.spelling in ("=", ";"):
                 declaration_end_idx = i
                 break
         if declaration_end_idx is None:
             declaration_end_idx = len(tokens)
+
+        # An inline record body makes the variable an aggregate, which bindgen already emits
+        # as a `pub static`, and an anonymous body has no spelling a declaration could use
+        if has_inline_body:
+            if cursor.type.get_canonical().kind == TypeKind.ENUM:
+                logger.warning(
+                    f"Variable `{spelling}` has an inline enum body, so bindgen may emit it "
+                    "as a `pub const` with no linkage"
+                )
+            continue
 
         declaration_tokens = [
             token
@@ -753,9 +1086,6 @@ def clang_make_bindable_(path: Path, spelling: str):
             extern_insert_pos = cursor.extent.start.offset
             edits[(extern_insert_pos, extern_insert_pos)] = extern_decl
 
-    if edits:
-        _apply_edits(path, edits)
-
 
 def _get_tokens(cursor: Cursor):
     # Use get_tokens if it actually returns a non-empty list
@@ -780,13 +1110,19 @@ def _get_tokens(cursor: Cursor):
 
 
 def _find_cursors(tu: TranslationUnit, spelling: str) -> list[Cursor]:
-    candidates: list[Cursor] = []
+    return _find_cursors_by_spelling(tu, [spelling])[spelling]
+
+
+def _find_cursors_by_spelling(
+    tu: TranslationUnit, spellings: Iterable[str]
+) -> dict[str, list[Cursor]]:
+    candidates: dict[str, list[Cursor]] = {s: [] for s in spellings}
 
     assert tu.cursor is not None
     for cursor in tu.cursor.walk_preorder():
         if cursor.kind not in (CursorKind.FUNCTION_DECL, CursorKind.VAR_DECL):
             continue
-        if cursor.spelling != spelling:
+        if cursor.spelling not in candidates:
             continue
         if cursor.semantic_parent is None:
             continue
@@ -794,8 +1130,12 @@ def _find_cursors(tu: TranslationUnit, spelling: str) -> list[Cursor]:
             continue
         if cursor.location.is_in_system_header:
             continue
-        candidates.append(cursor)
+        candidates[cursor.spelling].append(cursor)
 
+    return {s: _disambiguate_cursors(s, c) for s, c in candidates.items()}
+
+
+def _disambiguate_cursors(spelling: str, candidates: list[Cursor]) -> list[Cursor]:
     if len(candidates) == 0:
         raise ValueError(f"Unable to find function or variable with spelling `{spelling}`")
 
@@ -845,6 +1185,7 @@ def mangle(name: str) -> str:
     return name
 
 
+# FIXME: rename to `SymbolKey`; these are clang USRs (e.g. `c:@F@main`), not spellings
 SymbolName = str
 SymbolGroup = tuple[SymbolName, ...]
 
