@@ -9,6 +9,7 @@ from .model import ModelConfig, GenerateConfig
 from .translate_recurrent import RecurrentTranslator
 from .translate_snippet import SnippetTranslator
 from .wrapper import WrapperGenerator
+from .codex import CodexConfig, CodexSnippetTranslator, CodexWrapperGenerator
 from clang.cindex import Config
 
 __all__ = [
@@ -20,6 +21,9 @@ __all__ = [
     "RecurrentTranslator",
     "SnippetTranslator",
     "WrapperGenerator",
+    "CodexConfig",
+    "CodexSnippetTranslator",
+    "CodexWrapperGenerator",
 ]
 
 # NOTE: .so is *nix specific

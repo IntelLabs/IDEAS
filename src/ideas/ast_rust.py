@@ -4,17 +4,29 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+from textwrap import indent
 from collections import OrderedDict
 
 from tree_sitter import Language, Parser, Node, Query, QueryCursor
-import tree_sitter_rust
+import tree_sitter_rust_orchard
 
 from .adapters import Code
 
 # Initialize the Rust language once
-RUST_LANGUAGE = Language(tree_sitter_rust.language())
+RUST_LANGUAGE = Language(tree_sitter_rust_orchard.language())
 RUST_PARSER = Parser(RUST_LANGUAGE)
 CodeRust = Code["rust"]
+
+
+# The name bindgen gives an item, already mangled into a usable Rust identifier
+class BindgenName(str):
+    __slots__ = ()
+
+    def __new__(cls, value: str) -> "BindgenName":
+        # An unnamed item reads as "", which bindgen would take as a regex matching everything
+        if not value:
+            raise ValueError("A bindgen name cannot be empty!")
+        return super().__new__(cls, value)
 
 
 class RustFnSignature:
@@ -66,6 +78,21 @@ def get_nodes(node: Node, node_type: str | None = None) -> list[Node]:
     return nodes
 
 
+def get_node_text(node: Node | None) -> str:
+    if node is None or node.text is None:
+        return ""
+    return node.text.decode()
+
+
+_TYPE_IDENTIFIER_QUERY = Query(RUST_LANGUAGE, "(type_identifier) @name")
+
+
+def get_referenced_type_names(node: Node) -> set[BindgenName]:
+    # Every type named anywhere under `node`, e.g. the field types of a struct item
+    captures = QueryCursor(_TYPE_IDENTIFIER_QUERY).captures(node)
+    return {BindgenName(text) for n in captures.get("name", []) if (text := get_node_text(n))}
+
+
 def get_ancestor_nodes(node: Node, node_type: str | None = None) -> list[Node]:
     ancestors = []
     # Excluding self
@@ -97,6 +124,50 @@ def get_macro_nodes(root: Node, placeholder: str) -> list[Node]:
         ancestors.update(get_ancestor_nodes(macro_node))
 
     return list(ancestors)
+
+
+_CATCH_UNWIND_QUERY = Query(
+    RUST_LANGUAGE,
+    """
+    (scoped_identifier
+      path: (_) @path
+      name: (identifier) @name
+      (#eq? @name "catch_unwind"))
+
+    (scoped_use_list
+      path: (_) @path
+      list: (use_list (identifier) @name)
+      (#eq? @name "catch_unwind"))
+    """,
+)
+
+
+def _path_tail(node: Node) -> str:
+    name = node.child_by_field_name("name") if node.type == "scoped_identifier" else node
+    return get_node_text(name)
+
+
+def uses_catch_unwind(code: CodeRust) -> bool:
+    matches = QueryCursor(_CATCH_UNWIND_QUERY).matches(get_root(str(code)))
+    return any(_path_tail(caps["path"][0]) == "panic" for _, caps in matches)
+
+
+_UNIMPLEMENTED_QUERY = Query(
+    RUST_LANGUAGE,
+    """
+    (macro_invocation
+      macro: [
+        (identifier) @name
+        (scoped_identifier name: (identifier) @name)
+      ]
+      (#eq? @name "unimplemented"))
+    """,
+)
+
+
+def is_unimplemented(code: CodeRust) -> bool:
+    captures = QueryCursor(_UNIMPLEMENTED_QUERY).captures(get_root(str(code)))
+    return bool(captures.get("name"))
 
 
 def validate_changes(code: CodeRust, template: CodeRust) -> OrderedDict[str, str]:
@@ -188,6 +259,20 @@ def _rust_node_signature(node: Node, source: bytes, delete: bool = False) -> str
             # Everything before the body is the signature
             sig = source[node.start_byte : body.start_byte].rstrip()
             return sig.decode() + ";"
+
+    # Recurse into impl/trait/mod bodies so nested functions are also stripped/deleted
+    if ntype in ("impl_item", "trait_item", "mod_item"):
+        body = node.child_by_field_name("body")
+        if body is not None:
+            header = source[node.start_byte : body.start_byte].decode()
+            parts = [
+                sig
+                for child in body.named_children
+                if (sig := _rust_node_signature(child, source, delete=delete)) is not None
+            ]
+            if not parts:
+                return header + "{}"
+            return header + "{\n" + indent("\n".join(parts), " " * 4) + "\n}"
 
     # Keep everything else as-is
     return source[node.start_byte : node.end_byte].decode()

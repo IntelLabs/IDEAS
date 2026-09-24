@@ -1212,6 +1212,106 @@ def test_renamed_symbol_shadowed_by_local_variable(
     )
 
 
+@pytest.mark.parametrize("order", permutations(["a.c", "b.c"]), ids="-".join)
+def test_byte_identical_local_symbols_are_distinct(tmp_path: Path, order: tuple[str, ...]):
+    tus = _build_tus(
+        tmp_path,
+        {
+            "a.c": """\
+                struct parser { int value; };
+                typedef struct parser parser;
+                static int helper(parser *p) { return p->value != 0; }
+                int a(parser *p) { return helper(p); }
+                """,
+            "b.c": """\
+                struct parser { long value; };
+                typedef struct parser parser;
+                static int helper(parser *p) { return p->value != 0; }
+                int b(parser *p) { return helper(p); }
+                """,
+        },
+    )
+    by_name = {tu.name: tu for tu in tus}
+    compile_commands = _write_compile_commands(tmp_path, [by_name[name] for name in order])
+
+    consolidated = consolidate_init(compile_commands)
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, (
+        f"Consolidated code does not compile (distinct identical symbols collided):\n"
+        f"{error}\n\nConsolidated output:\n{consolidated}"
+    )
+
+
+def test_nested_forward_declaration_does_not_emit_parent_definition(tmp_path: Path):
+    [main_c] = _build_tus(
+        tmp_path,
+        {
+            "main.c": """\
+                typedef struct walker walker;
+                struct walker {
+                    struct detail *detail;
+                    int (*visit)(walker *);
+                };
+                struct detail { walker *walker; int value; };
+                int run(walker *w) { return w->detail->value; }
+                """,
+        },
+    )
+
+    consolidated = consolidate_init(_write_compile_commands(tmp_path, [main_c]))
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, f"Nested declaration emitted its parent definition too early:\n{error}"
+
+
+@pytest.mark.parametrize("order", permutations(["a.c", "b.c"]), ids="-".join)
+def test_cross_tu_prototype_is_preserved(tmp_path: Path, order: tuple[str, ...]):
+    tus = _build_tus(
+        tmp_path,
+        {
+            "a.c": """\
+                int callback(void);
+                static int (*callbacks[])(void) = {callback};
+                int invoke(void) { return callbacks[0](); }
+                """,
+            "b.c": """\
+                int invoke(void);
+                int callback(void) { return invoke(); }
+                """,
+        },
+    )
+    by_name = {tu.name: tu for tu in tus}
+    compile_commands = _write_compile_commands(tmp_path, [by_name[name] for name in order])
+
+    consolidated = consolidate_init(
+        compile_commands, source_priority=[by_name["a.c"], by_name["b.c"]]
+    )
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, f"Cross-TU prototype was discarded:\n{error}"
+
+
+def test_va_list_callback_keeps_typedef_spelling(tmp_path: Path):
+    [main_c] = _build_tus(
+        tmp_path,
+        {
+            "main.c": """\
+                #include <stdarg.h>
+                struct api { int (*consume)(va_list); };
+                static int consume(va_list args) { (void)args; return 0; }
+                struct api api = {consume};
+                int entry(void) { return api.consume != 0; }
+                """,
+        },
+    )
+
+    consolidated = consolidate_init(_write_compile_commands(tmp_path, [main_c]))
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, f"va_list callback types became incompatible:\n{error}"
+
+
 @pytest.fixture(scope="module")
 def shared_header_rename_tus(tmp_path_factory: pytest.TempPathFactory) -> list[Path]:
     return _build_tus(
@@ -1417,7 +1517,9 @@ def odr_struct_tus(tmp_path_factory: pytest.TempPathFactory) -> list[Path]:
     )
 
 
-@pytest.mark.xfail(reason="UB due to conflicting struct definitions in different TUs")
+@pytest.mark.xfail(
+    strict=True, reason="UB due to conflicting struct definitions in different TUs"
+)
 @pytest.mark.parametrize("order", permutations(["a.c", "b.c"]), ids="-".join)
 def test_struct_forward_decl_completed_differently_in_two_tus(
     odr_struct_tus: list[Path], order: tuple[str, ...]
@@ -1498,8 +1600,9 @@ def odr_typedef_struct_tus(tmp_path_factory: pytest.TempPathFactory) -> list[Pat
 
 
 @pytest.mark.xfail(
+    strict=True,
     reason="Shared typedef bound to a struct with conflicting completions cannot "
-    "be renamed to two spellings, leaving 'token' as an incomplete type."
+    "be renamed to two spellings, leaving 'token' as an incomplete type.",
 )
 @pytest.mark.parametrize("order", permutations(["a.c", "b.c"]), ids="-".join)
 def test_typedef_struct_forward_decl_completed_differently_in_two_tus(
@@ -1594,7 +1697,7 @@ def genuine_conflict_tus(tmp_path_factory: pytest.TempPathFactory) -> list[Path]
     )
 
 
-@pytest.mark.xfail(reason="Known limitation")
+@pytest.mark.xfail(strict=True, reason="Known limitation")
 @pytest.mark.parametrize("order", permutations(["a.c", "b.c", "c.c"]), ids="-".join)
 def test_shared_header_entity_inside_genuine_conflict_gets_single_spelling(
     genuine_conflict_tus: list[Path], order: tuple[str, ...]
@@ -1682,6 +1785,7 @@ def cv_qualified_alias_tus(tmp_path_factory: pytest.TempPathFactory) -> list[Pat
 
 
 @pytest.mark.xfail(
+    strict=True,
     reason="A cv-qualified typedef is a type of its own, so it cannot adopt the split "
     "tag's spelling and is rejected rather than silently losing its qualifier.",
 )
@@ -1775,6 +1879,7 @@ def chained_alias_tus(tmp_path_factory: pytest.TempPathFactory) -> list[Path]:
 
 
 @pytest.mark.xfail(
+    strict=True,
     reason="A typedef of a typedef must be rebuilt on the link it names rather than "
     "collapsed onto the tag, so it is rejected instead of flattening the chain.",
 )
@@ -1892,4 +1997,128 @@ def test_header_defined_gnu_source_with_default_source_flag(
     assert success, (
         f"Consolidated code does not compile (header-defined _GNU_SOURCE lost):\n{error}\n\n"
         f"Consolidated output:\n{consolidated}"
+    )
+
+
+@pytest.fixture(scope="module")
+def typedef_shadowed_by_function_tus(tmp_path_factory: pytest.TempPathFactory) -> list[Path]:
+    return _build_tus(
+        tmp_path_factory.mktemp("typedef_shadowed_by_function"),
+        {
+            "common.h": """\
+                typedef int slot;
+                """,
+            # `slot_alias` is written per-TU rather than shared, so its two definitions have
+            # different presumed paths and it reaches the rename check
+            "a.c": """\
+                #include "common.h"
+
+                typedef slot slot_alias;
+
+                int use_a(slot_alias v) { return (int)v; }
+                """,
+            "b.c": """\
+                #include "common.h"
+
+                typedef slot slot_alias;
+
+                int use_b(slot_alias v) { return (int)v + 1; }
+                """,
+            "c.c": """\
+                static int slot(void) { return 0; }
+
+                int use_c(void) { return slot(); }
+                """,
+        },
+    )
+
+
+@pytest.mark.parametrize("order", permutations(["a.c", "b.c", "c.c"]), ids="-".join)
+def test_typedef_shadowed_by_function_does_not_split_its_aliases(
+    typedef_shadowed_by_function_tus: list[Path], order: tuple[str, ...]
+):
+    # A tag spelling carries its keyword, but a typedef does not, so `typedef int slot;` and
+    # `static int slot(void);` land under one spelling. The function says nothing about what
+    # the typedef denotes: every TU that reads `slot` as a type reads the same one, so
+    # `slot_alias` still names a single type and must keep its spelling.
+    base = typedef_shadowed_by_function_tus[0].parent
+    by_name = {tu.name: tu for tu in typedef_shadowed_by_function_tus}
+
+    compile_commands = _write_compile_commands(
+        base, [by_name[n] for n in order], extra_flags=f"-I{base}"
+    )
+    consolidated = consolidate_init(compile_commands, source_priority=[])
+
+    text = str(consolidated)
+    assert "a_slot_alias" not in text and "b_slot_alias" not in text, consolidated
+    # One reading of the type means one typedef survives the dedupe
+    assert text.count("slot_alias;") == 1, consolidated
+
+    # The typedef and the function genuinely collide, so that spelling is still split
+    assert "int use_c(void) { return slot(); }" not in text, consolidated
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, (
+        f"Consolidated code does not compile:\n{error}\n\nConsolidated output:\n{consolidated}"
+    )
+
+
+@pytest.fixture(scope="module")
+def rename_target_taken_by_tag_tus(tmp_path_factory: pytest.TempPathFactory) -> list[Path]:
+    base = tmp_path_factory.mktemp("rename_target_taken_by_tag")
+    return _build_tus(
+        base,
+        {
+            # A system header, so its cursors are absent from `local_names` and the tag is
+            # known only by its qualified spelling
+            "sysinc/fake_sys.h": """\
+                struct a_S { long sys_field; };
+                """,
+            # `struct S` is completed differently here and in b.c, so a.c's copy is renamed
+            # to `a_S` -- the spelling the system header already gives a different struct
+            "a.c": """\
+                struct S { int a; };
+
+                int use_a(struct S *p) { return p->a; }
+                """,
+            "b.c": """\
+                struct S { char *b; };
+
+                int use_b(struct S *p) { return (int)*p->b; }
+                """,
+            "c.c": """\
+                #include <fake_sys.h>
+
+                int use_c(struct a_S *p) { return (int)p->sys_field; }
+                """,
+        },
+        cflags=[f"-isystem{base / 'sysinc'}"],
+    )
+
+
+@pytest.mark.parametrize("order", permutations(["a.c", "b.c", "c.c"]), ids="-".join)
+def test_rename_does_not_take_a_spelling_a_tag_already_holds(
+    rename_target_taken_by_tag_tus: list[Path], order: tuple[str, ...]
+):
+    # Candidate spellings are unqualified, so the "already taken" guard has to be checked
+    # against unqualified names. A tag is only ever keyed as `struct a_S`, which never
+    # matches the candidate `a_S`, and the single rename pass gets no chance to notice that
+    # the rename landed on top of an existing struct.
+    base = rename_target_taken_by_tag_tus[0].parent
+    by_name = {tu.name: tu for tu in rename_target_taken_by_tag_tus}
+
+    compile_commands = _write_compile_commands(
+        base, [by_name[n] for n in order], extra_flags=f"-isystem{base / 'sysinc'}"
+    )
+    consolidated = consolidate_init(compile_commands, source_priority=[])
+
+    text = str(consolidated)
+    # The system header's struct is the only one entitled to that tag
+    assert "long sys_field;" in text, consolidated
+    assert text.count("struct a_S {") == 1, consolidated
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, (
+        f"Consolidated code does not compile (rename collided with an existing tag):\n"
+        f"{error}\n\nConsolidated output:\n{consolidated}"
     )

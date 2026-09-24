@@ -1,13 +1,15 @@
 #
-# Copyright (C) 2025 Intel Corporation
+# Copyright (C) 2026 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
 #
 
 MAKEFILE_DIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+IDEAS_MAKEFILE := ${MAKEFILE_DIR}/IDEAS.mk
 include ${MAKEFILE_DIR}/VARIABLES.mk
 
-BEAR_VERSION = 4.1.5## bear version to install
+# Arguments for the inner Make invocation from an example target
+IDEAS_MAKE_ARGS = --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D)
 
 HF_TOKEN = ## Hugging Face token (optional, recommended for faster download speed)
 HF_CACHE = ${HOME}/.cache/huggingface## Hugging Face cache dir on host
@@ -25,8 +27,9 @@ VLLM_RECIPE = zai-org/GLM-5.2-FP8 \
     --reasoning-parser glm45 \
     --max-model-len auto## See https://recipes.vllm.ai/
 
-EXAMPLES_DIR := examples
-ALL_EXAMPLES := $(sort $(patsubst %/test_case,%,$(shell find ${EXAMPLES_DIR} -maxdepth 3 -name test_case -type d)))
+EXAMPLES_DIR := examples/Test-Corpus/Public-Tests
+EXAMPLES_BATTERY := B02_
+ALL_EXAMPLES := $(sort $(patsubst %/test_case,%,$(shell find ${EXAMPLES_DIR} -maxdepth 3 -name test_case -type d | grep -E '(${EXAMPLES_BATTERY})')))
 EXAMPLES ?= ${ALL_EXAMPLES}## List of examples to run on
 
 ifeq ($(EXAMPLES),)
@@ -36,44 +39,10 @@ endif
 
 all: help ;
 
-.PHONY: docker/build
-docker/build:## Build translation Docker image
-docker/build: docker/docker_build.log
-
-.PRECIOUS: docker/docker_build.log
-docker/docker_build.log: docker/ideas.Dockerfile uv.lock pyproject.toml
-	cp uv.lock pyproject.toml docker/
-	cd docker && docker build --build-arg USER_UID=$(shell id -u) \
-                         --build-arg USER_GID=$(shell id -g) \
-                         -f ideas.Dockerfile -t ideas-$(shell id -u) .
-	rm docker/uv.lock docker/pyproject.toml
-	docker images --quiet ideas-$(shell id -u):latest > $@
-
-.PHONY: examples/docker
-examples/docker:## Mount all examples to the translation Docker image
-examples/docker: docker/docker_build.log
-	mkdir -p $(foreach ex,${EXAMPLES},${MAKEFILE_DIR}/${ex}/${TRANSLATION_DIR})
-	${DOCKER_RUN} \
-      --mount type=tmpfs,dst=${MAKEFILE_DIR}/examples \
-      $(foreach ex,${EXAMPLES},\
-        --mount type=tmpfs,dst=${MAKEFILE_DIR}/${ex} \
-        --mount type=bind,src=${MAKEFILE_DIR}/${ex}/test_case,dst=${MAKEFILE_DIR}/${ex}/test_case \
-        --mount type=bind,src=${MAKEFILE_DIR}/${ex}/${TRANSLATION_DIR},dst=${MAKEFILE_DIR}/${ex}/${TRANSLATION_DIR}) \
-      --env TRANSLATION_DIR \
-      --env "EXAMPLES=${EXAMPLES}" \
-      -it ${DOCKER_IMAGE} bash
-
-examples/%/docker:##Mount specific example to translation Docker image
-examples/%/docker: docker/docker_build.log
-	mkdir -p ${MAKEFILE_DIR}/$(@D)/${TRANSLATION_DIR}
-	${DOCKER_RUN} \
-      --mount type=tmpfs,dst=${MAKEFILE_DIR}/examples \
-      --mount type=tmpfs,dst=${MAKEFILE_DIR}/$(@D) \
-      --mount type=bind,src=${MAKEFILE_DIR}/$(@D)/test_case,dst=${MAKEFILE_DIR}/$(@D)/test_case \
-      --mount type=bind,src=${MAKEFILE_DIR}/$(@D)/${TRANSLATION_DIR},dst=${MAKEFILE_DIR}/$(@D)/${TRANSLATION_DIR} \
-      --env TRANSLATION_DIR \
-      --env EXAMPLES=$(@D) \
-      -it ${DOCKER_IMAGE} bash
+include ${MAKEFILE_DIR}/INSTALL.mk
+INCLUDE_DOCKER_RULES := 1
+unexport INCLUDE_DOCKER_RULES
+include ${MAKEFILE_DIR}/docker/DOCKER.mk
 
 .PHONY: vllm/serve
 vllm/serve:## Start vLLM server
@@ -82,40 +51,6 @@ vllm/serve:## Start vLLM server
 .PHONY: vllm/kill
 vllm/kill:## Gracefully stop the running vLLM server
 	docker stop ${VLLM_NAME}
-
-.PHONY: install
-install: install-uv install-rust ## Install uv and Rust
-
-.PHONY: install-uv
-install-uv:## Install uv@0.11.13
-	curl -LsSf https://astral.sh/uv/0.11.13/install.sh | sh
-
-.PHONY: install-rust
-install-rust:## Install Rust@1.88.0 and tools
-	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain 1.88.0
-	rustup component add rustfmt
-	rustup component add llvm-tools-preview --toolchain 1.88.0-x86_64-unknown-linux-gnu
-	cargo install bindgen-cli --version 0.72.1
-	cargo install cargo-llvm-cov --version 0.8.6
-	cargo install cargo-nextest --version 0.9.114 --locked
-
-.PHONY: install-clang
-install-clang:## Install Clang-21, must be sudo
-	wget https://apt.llvm.org/llvm.sh
-	chmod +x llvm.sh
-	-./llvm.sh 21 all
-	rm ./llvm.sh
-
-.PHONY: install-sys-deps
-install-sys-deps:## Install system dependencies, must be sudo
-	apt install libpcre3-dev libpcre2-dev
-
-.PHONY: install-bear
-install-bear:## Install bear ${BEAR_VERSION} from source (requires Rust)
-	git clone --branch ${BEAR_VERSION} --depth 1 https://github.com/rizsotto/Bear /tmp/bear
-	cd /tmp/bear && cargo build --release && ./scripts/install.sh
-	rm -rf /tmp/bear
-
 
 .PHONY: FORCE
 FORCE:
@@ -126,55 +61,84 @@ examples: $(addsuffix /print,${EXAMPLES}) ;
 examples/%/print: FORCE
 	@if [ -d "$(@D)" ]; then echo "$(@D)"; fi
 
-.PHONY: examples/init
-examples/init:## Initialize all examples
-examples/init: $(addsuffix /init,${EXAMPLES}) ;
-	@echo "# ${TRANSLATION_DIR}"
-examples/%/init:## Initialize specific example
-examples/%/init: FORCE
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) bear
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) init
-
-
 .PHONY: examples/bear
 examples/bear:## Use bear to intercept compile and linker commands
-examples/bear: $(addsuffix /bear,${EXAMPLES}) ;
+examples/bear: $(addsuffix /.bear,${EXAMPLES}) ;
 ifneq (${VERBOSE},0)
 	@echo ""
 endif
 	@echo "--- Bear ---"
 	@find ${EXAMPLES} -maxdepth 2 -path "*/build-ninja/events.jsonl" \( -size +0 -printf 'SUCCEEDED\n' -o -printf 'FAILED\n' \) | sort -r | uniq -c
+examples/%/.bear: examples/%/test_case/CMakeLists.txt FORCE ${DOCKER_READY}
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} bear
 examples/%/bear:## Bear intercept and build specific example
 examples/%/bear: FORCE
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) bear
+	-@$(MAKE) --no-print-directory examples/bear EXAMPLES="$(@D)"
+examples/libgit2_noconfig_notests/test_case/CMakeLists.txt:  # libgit2 (no config, no tests)
+	rsync -rvhz /raid/datasets/P02/libgit2_noconfig_notests/ examples/libgit2_noconfig_notests/
 
+.PHONY: examples/init
+examples/init:## Initialize all examples
+examples/init: $(addsuffix /.init,${EXAMPLES}) ;
+	@echo "# ${TRANSLATION_DIR}"
+examples/%/.init: examples/%/.bear FORCE
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} init
+examples/%/init:## Initialize specific example
+examples/%/init: FORCE
+	-@$(MAKE) --no-print-directory examples/init EXAMPLES="$(@D)"
 
 .PHONY: examples/testgen
-examples/testgen:## Generate I/O test vectors for all targets in all C examples with an agent
-examples/testgen: $(addsuffix /testgen,${EXAMPLES})
-examples/%/testgen:## Generate I/O test vectors for all targets in a specific C example with an agent
+examples/testgen:## Generate I/O tests and check that they pass for all examples
+examples/testgen: $(addsuffix /.testgen,${EXAMPLES})
+ifneq (${VERBOSE},0)
+	@echo ""
+endif
+	@echo "--- Project Completion Count for ${TESTGEN_CACHE}/cargo_io.jsonl ---"
+	@find ${EXAMPLES} -maxdepth 2 -path '*/${TESTGEN_CACHE}/cargo_io.jsonl' -exec ./scripts/test_log_stats.sh {} + | cut -d" " -f1 | sort | uniq -c
+ifneq (${VERBOSE},0)
+	@echo ""
+	@find ${EXAMPLES} -maxdepth 2 -path '*/${TESTGEN_CACHE}/cargo_io.jsonl' -exec ./scripts/test_log_stats.sh {} + | egrep -v "^complete" | sort | sed 's|/${TESTGEN_CACHE}/cargo_io.jsonl$$||'
+endif
+	@echo ""
+	@echo "--- Aggregated Test Count for ${TESTGEN_CACHE}/cargo_io.jsonl ---"
+	@find ${EXAMPLES} -maxdepth 2 -path '*/${TESTGEN_CACHE}/cargo_io.jsonl' -exec cat {} + \
+      | jq -r 'select(.type=="test" and (.event=="ok" or .event=="failed")) | if .event == "ok" then "ok" elif .reason == "time limit exceeded" then "TIMEOUT" else "FAILED" end' \
+      | LC_ALL=C sort -r | uniq -c
+examples/%/.testgen: examples/%/.bear FORCE
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} testgen TRANSLATION_DIR=${TESTGEN_CACHE}
+examples/%/testgen:## Generate I/O tests and check that they pass for a specific example
 examples/%/testgen: FORCE
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) bear
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) testgen
+	-@$(MAKE) --no-print-directory examples/testgen EXAMPLES="$(@D)"
 
 
 .PHONY: examples/translate
 examples/translate:## Translate all examples
-examples/translate: $(addsuffix /translate,${EXAMPLES})
+examples/translate: $(addsuffix /.translate,${EXAMPLES})
 ifneq (${VERBOSE},0)
 	@echo ""
 endif
 	@echo "--- Translation Count for ${TRANSLATION_DIR} ---"
-	@find ${EXAMPLES} -maxdepth 2 -path "*/${TRANSLATION_DIR}/translate.log" | wc -l
+	@find ${EXAMPLES} -maxdepth 3 -path "*/${TRANSLATION_DIR}/*/translate.log" -exec grep -H '\[ideas.translate\]' {} + | \
+      sed -En -e 's#^(.+)/[^/]+/[^/]+/translate\.log:.* - Translated .* `([^`]+)`.*:.*#translated \1 \2#p' \
+              -e 's#^(.+)/[^/]+/[^/]+/translate\.log:.* - Failed .* `([^`]+)`.*:.*#FAILED \1 \2#p' | \
+      cut -d" " -f1 | sort | uniq -c
+ifneq (${VERBOSE},0)
+	@echo ""
+	@find ${EXAMPLES} -maxdepth 3 -path "*/${TRANSLATION_DIR}/*/translate.log" -exec grep -H '\[ideas.translate\]' {} + | \
+      sed -En -e 's#^(.+)/[^/]+/[^/]+/translate\.log:.* - Translated .* `([^`]+)`.*:.*#translated \1 \2#p' \
+              -e 's#^(.+)/[^/]+/[^/]+/translate\.log:.* - Failed .* `([^`]+)`.*:.*#FAILED \1 \2#p' | \
+      grep -v "^translated" | sort
+endif
+examples/%/.translate: examples/%/.bear FORCE
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} translate
 examples/%/translate:## Translate specific example
 examples/%/translate: FORCE
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) bear
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) translate
+	-@$(MAKE) --no-print-directory examples/translate EXAMPLES="$(@D)"
 
 
 .PHONY: examples/build
 examples/build:## Build all translated examples
-examples/build: $(addsuffix /build,${EXAMPLES})
+examples/build: $(addsuffix /.build,${EXAMPLES})
 ifneq (${VERBOSE},0)
 	@echo ""
 endif
@@ -184,15 +148,43 @@ ifneq (${VERBOSE},0)
 	@echo ""
 	@find ${EXAMPLES} -maxdepth 2 -path "*/${TRANSLATION_DIR}/build.log" -size +0 -printf 'BROKEN %h\n' | sed 's|/${TRANSLATION_DIR}$$||' | sort
 endif
+examples/%/.build: examples/%/.bear FORCE
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} build
 examples/%/build:## Build specific translated example
 examples/%/build: FORCE
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) bear
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) build
+	-@$(MAKE) --no-print-directory examples/build EXAMPLES="$(@D)"
 
+.PHONY: examples/baseline
+examples/baseline:## Run the test vectors of all examples against their C build
+examples/baseline: $(addsuffix /.baseline,${EXAMPLES})
+ifneq (${VERBOSE},0)
+	@echo ""
+endif
+	@echo "--- Project Completion Count for build-ninja/baseline.json ---"
+	@find ${EXAMPLES} -maxdepth 2 -path '*/build-ninja/baseline.json' \( -size +0 -printf 'complete\n' -o -printf 'EMPTY\n' \) | LC_ALL=C sort -r | uniq -c
+ifneq (${VERBOSE},0)
+	@echo ""
+	@find ${EXAMPLES} -maxdepth 2 -path '*/build-ninja/baseline.json' -size 0 -printf 'EMPTY %h\n' | sort
+endif
+	@echo ""
+	@echo "--- Aggregated Test Count for build-ninja/baseline.json ---"
+	@find ${EXAMPLES} -maxdepth 2 -path '*/build-ninja/baseline.json' -exec cat {} + \
+      | jq -r '.[].result' | sort | uniq -c
+ifneq (${VERBOSE},0)
+	@echo ""
+	@find ${EXAMPLES} -maxdepth 2 -path '*/build-ninja/baseline.json' -size +0 -print0 \
+      | xargs -0 -r jq -r 'to_entries[] | select(.value.result != "Pass" and .value.result != "Skip") | "\(.value.result) \(input_filename) \(.key)"' \
+      | sed 's|/build-ninja/baseline.json | |' | sort
+endif
+examples/%/.baseline: examples/%/.bear FORCE
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} baseline
+examples/%/baseline:## Run the test vectors of a specific example against its C build
+examples/%/baseline: FORCE
+	-@$(MAKE) --no-print-directory examples/baseline EXAMPLES="$(@D)"
 
 .PHONY: examples/test
 examples/test:## Test all translated examples
-examples/test: $(addsuffix /test,${EXAMPLES})
+examples/test: $(addsuffix /.test,${EXAMPLES})
 ifneq (${VERBOSE},0)
 	@echo ""
 endif
@@ -200,31 +192,35 @@ endif
 	@find ${EXAMPLES} -maxdepth 2 -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.jsonl' -exec ./scripts/test_log_stats.sh {} + | cut -d" " -f1 | sort | uniq -c
 ifneq (${VERBOSE},0)
 	@echo ""
-	@find ${EXAMPLES} -maxdepth 2 -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.jsonl' -exec ./scripts/test_log_stats.sh {} + | egrep -v "^complete" | sort | sed 's|/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.jsonl$$||'
+	@find ${EXAMPLES} -maxdepth 2 -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.jsonl' -exec ./scripts/test_log_stats.sh {} + | egrep -v "^complete" | sort | sed 's|/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.jsonl$$||' | sort
 endif
 	@echo ""
 	@echo "--- Aggregated Test Count for ${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.jsonl ---"
 	@find ${EXAMPLES} -maxdepth 2 -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.jsonl' -exec cat {} + \
-	  | jq -r 'select(.type=="test" and (.event=="ok" or .event=="failed")) | .event' \
-	  | sed 's/failed/FAILED/' | sort -r | uniq -c
+      | jq -r 'select(.type=="test" and (.event=="ok" or .event=="failed")) | if .event == "ok" then "ok" elif .reason == "time limit exceeded" then "TIMEOUT" else "FAILED" end' \
+      | LC_ALL=C sort -r | uniq -c
+examples/%/.test: examples/%/.bear FORCE
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} test
 examples/%/test:## Test specific translated example
 examples/%/test: FORCE
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) bear
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) test
+	-@$(MAKE) --no-print-directory examples/test EXAMPLES="$(@D)"
 
 .PHONY: examples/cost
 examples/cost:## Print cost of all translated examples
-examples/cost: $(addsuffix /cost,${EXAMPLES})
+examples/cost: $(addsuffix /.cost,${EXAMPLES})
 	@echo "--- Aggregated Cost for ${TRANSLATION_DIR} ---"
 	@find ${EXAMPLES} -maxdepth 2 -path "*/${TRANSLATION_DIR}/cost.tsv" -exec cat {} + | sort -k1 | tr -d '$$,' | datamash -g1 sum 3 sum 4 sum 5 sum 6 | awk '{printf "%28s $$%10.4f %12\047d tok ( %12\047d in / %12\047d out)\n",$$1,$$2,$$3,$$4,$$5}'
+examples/%/.cost: examples/%/.bear FORCE
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} cost
 examples/%/cost:## Print cost for specific translated example
 examples/%/cost: FORCE
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) bear
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) cost
+	-@$(MAKE) --no-print-directory examples/cost EXAMPLES="$(@D)"
 
 .PHONY: examples/stats
 examples/stats:## Print translation stats for all examples
 examples/stats:
+	-@$(MAKE) --no-print-directory examples/translate
+	@echo ""
 	-@$(MAKE) --no-print-directory examples/build
 	@echo ""
 	-@$(MAKE) --no-print-directory examples/test
@@ -232,24 +228,27 @@ examples/stats:
 	-@$(MAKE) --no-print-directory examples/cost VERBOSE=0
 
 examples/%/stats:##Print translation stats for specific example
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) build VERBOSE=1
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) test VERBOSE=1
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) cost VERBOSE=1
+examples/%/stats: FORCE
+	-@$(MAKE) --no-print-directory examples/stats EXAMPLES="$(@D)"
 
-
+.PHONY: examples/reset
+examples/reset:## Start a fresh run in ${TRANSLATION_DIR} of all examples, keeping the old one on a branch
+examples/reset: $(addsuffix /reset,${EXAMPLES})
+examples/%/reset:## Start a fresh run in ${TRANSLATION_DIR} of specific example, keeping the old one on a branch
+examples/%/reset: FORCE
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} reset
 
 .PHONY: examples/clean
 examples/clean:## Clean all examples
 examples/clean: $(addsuffix /clean,${EXAMPLES})
 examples/%/clean:## Clean specific example
 examples/%/clean: FORCE
-	-@$(MAKE) --no-print-directory -f $(IDEAS_MAKEFILE) -C $(@D) clean
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} clean
 
 # Global clean
+clean:## Clean Docker and Rust artifacts
 clean:
-	rm -rf docker/docker_build.log
-	rm -rf examples
-	git checkout HEAD examples
+	find examples -type d -exec test -e '{}/Cargo.toml' \; -prune -exec cargo clean --manifest-path '{}/Cargo.toml' \;
 
 # help
 RESET := \033[0;0m

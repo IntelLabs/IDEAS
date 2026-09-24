@@ -53,6 +53,12 @@ def add_deps_for_exec(crate: Crate) -> None:
     crate.invalidate_metadata()
 
 
+def add_deps_for_lib(crate: Crate) -> None:
+    # The template parses `cargo build --message-format=json` to locate the candidate library
+    crate.cargo_add(dep="serde_json@1", section="dev")
+    crate.invalidate_metadata()
+
+
 def convert_tests_for_exec(test_cases: list[Path]) -> str:
     test_cases = list(filter(is_bin_test, test_cases))
     if len(test_cases) == 0:
@@ -139,13 +145,6 @@ def is_lib_test(test_case: Path):
     return "lib_state_in" in test_case_json and "lib_state_out" in test_case_json
 
 
-def add_deps_for_lib(crate: Crate) -> None:
-    # Add test dependencies
-    crate.cargo_add(dep="once_cell@1.21.3", section="dev")
-    crate.cargo_add(dep="test-cdylib@1.1.0", section="dev")
-    crate.invalidate_metadata()
-
-
 def convert_tests_for_lib(
     test_cases: list[Path],
     runner_manifest: Path | None,
@@ -162,10 +161,13 @@ def convert_tests_for_lib(
     # Load template
     template = template_path.read_text()
 
+    # cando2 derives the candidate name, test vectors and artifact dir from the runner's parent
+    test_root_dir = runner_manifest.parent.parent if runner_manifest else None
+
     # FIXME: This currently assumes that the macro generate_tests! is defined in the template
     # Use the generate_tests! macro to add tests
     lines = ["\n", "generate_tests! {"]
-    lines.append(f'    "{runner_manifest}";')
+    lines.append(f'    "{runner_manifest}", "{test_root_dir}";')
     for test_case in test_cases:
         # Skip tests that exercise undefined behavior
         test_case_json = json.loads(test_case.read_text())

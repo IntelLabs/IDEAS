@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# Allowlist
+!pyproject.toml
+!uv.lock
+!INSTALL.mk
+!docker/ideas.Dockerfile
+!docker/ideas.bashrc

@@ -1,5 +1,5 @@
 default_language_version:
-  python: python3.11
+  python: python3.13
 
 exclude: ^(examples/|lib/|tools/|test/fixtures/)
 
@@ -23,7 +23,7 @@ repos:
       - id: pretty-format-json
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.13
+    rev: v0.13.0
     hooks:
       # Run the linter.
       - id: ruff
@@ -38,6 +38,6 @@ repos:
 
   - repo: https://github.com/astral-sh/uv-pre-commit
     # uv version.
-    rev: 0.7.12
+    rev: 0.11.13
     hooks:
       - id: uv-lock

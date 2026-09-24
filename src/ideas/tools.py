@@ -8,10 +8,13 @@ import os
 import re
 import json
 import shutil
+import signal
+from textwrap import dedent
 
 import tomlkit
 import logging
 import subprocess
+from contextlib import suppress
 from functools import cached_property
 from typing import Any, Literal
 from tempfile import TemporaryDirectory
@@ -34,22 +37,24 @@ class VCS:
         if self.vcs == "none":
             return True
 
-        ok, out = False, ""
         if not force_init:
-            ok, out = self("rev-parse --abbrev-ref HEAD")
-        if not ok:
-            ok, out = self("init --initial-branch=main")
-        if not ok:
-            raise ValueError(f"Failed to initialize git in {self.repo_dir}!\n{out}")
-        return ok
+            ok, _ = self("rev-parse --abbrev-ref HEAD")
+            if ok:
+                return True
 
-    def add(self, *paths: Path) -> bool:
+        for cmd in ("init --initial-branch=main", f"config core.excludesFile {os.devnull}"):
+            ok, out = self(cmd)
+            if not ok:
+                raise ValueError(f"Failed to initialize git in {self.repo_dir}!\n{out}")
+        return True
+
+    def add(self, *paths: Path, force: bool = False) -> bool:
         if self.vcs == "none":
             return True
 
         ok = True
         for path in paths:
-            ok, out = self(f"add {path}")
+            ok, out = self(f"add {'-f ' if force else ''}{path}")
             if not ok:
                 raise ValueError(f"Failed to add {path}!\n{out}")
         return ok
@@ -109,8 +114,13 @@ class Crate:
         vcs: Literal["none", "git"] = "none",
         template: Literal["bin", "lib"] | None = None,
         reinit: bool = False,
+        *,
+        jobs: int | None = None,
+        codegen_units: int | None = None,
     ):
         self.cargo_toml = cargo_toml.resolve()
+        self.jobs = jobs
+        self.codegen_units = codegen_units
 
         crate_dir = self.cargo_toml.parent
         self.vcs = VCS(repo_dir=crate_dir, vcs=vcs)
@@ -258,6 +268,43 @@ class Crate:
         self.invalidate_metadata()
         return output
 
+    # Workaround for https://github.com/rust-lang/cargo/issues/9454
+    def add_self_alias(self, alias: str) -> None:
+        lib_name = self.lib_name
+        if lib_name is None:
+            raise ValueError(f"Crate {self.name} has no library target to alias as `{alias}`!")
+
+        shim_name = f"{self.name}-{alias.replace('_', '-')}"
+        shim_dir = self.cargo_toml.parent / alias
+        (shim_dir / "src").mkdir(parents=True, exist_ok=True)
+        (shim_dir / "src" / "lib.rs").write_text(f"pub use {lib_name}::*;\n")
+        (shim_dir / "Cargo.toml").write_text(
+            dedent(f"""\
+                [package]
+                name = "{shim_name}"
+                version = "0.1.0"
+                edition = "{self.root_package["edition"]}"
+
+                [dependencies]
+                {lib_name} = {{ path = "..", package = "{self.name}" }}
+
+                [lib]
+                test = false
+                doctest = false
+            """)
+        )
+
+        # Add the shim crate as a fixed-name dev dependency in this crate
+        manifest_path = Path(self.cargo_toml)
+        doc = tomlkit.parse(manifest_path.read_text())
+        dev_deps = doc.setdefault("dev-dependencies", tomlkit.table())
+        entry = tomlkit.inline_table()
+        entry["path"] = alias
+        entry["package"] = shim_name
+        dev_deps[alias] = entry
+        manifest_path.write_text(tomlkit.dumps(doc))
+        self.invalidate_metadata()
+
     def cargo_feature(self, **features: list[str]) -> None:
         # Set/overwrite new features
         cargo_toml = tomlkit.loads(self.cargo_toml.read_text())
@@ -339,18 +386,17 @@ class Crate:
         self.cargo_toml.write_text(tomlkit.dumps(cargo_toml))
         self.invalidate_metadata()
 
-    def cargo_clean(self) -> None:
+    def cargo_clean(self, workspace: bool = False) -> None:
+        manifest_path = self.workspace_root / "Cargo.toml" if workspace else self.cargo_toml
         cmd = [
             "cargo",
             "clean",
             "--quiet",
-            f"--manifest-path={self.cargo_toml}",
+            f"--manifest-path={manifest_path}",
         ]
         success, output, error, _ = run_subprocess(cmd)
         if not success:
-            raise RuntimeError(
-                f"Failed to clean crate at {self.cargo_toml} with error:\n\n{output + error}"
-            )
+            logger.warning(f"Failed to clean crate at {manifest_path}:\n\n{output + error}")
 
     def cargo_build(self) -> tuple[bool, str]:
         cmd = [
@@ -360,13 +406,47 @@ class Crate:
             "--color=never",
             f"--manifest-path={self.cargo_toml}",
         ]
-        builds, output, error, _ = run_subprocess(cmd)
+        if self.jobs is not None:
+            cmd.extend(["-j", str(self.jobs)])
+
+        builds, output, error, _ = run_subprocess(cmd, env=self._cargo_env())
         return builds, output + error
+
+    def _cargo_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        if self.codegen_units is not None:
+            rustflags = env.get("RUSTFLAGS", "")
+            env["RUSTFLAGS"] = (rustflags + f" -C codegen-units={self.codegen_units}").strip()
+        return env
+
+    def cargo_test_list(self, name: str, features: list[str] | None = None) -> list[str]:
+        cmd = [
+            "cargo",
+            "nextest",
+            "list",
+            "--color=never",
+            "--cargo-quiet",
+            f"--manifest-path={self.cargo_toml}",
+            "--message-format=json",
+        ]
+        if name:
+            cmd.extend(["--test", name])
+        if features:
+            cmd.extend(["--features", ",".join(features)])
+
+        ok, output, error, _ = run_subprocess(cmd)
+        if not ok:
+            raise RuntimeError(
+                f"Failed to list the tests of `{name}` in {self.cargo_toml.parent}!\n{output + error}"
+            )
+        listing = json.loads(output)
+        return [
+            test for suite in listing["rust-suites"].values() for test in suite["testcases"]
+        ]
 
     def cargo_test(
         self,
         name: str,
-        test_harness: Literal["nextest run", "test"] = "nextest run",
         quiet: bool = True,
         fail_fast: bool = False,
         build_only: bool = False,
@@ -376,19 +456,17 @@ class Crate:
     ) -> tuple[bool, str, str, int | Literal["timeout"]]:
         cmd = [
             "cargo",
-            *test_harness.split(),
+            "nextest",
+            "run",
             "--color=never",
             f"--manifest-path={self.cargo_toml}",
         ]
-        if not fail_fast:
+        if self.jobs is not None:
+            cmd.extend(["--build-jobs", str(self.jobs)])
+        if not fail_fast and not build_only:
             cmd.append("--no-fail-fast")
         if quiet:
-            if test_harness == "nextest run":
-                cmd.append("--cargo-quiet")
-            elif test_harness == "test":
-                cmd.append("--quiet")
-            else:
-                raise ValueError(f"Unsupported test harness: {test_harness}")
+            cmd.append("--cargo-quiet")
         if lib:
             cmd.append("--lib")
             if name:
@@ -398,22 +476,17 @@ class Crate:
         if build_only:
             cmd.append("--no-run")
 
-        env = os.environ.copy()
+        env = self._cargo_env()
         if message_format is not None:
             cmd.extend(["--message-format", message_format])
-            if message_format == "libtest-json" and test_harness == "nextest run":
+            if message_format == "libtest-json":
                 # https://nexte.st/docs/machine-readable/libtest-json/
                 env["NEXTEST_EXPERIMENTAL_LIBTEST_JSON"] = "1"
         if skip:
-            if test_harness == "nextest run":
-                excluded_tests = [f"test(/^{re.escape(test_name)}$/)" for test_name in skip]
-                expr = " and ".join(f"not {test_expr}" for test_expr in excluded_tests)
-                cmd.extend(["-E", expr])
-            else:
-                cmd.append("--")
-                cmd.append("--exact")
-                for test_name in skip:
-                    cmd.extend(["--skip", test_name])
+            excluded_tests = [f"test(/^{re.escape(test_name)}$/)" for test_name in skip]
+            expr = " and ".join(f"not {test_expr}" for test_expr in excluded_tests)
+            cmd.extend(["-E", expr])
+            cmd.append("--no-tests=pass")
         return run_subprocess(cmd, env=env)
 
     def cargo_nextest_config(
@@ -438,32 +511,52 @@ class Crate:
         return path.write_text(data, **kwargs)
 
 
+def _kill_group(
+    proc: "subprocess.Popen[str]", grace: float = 2.0, drain: float = 5.0
+) -> tuple[str, str]:
+    # SIGTERM first so the process group can clean up after itself, SIGKILL if it lingers
+    with suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+        with suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=grace)
+        # FIXME: Give grace to the process group, not just leader, to exit cleanly
+        os.killpg(proc.pid, signal.SIGKILL)
+
+    # A descendant that left the process group survives the kill and holds the pipes open
+    try:
+        stdout, stderr = proc.communicate(timeout=drain)
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout.decode(errors="replace") if e.stdout else ""
+        stderr = e.stderr.decode(errors="replace") if e.stderr else ""
+    return stdout, stderr
+
+
 def run_subprocess(
     cmd: list[str],
     input: str | None = None,
     timeout: float | None = None,
     **kwargs,
 ) -> tuple[bool, str, str, int | Literal["timeout"]]:
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-            input=input,
-            timeout=timeout,
-            **kwargs,
-        )
-        return True, result.stdout, result.stderr, result.returncode
-    except subprocess.CalledProcessError as e:
-        return False, e.stdout, e.stderr, e.returncode
-    except subprocess.TimeoutExpired as e:
-        return (
-            False,
-            e.stdout.decode() if e.stdout else "",
-            e.stderr.decode() if e.stderr else "",
-            "timeout",
-        )
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE if input is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        **kwargs,
+    )
+    with proc:
+        try:
+            stdout, stderr = proc.communicate(input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = _kill_group(proc)
+            return False, stdout, stderr, "timeout"
+        except BaseException:
+            # start_new_session detaches the child from the tty, so Ctrl-C never reaches it
+            _kill_group(proc)
+            raise
+    return proc.returncode == 0, stdout, stderr, proc.returncode
 
 
 def check_rust(
@@ -472,7 +565,7 @@ def check_rust(
     flags: list[str] | None = None,
     structured_output: bool = False,
 ) -> tuple[bool, str]:
-    cmd = ["rustc"]
+    cmd = ["rustc", "-Awarnings"]
 
     if flags:
         cmd.extend(flags)

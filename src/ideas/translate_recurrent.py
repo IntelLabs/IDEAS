@@ -4,331 +4,131 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-import re
-import math
-import json
+import shutil
 import logging
 from pathlib import Path
-from dataclasses import dataclass, field
-from collections.abc import Iterable
-from textwrap import indent
 from typing import Literal
+from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass, field, replace
 
 import dspy
 import networkx as nx
 
-from .ast_rust import CodeRust, strip_fns, mangle
-from .tools import Crate, MAX_DEPENDENT_CHARS, REDUCED_CONTEXT
+from . import model
+from .ast_rust import BindgenName, CodeRust
+from .ast_rust import mangle
+from .refine import CodeAttempt, Feedback
+from .hybrid import HybridSnapshot, HybridWriter
+from .oracle import Candidate, NullOracle, SymbolOracle, Verdict
+from .tools import Crate
+from .translate_context import TranslateContext, TranslationContext, WrapContext
 from .ast import Symbol, SymbolName, SymbolGroup
 from .ast import CodeC, TreeResult, create_symbol_ordering_key_fn
-from .ast import clang_make_global_, clang_make_extern_
-from .wrapper import bindgen, generate_unimplemented_function_wrapper
 from .wrapper import generate_unimplemented_type_wrapper
+from .wrapper import generate_unimplemented_variable_wrapper
+from .wrapper import WrapperGenerator, scope_errors, WrapperAttempt
+from .translate_snippet import SnippetTranslator, TranslationAttempt
 
 logger = logging.getLogger("ideas.translate_recurrent")
-
-
-WrapperName = str
-
-
-@dataclass(frozen=True)
-class TranslationContext:
-    crate_code: CodeRust
-    reference_code: CodeRust
-    dependent_code: CodeC
-    support_code: CodeC
-    wrappers: CodeRust
-
-    @classmethod
-    def build(
-        cls,
-        G: nx.DiGraph,
-        group: SymbolGroup,
-        groups: list[SymbolGroup],
-        symbols: dict[SymbolName, Symbol],
-        translations: dict[SymbolGroup, CodeRust] | None = None,
-        wrappers: dict[WrapperName, CodeRust] | None = None,
-    ) -> "TranslationContext":
-        if translations is None:
-            translations = {}
-        if wrappers is None:
-            wrappers = {}
-        descendants = nx.descendants(G, group)
-        already_translated = [g for g in groups if g in descendants]
-        immediate_already_translated = set(G.successors(group))
-        ancestors = nx.ancestors(G, group)
-        ancestor_deps = {succ for a in ancestors for succ in G.successors(a)}
-        to_be_translated = [
-            g for g in groups if g in ancestors | (ancestor_deps - descendants - {group})
-        ]
-        reference_groups = [g for g in groups if g in translations]
-        hops = nx.single_source_shortest_path_length(G, group)
-        return cls(
-            crate_code=cls._build_crate_code(reference_groups, translations),
-            reference_code=cls._build_reference_code(reference_groups, translations, hops),
-            dependent_code=cls._build_dependent_code(to_be_translated, symbols),
-            support_code=cls._build_support_code(
-                already_translated, immediate_already_translated, symbols
-            ),
-            wrappers=cls._build_wrapper_context(wrappers),
-        )
-
-    @staticmethod
-    def _build_crate_code(
-        reference_groups: list[SymbolGroup],
-        translations: dict[SymbolGroup, CodeRust],
-    ) -> CodeRust:
-        # Use all unique (dict.fromkeys) translations as the crate's current contents since many symbol names can map to the same translation
-        return CodeRust.join(dict.fromkeys(translations[g] for g in reference_groups))
-
-    @staticmethod
-    def _build_reference_code(
-        reference_groups: list[SymbolGroup],
-        translations: dict[SymbolGroup, CodeRust],
-        hops: dict[SymbolGroup, int],
-    ) -> CodeRust:
-        def trim_by_distance(ref_group: SymbolGroup) -> CodeRust:
-            match hops.get(ref_group):
-                case 1:
-                    # 1-hop successors keep full function bodies since they are likely to be directly relevant
-                    return translations[ref_group]
-                case 2:
-                    # 2-hop successors strip top-level function bodies since they are less likely to be directly relevant
-                    return strip_fns(translations[ref_group])
-                case _:
-                    # For distant or unreachable groups delete top-level functions but keep types,
-                    # since types may still be needed even when not reachable via static analysis
-                    return strip_fns(translations[ref_group], delete=True)
-
-        return CodeRust.join(dict.fromkeys(trim_by_distance(g) for g in reference_groups))
-
-    @staticmethod
-    def _build_support_code(
-        already_translated: list[SymbolGroup],
-        immediate_already_translated: set[SymbolGroup],
-        symbols: dict[SymbolName, Symbol],
-    ) -> CodeC:
-        # Gather support code in topological order.
-        # Reduce C support code context by turning non-immediate symbols into declarations. We keep
-        # immediate C code in full since they are more likely to be relevant for wrappers.
-        return CodeC.join(
-            symbols[name].code
-            if g in immediate_already_translated
-            else CodeC(symbols[name].llm_context_declaration)
-            for g in already_translated
-            for name in g
-        )
-
-    @classmethod
-    def _build_dependent_code(
-        cls,
-        to_be_translated: list[SymbolGroup],
-        symbols: dict[SymbolName, Symbol],
-        max_chars: int = MAX_DEPENDENT_CHARS,
-    ) -> CodeC:
-        # Gather dependent C code in topological order.
-        dependent_code = CodeC.join(symbols[name].code for g in to_be_translated for name in g)
-        if len(str(dependent_code)) > max_chars:
-            logger.warning(f"Dependent code exceeds max {len(str(dependent_code))}/{max_chars}")
-            dependent_code = cls._select_c_code(to_be_translated, symbols, max_chars)
-        return dependent_code
-
-    _MEMORY_PATTERN = re.compile(
-        r"\b(malloc|calloc|realloc|free|memcpy|memmove|memset|strdup|strndup|fopen|freopen|fclose)\b"
-    )
-    _POINTER_PATTERN = re.compile(r"->|\*|&|\[|\bNULL\b|\bsizeof\b")
-
-    @dataclass(frozen=True)
-    class _DependentCandidate:
-        group: SymbolGroup
-        full: CodeC
-        full_chars: int
-        score: float
-
-    @classmethod
-    def _select_c_code(
-        cls,
-        groups: list[SymbolGroup],
-        symbols: dict[SymbolName, Symbol],
-        max_chars: int,
-    ) -> CodeC:
-        candidates = cls._collect_dependent_candidates(groups, symbols)
-        chosen: set[SymbolGroup] = set()
-        total_chars = 0
-
-        # Select the most informative dependent bodies that fit within the remaining budget.
-        for candidate in sorted(
-            candidates,
-            key=lambda candidate: candidate.score / math.sqrt(max(candidate.full_chars, 1)),
-            reverse=True,
-        ):
-            if total_chars + candidate.full_chars > max_chars:
-                continue
-            chosen.add(candidate.group)
-            total_chars += candidate.full_chars
-
-        return CodeC.join(
-            candidate.full for candidate in candidates if candidate.group in chosen
-        )
-
-    @classmethod
-    def _collect_dependent_candidates(
-        cls,
-        groups: list[SymbolGroup],
-        symbols: dict[SymbolName, Symbol],
-    ) -> list:
-        candidates = []
-        for group in groups:
-            full = CodeC.join(symbols[name].code for name in group)
-            candidates.append(
-                cls._DependentCandidate(
-                    group=group,
-                    full=full,
-                    full_chars=len(str(full)),
-                    score=cls._score_dependent_group(group, symbols),
-                )
-            )
-        return candidates
-
-    @classmethod
-    def _score_dependent_group(
-        cls, group: SymbolGroup, symbols: dict[SymbolName, Symbol]
-    ) -> float:
-        score = 0.0
-
-        # Favor groups with function definitions
-        if any(symbols[name].is_function and symbols[name].is_definition for name in group):
-            score += 3.0
-
-        # Favor groups with memory or pointer-related code patterns
-        code = "\n".join(str(symbols[name].code) for name in group)
-        if cls._MEMORY_PATTERN.search(code):
-            score += 3.0
-        if cls._POINTER_PATTERN.search(code):
-            score += 2.0
-
-        # Favor smaller groups
-        return score + 1.0 / math.sqrt(max(len(code), 1))
-
-    @classmethod
-    def _build_wrapper_context(cls, wrappers: dict[WrapperName, CodeRust]) -> CodeRust:
-        context = CodeRust("")
-        for name, wrapper in wrappers.items():
-            if "fn c_to_r" in str(wrapper):
-                wrapper = cls._build_type_wrapper_context(wrapper)
-            elif "pub static mut" in str(wrapper):
-                pass
-            elif REDUCED_CONTEXT:
-                wrapper = None
-
-            if wrapper:
-                context += CodeRust(
-                    f"pub mod {name} {{\n" + indent(str(wrapper), " " * 4) + "\n}"
-                )
-        return context
-
-    @classmethod
-    def _build_type_wrapper_context(cls, wrapper: CodeRust) -> CodeRust:
-        # Strip tests from type wrapper
-        wrapper_src = str(wrapper)
-        test_idx = wrapper_src.find("#[cfg(test)]")
-        if test_idx != -1:
-            wrapper_src = wrapper_src[:test_idx].strip()
-        wrapper = CodeRust(wrapper_src)
-
-        # Strip functions from wrapper
-        wrapper = strip_fns(wrapper)
-
-        return wrapper
+snippet_logger = logging.getLogger("ideas.translate_snippet")
+wrapper_logger = logging.getLogger("ideas.wrapper")
 
 
 @dataclass
 class _State:
-    c_src: bytes
     rust_lib_src: bytes
     rust_main_src: bytes | None
-    hybrid_lib_src: bytes | None
-    hybrid_main_src: bytes | None
-    wrappers: dict[Path, bytes]
+    hybrid: HybridSnapshot
+
+
+@dataclass(frozen=True)
+class _WrapperPlan:
+    unimplemented_wrapper: CodeRust
+    extra_errors: Callable[[CodeRust], list[str]] | None = None
+    tests_mod: str | None = None
+    extern_symbol: str | None = None
+
+    def errors(self, wrapper: CodeRust) -> list[str]:
+        errors = scope_errors(wrapper, self.unimplemented_wrapper)
+        if self.extra_errors is not None:
+            errors += self.extra_errors(wrapper)
+        return errors
 
 
 @dataclass
 class _TranslationResult:
-    pred: dspy.Prediction = field(repr=False, compare=False)
+    attempt: TranslationAttempt = field(repr=False, compare=False)
 
     @property
     def success(self) -> bool:
-        return self.pred.success
+        return self.attempt.success
 
     @property
-    def translation(self) -> CodeRust | None:
-        return self.pred.translation if "translation" in self.pred else None
+    def translation(self) -> CodeRust:
+        return self.attempt.translation
 
     @property
-    def feedback(self) -> str:
-        return self.pred.feedback if "feedback" in self.pred else ""
-
-    @classmethod
-    def from_pred(cls, pred: dspy.Prediction) -> "_TranslationResult":
-        return cls(pred=pred)
+    def feedback(self) -> Feedback:
+        return self.attempt.next_feedback
 
 
 @dataclass
-class _WrapperResult:
-    pred: dspy.Prediction | None = field(default=None, repr=False, compare=False)
-    failure: Literal["wrap", "test"] | None = None
-    failed_tests: set[str] = field(default_factory=set)
+class _SymbolResult:
+    attempt: WrapperAttempt | None = field(default=None, repr=False, compare=False)
+    verdict: Verdict | None = None
 
     @property
     def success(self) -> bool:
-        return self.failure is None
+        return self.verdict is None or not self.verdict.rejected
+
+    @property
+    def stage(self) -> Literal["wrap", "review"] | None:
+        return self.verdict.stage if self.verdict is not None else None
+
+    @property
+    def wrapped(self) -> bool:
+        return self.attempt is None or self.attempt.success
+
+    @property
+    def rejection(self) -> str:
+        return "" if self.attempt is None or self.attempt.success else self.attempt.reason
 
     @property
     def wrapper(self) -> CodeRust | None:
-        return self.pred.wrapper if self.pred is not None and "wrapper" in self.pred else None
+        return self.attempt.wrapper if self.attempt is not None else None
+
+    @property
+    def regressed(self) -> set[str]:
+        return self.verdict.blamed if self.verdict is not None else set()
 
     @property
     def feedback(self) -> str:
-        if self.failure is None:
-            return ""
+        return self.verdict.feedback if self.verdict is not None else ""
 
-        if self.failure == "wrap":
-            return (
-                "It was difficult to generate a C-compatible FFI wrapper for the translation. "
-                "Regenerate the translation with clear, explicit, wrapper-friendly Rust function boundaries and straightforward ownership, "
-                "while keeping the translation fully memory-safe and free of unsafe constructs."
-            )
-
-        return (
-            "The current Rust translation in `prior_translation` does not match the behavior of the C `snippet`. "
-            "Carefully compare `prior_translation` against the C `snippet` and regenerate the Rust `translation` to match the C behavior exactly. "
-            "Do not assume inputs are well-formed: if the tests exercise malformed, invalid, partial, or adversarial input, preserve the C behavior for those cases too, including error returns, boundary handling, or other observable effects. "
-            "Make minimal, targeted changes to `prior_translation`, and only modify what is necessary to match the C behavior. "
-            "Treat the C `snippet` as the source of truth, even if it contains a bug."
-        )
-
-    @classmethod
-    def from_pred(cls, pred: dspy.Prediction) -> "_WrapperResult":
-        failure: Literal["wrap", "test"] | None = None if pred.success else "wrap"
-        return cls(pred=pred, failure=failure)
+    @property
+    def wrap_feedback(self) -> Feedback:
+        review = self.verdict.wrap_feedback if self.verdict is not None else ""
+        prior = self.attempt.next_feedback if self.attempt is not None else Feedback()
+        return replace(prior, review=review)
 
 
 @dataclass
 class _Result:
     translation_result: _TranslationResult
-    wrapper_results: dict[WrapperName, _WrapperResult] = field(default_factory=dict)
+    symbol_results: dict[SymbolName, _SymbolResult] = field(default_factory=dict)
 
     @property
-    def translation(self) -> CodeRust | None:
+    def translation(self) -> CodeRust:
         return self.translation_result.translation
 
     @property
-    def failure(self) -> Literal["translate", "wrap", "test"] | None:
+    def failure(self) -> Literal["translate", "wrap", "review"] | None:
         if not self.translation_result.success:
             return "translate"
-        for r in self.wrapper_results.values():
-            if r.failure is not None:
-                return r.failure
+        for r in self.symbol_results.values():
+            if r.stage is not None:
+                return r.stage
         return None
 
     @property
@@ -336,21 +136,26 @@ class _Result:
         return self.failure is None
 
     @property
-    def failed_tests(self) -> set[str]:
-        return {t for r in self.wrapper_results.values() for t in r.failed_tests}
+    def regressed(self) -> set[str]:
+        return {t for r in self.symbol_results.values() for t in r.regressed}
 
     @property
-    def feedback(self) -> str:
+    def translation_feedback(self) -> Feedback:
         if not self.translation_result.success:
             return self.translation_result.feedback
-        for r in self.wrapper_results.values():
+        # The translation built and stayed in scope, so only the oracle has anything to add
+        for r in self.symbol_results.values():
             if not r.success:
-                return r.feedback
-        return ""
+                return Feedback(review=r.feedback)
+        return Feedback()
 
     @property
-    def wrappers(self) -> dict[WrapperName, CodeRust]:
-        return {n: r.wrapper for n, r in self.wrapper_results.items() if r.wrapper is not None}
+    def wrap_feedback(self) -> dict[SymbolName, Feedback]:
+        return {n: fb for n, r in self.symbol_results.items() if (fb := r.wrap_feedback)}
+
+    @property
+    def wrappers(self) -> dict[SymbolName, CodeRust]:
+        return {n: r.wrapper for n, r in self.symbol_results.items() if r.wrapper is not None}
 
 
 class RecurrentTranslator(dspy.Module):
@@ -359,20 +164,18 @@ class RecurrentTranslator(dspy.Module):
         sys_crate: Crate,
         crate: Crate,
         rs_crate: Crate,
-        symbol_translator: dspy.Module,
-        symbol_wrapper: dspy.Module | None,
-        tests: str | None = None,
+        symbol_translator: SnippetTranslator,
+        symbol_wrapper: WrapperGenerator | None,
+        symbol_oracle: SymbolOracle | None = None,
         max_iters: int = 1,
     ):
         super().__init__()
-        assert sys_crate.lib_src_path is not None
-        self.c_src_path = sys_crate.lib_src_path.with_suffix(".c")
-        self.crate = crate
+        self.max_iters = max_iters
         self._translator = symbol_translator
         self._wrapper = symbol_wrapper
-        self._tests = tests
-        self.max_iters = max_iters
-        self._failed_tests: set[str] = set()
+        self._oracle: SymbolOracle = (
+            symbol_oracle if symbol_oracle is not None else NullOracle()
+        )
 
         self._init_rust_crate(rs_crate)
         self._init_hybrid_crate(sys_crate, crate)
@@ -392,18 +195,30 @@ class RecurrentTranslator(dspy.Module):
             rs_crate.vcs.add(rs_crate.main_src_path)
 
     def _init_hybrid_crate(self, sys_crate: Crate, crate: Crate):
-        if crate.lib_src_path is None and crate.main_src_path is None:
-            raise ValueError(f"Crate {crate.name} has neither lib.rs nor main.rs!")
+        assert self.rust_crate.lib_name is not None
+        self.crate = crate
+        self._hybrid = HybridWriter(sys_crate, crate, self.rust_crate.lib_name)
 
-        assert sys_crate.lib_name is not None
-        use_stmt = f"use {sys_crate.lib_name} as _;\n"
+    def _cargo_build(self) -> str:
+        builds, feedback = self.crate.cargo_build()
+        if not builds:
+            return f"Running `cargo build` fails!\n{feedback}"
+        return self._oracle.build()
 
-        if crate.lib_src_path is not None:
-            crate.lib_src_path.write_text(use_stmt)
-            crate.vcs.add(crate.lib_src_path)
-        if crate.main_src_path is not None:
-            crate.main_src_path.write_text(f"#![no_main]\n\n{use_stmt}\n\n")
-            crate.vcs.add(crate.main_src_path)
+    def strand_c(self):
+        self._hybrid.strand_c()
+
+    def _cargo_test(self, name: str, *, lib: bool = False) -> str:
+        passes, _, error, _ = self.crate.cargo_test(name, lib=lib)
+        # Feedback is empty when the tests pass, so callers can treat it as the failure signal
+        return "" if passes else f"Running `cargo test {name}` fails!\n{error}"
+
+    def _test_counts(self) -> str:
+        return (
+            f"regressed={len(self._oracle.regressions)} "
+            f"total={len(self._oracle.expected_tests)} "
+            f"baseline_failures={len(self._oracle.baseline_failures)}"
+        )
 
     def forward(
         self,
@@ -411,7 +226,35 @@ class RecurrentTranslator(dspy.Module):
         dependencies: dict[SymbolGroup, Iterable[SymbolGroup]],
         ast_order: dict[Path, TreeResult] | None = None,
     ) -> dspy.Prediction:
-        self._failed_tests = set()
+        # Tests that already fail against the untranslated C never count against a translation
+        self._oracle.baseline()
+
+        # Write types to the hybrid crate so symbol wrappers can reference them
+        self._hybrid.write_types(symbols.values())
+
+        # Write variables first so any generated code sees statics it cannot shadow (E0530)
+        self._hybrid.add_bindings(symbols.values())
+
+        if feedback := self._cargo_build():
+            raise RuntimeError(feedback)
+
+        msg = f"Initialized translation of `{self.crate.name}` ({len(symbols)} symbols)"
+        logger.info(msg)
+        if self._oracle.baseline_failures:
+            excluded = (
+                "Excluded test(s) that already fail against the untranslated C: "
+                f"{', '.join(sorted(self._oracle.baseline_failures))}"
+            )
+            logger.warning(excluded)
+            msg += f"\n\n# Excluded Tests\n{excluded}"
+        if missing := _undeclared_types(self._hybrid.types, symbols.values()):
+            undeclared = (
+                f"bindgen did not declare wrappable type(s): {', '.join(missing)}. "
+                "Wrapping them will fail to build."
+            )
+            logger.warning(undeclared)
+            msg += f"\n\n# Undeclared Types\n{undeclared}"
+        self.crate.vcs.commit(msg)
 
         # Process symbols in topological order
         G = nx.from_dict_of_lists(dependencies, create_using=nx.DiGraph)
@@ -425,9 +268,15 @@ class RecurrentTranslator(dspy.Module):
 
         snippets: dict[CodeC, SymbolGroup] = {}
         translations: dict[SymbolGroup, CodeRust] = {}
-        wrappers: dict[WrapperName, CodeRust] = {}
+        wrappers: dict[SymbolName, CodeRust] = {}
         count = len(groups)
         for i, group in enumerate(groups, start=1):
+            # A group that is nothing but alias typedefs has no Rust form to ask a model for
+            if all(symbols[name].is_alias_typedef for name in group):
+                logger.info(f"Skipping alias typedef `{' '.join(group)}`...")
+                translations[group] = CodeRust(f"// alias typedef `{' '.join(group)}`")
+                continue
+
             logger.info(f"Translating symbol group `{' '.join(group)}` [{i}/{count}] ...")
 
             # Gather code for each symbol and check if we have already translated such a snippet
@@ -443,24 +292,37 @@ class RecurrentTranslator(dspy.Module):
             ctx = TranslationContext.build(G, group, groups, symbols, translations, wrappers)
 
             # Translate and wrap snippet, saving it if it tests
-            group_result = self._translate_and_wrap_with_retries(
-                context=ctx, symbols=[symbols[name] for name in group]
-            )
+            with model.track_lm_usage() as usage:
+                group_result = self._translate_and_wrap_with_retries(
+                    context=ctx, symbols=[symbols[name] for name in group]
+                )
             if group_result.failure == "translate":
-                # Translate failures (as opposed to wrap/test failures) are fatal
+                # Translate failures (as opposed to wrap/review failures) are fatal
+                logger.error(
+                    f"Failed to translate symbol group `{' '.join(group)}` [{i}/{count}] "
+                    f"to Rust: {model.format_lm_usage(usage)} {self._test_counts()}"
+                )
                 break
-            assert group_result.translation is not None  # group_result.failure != translate
             translations[group] = group_result.translation
             wrappers.update(group_result.wrappers)
 
-            # Once a test fails, skip it for all future groups in this run
-            newly_failed_tests = group_result.failed_tests - self._failed_tests
-            if newly_failed_tests:
-                self._failed_tests.update(newly_failed_tests)
-                logger.info(
-                    f"Disabled the following failing tests: {', '.join(sorted(newly_failed_tests))}"
+            # Record the culprit so no later group is blamed for the same test
+            if regressed := group_result.regressed:
+                self._oracle.blame(group, regressed)
+                logger.warning(
+                    f"Test(s) regressed by symbol group `{' '.join(group)}`: "
+                    f"{', '.join(sorted(regressed))}"
                 )
-        pred = dspy.Prediction(success=len(translations) == len(groups))
+
+            logger.info(
+                f"Translated symbol group `{' '.join(group)}` [{i}/{count}] to Rust: "
+                f"{model.format_lm_usage(usage)} {self._test_counts()}"
+            )
+
+        pred = dspy.Prediction(
+            complete=len(translations) == len(groups),
+            regressions=self._oracle.regressions,
+        )
         return pred
 
     def _translate_and_wrap_with_retries(
@@ -468,33 +330,57 @@ class RecurrentTranslator(dspy.Module):
         context: TranslationContext,
         symbols: list[Symbol],
         prior_translation: CodeRust | None = None,
-        prior_wrappers: dict[WrapperName, CodeRust] | None = None,
-        feedback: str = "",
+        prior_wrappers: dict[SymbolName, CodeRust] | None = None,
+        translation_feedback: Feedback = Feedback(),
+        wrap_feedback: dict[SymbolName, Feedback] | None = None,
     ) -> _Result:
         name = " ".join([f"`{s.name}`" for s in symbols])
         num_iters = max(self.max_iters, 1)
+        # The last state the oracle accepted; no outcome of this call may land below it
+        entry = self._snapshot()
+        best: tuple[int, _State, _Result] | None = None
+        result: _Result | None = None
 
         for i in range(num_iters):
-            state = self._snapshot()
-
             # Attempt translation and exit early on success
             result = self._translate_and_wrap(
                 context,
                 symbols,
                 prior_translation=prior_translation,
                 prior_wrappers=prior_wrappers,
-                feedback=feedback,
+                translation_feedback=translation_feedback,
+                wrap_feedback=wrap_feedback,
             )
             if result.success:
-                break
+                return result
+
+            if result.failure == "review" and (
+                best is None or len(result.regressed) <= best[0]
+            ):
+                best = (len(result.regressed), self._snapshot(), result)
 
             # If neither translation nor wrappers differ from previous try, then stop retrying
-            if (
+            looping = (
                 prior_translation is not None
                 and prior_translation == result.translation
                 and prior_wrappers is not None
                 and prior_wrappers == result.wrappers
-            ):
+            )
+            final = looping or i + 1 == num_iters
+
+            # On failure, restore state based on which stage failed
+            if not final or result.failure == "translate":
+                # Full restore for next retry or if translation failed (graceful exit)
+                self._restore(entry)
+            elif result.failure == "wrap":
+                # Wrapper restore since they failed but hopefully translation is good
+                # FIXME: What if a wrapper is being tested? Seems fatal?
+                self._restore(entry, hybrid_only=True)
+            elif result.failure == "review":
+                # Keep wrappers and translation even though the oracle rejected them
+                pass
+
+            if looping:
                 logger.error(
                     f"Failed to translate symbol(s) {name} due to translation loop ({i + 1}/{num_iters})!"
                 )
@@ -503,143 +389,152 @@ class RecurrentTranslator(dspy.Module):
             # Translation differs so allow another retry but log an error
             logger.error(f"Failed to translate symbol(s) {name} ({i + 1}/{num_iters})!")
 
-            # On failure, restore state based on which stage failed
-            if i + 1 < num_iters or result.failure == "translate":
-                # Full restore for next retry or if translation failed (graceful exit)
-                self._restore(state)
-            elif result.failure == "wrap":
-                # Wrapper restore since they failed but hopefully translation is good
-                # FIXME: What if a wrapper is being tested? Seems fatal?
-                self._restore(state, wrappers_only=True)
-            elif result.failure == "test":
-                # Keep wrappers and translation even though they didn't pass tests
-                pass
-
             # Create feedback for next iteration
             prior_translation = result.translation
             prior_wrappers = result.wrappers
-            feedback = result.feedback
-        return result  # pyright: ignore[reportPossiblyUnboundVariable] because num_iters is always >= 1
+            translation_feedback = result.translation_feedback
+            wrap_feedback = result.wrap_feedback
+
+        # Rewind to the best attempt that regressed the least. A later attempt that never ran
+        # does not invalidate an earlier one that did, so this also rescues a group whose final
+        # try failed to translate.
+        assert result is not None  # num_iters is at least 1
+        if best is not None and best[2] is not result:
+            score, state, result = best
+            self._restore(state)
+            logger.warning(
+                f"Restored the attempt at {name} that regressed the fewest test(s): {score}"
+            )
+        return result
 
     def _snapshot(self) -> _State:
         def read(path: Path | None) -> bytes | None:
             return path.read_bytes() if path else None
 
         assert self.rust_crate.lib_src_path is not None
-        wrapper_files = self.crate.src_dir.glob("wrap_*.rs")
         return _State(
-            c_src=self.c_src_path.read_bytes(),
             rust_lib_src=self.rust_crate.lib_src_path.read_bytes(),
             rust_main_src=read(self.rust_crate.main_src_path),
-            hybrid_lib_src=read(self.crate.lib_src_path),
-            hybrid_main_src=read(self.crate.main_src_path),
-            wrappers={path: path.read_bytes() for path in wrapper_files if path.is_file()},
+            hybrid=self._hybrid.snapshot(),
         )
 
-    def _restore(self, state: _State, *, wrappers_only: bool = False):
-        # Wrappers are always restored
-        for path, src in state.wrappers.items():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(src)
-
-        if wrappers_only:
+    def _restore(self, state: _State, *, hybrid_only: bool = False):
+        self._hybrid.restore(state.hybrid)
+        if hybrid_only:
             return
 
         def write(path: Path | None, src: bytes | None):
             if path is not None and src is not None:
                 path.write_bytes(src)
+                self.rust_crate.vcs.add(path)
 
         assert self.rust_crate.lib_src_path is not None
-        self.c_src_path.write_bytes(state.c_src)
-        self.rust_crate.lib_src_path.write_bytes(state.rust_lib_src)
+        write(self.rust_crate.lib_src_path, state.rust_lib_src)
         write(self.rust_crate.main_src_path, state.rust_main_src)
-        write(self.crate.lib_src_path, state.hybrid_lib_src)
-        write(self.crate.main_src_path, state.hybrid_main_src)
+
+    @contextmanager
+    def _checkpoint(self, *, hybrid_only: bool = False) -> Iterator[_State]:
+        # Restored unconditionally, and the yielded state outlives the block so a caller can
+        # return to it again later
+        state = self._snapshot()
+        try:
+            yield state
+        finally:
+            self._restore(state, hybrid_only=hybrid_only)
 
     def _translate_and_wrap(
         self,
         context: TranslationContext,
         symbols: list[Symbol],
         prior_translation: CodeRust | None = None,
-        prior_wrappers: dict[WrapperName, CodeRust] | None = None,
-        feedback: str = "",
+        prior_wrappers: dict[SymbolName, CodeRust] | None = None,
+        translation_feedback: Feedback = Feedback(),
+        wrap_feedback: dict[SymbolName, Feedback] | None = None,
     ) -> _Result:
         prior_wrappers = prior_wrappers or {}
+        wrap_feedback = wrap_feedback or {}
 
         # Translate snippet and exit early if it fails
         snippet = CodeC.join(symbol.code for symbol in symbols)
         name = " ".join(symbol.name for symbol in symbols)
         translation_result = self._translate_snippet(
             name=name,
-            context=context,
+            context=context.translate,
             snippet=snippet,
             prior_translation=prior_translation,
-            feedback=feedback,
+            feedback=translation_feedback,
         )
         if not translation_result.success:
             return _Result(translation_result=translation_result)
 
         out = _Result(translation_result=translation_result)
-        assert out.translation is not None  # translation_result.success == True
 
         # Generate wrapper for each symbol
         for symbol in symbols:
-            wrapper_name: WrapperName = f"wrap_{mangle(symbol.spelling)}"
-            wrapper_result = self._wrap_symbol(
-                name=wrapper_name,
+            symbol_result = self._wrap_symbol(
                 symbol=symbol,
-                context=context,
+                context=context.wrap,
                 snippet=snippet,
                 translation=out.translation,
-                prior_wrapper=prior_wrappers.get(wrapper_name),
+                prior_wrapper=prior_wrappers.get(symbol.name),
+                feedback=wrap_feedback.get(symbol.name, Feedback()),
             )
-            if wrapper_result is None:
+            if symbol_result is None:
                 continue
-            out.wrapper_results[wrapper_name] = wrapper_result
-            if not wrapper_result.success:
+            # Judged whether or not the wrapper stage succeeded: a failed wrap is a rejection
+            # the oracle words, and a successful one is what the tests then run against
+            candidate = Candidate(
+                symbol=symbol,
+                snippet=snippet,
+                translation=out.translation,
+                wrapper=symbol_result.wrapper,
+                wrap_rejection=symbol_result.rejection,
+                wrapped=symbol_result.wrapped,
+            )
+            symbol_result = replace(symbol_result, verdict=self._judge_symbol(candidate))
+            out.symbol_results[symbol.name] = symbol_result
+            if not symbol_result.success:
                 break
 
         # Cache successful translation and wrappers
         if out.success:
-            self._translator.write_cache(out.translation_result.pred)
-            for wrapper_result in out.wrapper_results.values():
-                if wrapper_result.pred is not None and self._wrapper is not None:
-                    self._wrapper.write_cache(wrapper_result.pred)
+            self._translator.write_cache(out.translation_result.attempt)
+            for symbol_result in out.symbol_results.values():
+                if symbol_result.attempt is not None and self._wrapper is not None:
+                    self._wrapper.write_cache(symbol_result.attempt)
         return out
 
     def _translate_snippet(
         self,
         name: str,
-        context: TranslationContext,
+        context: TranslateContext,
         snippet: CodeC,
         prior_translation: CodeRust | None = None,
-        feedback: str = "",
+        feedback: Feedback = Feedback(),
     ) -> _TranslationResult:
         assert self.rust_crate.lib_src_path is not None
         lib_src_path = self.rust_crate.lib_src_path
-        base_rust_src = CodeRust(lib_src_path.read_text())
+        main_src_path = self.rust_crate.main_src_path
+        base_lib_src = CodeRust(lib_src_path.read_text())
+        base_main_src = main_src_path.read_text() if main_src_path is not None else None
 
-        def build(translation: CodeRust) -> str:
-            # Append translation to lib.rs and check if it builds
-            lib_src_path.write_text(str(base_rust_src + translation))
+        def build(code: CodeRust) -> str:
+            lib_src_path.write_text(str(base_lib_src + code))
             self.rust_crate.vcs.add(lib_src_path)
-            # Import translated `main` symbol from lib.rs for binaries to get build feedback
-            if self.rust_crate.main_src_path is not None and name == "c:@F@main":
-                self.rust_crate.main_src_path.write_text(
-                    f"#![forbid(unsafe_code)]\n\nuse {self.rust_crate.lib_name}::*;\n"
-                )
-                self.rust_crate.vcs.add(self.rust_crate.main_src_path)
-            builds, build_feedback = self.rust_crate.cargo_build()
-            return "Running `cargo build` fails!\n" + build_feedback if not builds else ""
+            builds, error = self.rust_crate.cargo_build()
+            return "" if builds else f"Running `cargo build` fails!\n{error}"
 
-        def commit(msg: str, pred: dspy.Prediction):
-            if "reasoning" in pred and pred.reasoning:
-                msg += f"\n\n# Reasoning\n{indent(pred.reasoning, '  ')}"
-            if "feedback" in pred and pred.feedback:
-                msg += f"\n\n# Feedback\n{indent(pred.feedback, '  ')}"
-            self.rust_crate.vcs.commit(msg)
+        # Import the translated `main` from lib.rs so a binary's build feedback covers it
+        switch_main = main_src_path is not None and name == "c:@F@main"
+        if switch_main:
+            assert main_src_path is not None
+            main_src_path.write_text(
+                f"#![forbid(unsafe_code)]\n\nuse {self.rust_crate.lib_name}::main;\n"
+            )
+            self.rust_crate.vcs.add(main_src_path)
 
-        pred = self._translator(
+        snippet_logger.info(f"Translating snippet `{name}` ...")
+        with self._translator.session(
             name=name,
             crate_code=context.crate_code,
             reference_code=context.reference_code,
@@ -647,316 +542,430 @@ class RecurrentTranslator(dspy.Module):
             dependent_code=context.dependent_code,
             prior_translation=prior_translation,
             feedback=feedback,
-            feedback_fn=build,
-            on_attempt=commit,
-        )
-        return _TranslationResult.from_pred(pred)
+        ) as session:
+            success = False
+            attempt: TranslationAttempt | None = None
+            for attempt in session:
+                # lib.rs already carries the crate-level attribute, so a second one cannot build
+                if CodeRust("#![forbid(unsafe_code)]") in attempt.translation:
+                    attempt.reject(
+                        scope=["Do not include `#![forbid(unsafe_code)]` in the translation!"]
+                    )
+                elif error := build(attempt.translation):
+                    attempt.reject(build=[error])
+                else:
+                    attempt.accept()
+                success = attempt.success
+                _commit(self.rust_crate, attempt)
+
+                # A rejected candidate must not be on disk when the next one is generated
+                if not attempt.success:
+                    lib_src_path.write_text(str(base_lib_src))
+
+        # Nothing supplies the entrypoint the switch imports, so put the placeholder back
+        if switch_main and not success and base_main_src is not None:
+            assert main_src_path is not None
+            main_src_path.write_text(base_main_src)
+        assert attempt is not None  # `_max_iters` is at least 1, so the loop always ran
+        return _TranslationResult(attempt)
 
     def _wrap_symbol(
         self,
-        name: WrapperName,
         symbol: Symbol,
-        context: TranslationContext,
+        context: WrapContext,
         snippet: CodeC,
         translation: CodeRust,
         prior_wrapper: CodeRust | None,
-    ) -> _WrapperResult | None:
-        result = None
+        feedback: Feedback = Feedback(),
+    ) -> _SymbolResult | None:
+        is_bin = self.crate.main_src_path is not None
 
-        # Main function must always wrapped
-        if self.crate.main_src_path is not None and symbol.spelling == "main":
+        result = None
+        if is_bin and symbol.spelling == "main":
+            # Rust has to own the entrypoint or its `main` collides with C's at link time
             result = self._wrap_main()
+        elif is_bin and symbol.is_function and not self._oracle.exercises(symbol):
+            # As a policy, an untested binary gets no function wrappers other than `main`
+            pass
         elif symbol.is_type and symbol.is_definition:
-            result = self._wrap_type(name, symbol, context, snippet, translation, prior_wrapper)
+            result = self._wrap_type(
+                symbol, context, snippet, translation, prior_wrapper, feedback
+            )
         elif symbol.is_variable:
-            result = self._wrap_variable(name, symbol)
+            result = self._wrap_variable(
+                symbol, context, snippet, translation, prior_wrapper, feedback
+            )
         elif symbol.is_function and symbol.is_definition:
             result = self._wrap_function(
-                name, symbol, context, snippet, translation, prior_wrapper
+                symbol, context, snippet, translation, prior_wrapper, feedback
             )
         if result is None:
+            logger.debug("Skipped wrapping of symbol `%s`", symbol.name)
             return None
-
-        # Don't bother testing if the wrapping failed or no tests
-        if not result.success or self._tests is None:
-            return result
-
-        # Test the hybrid crate
-        passes, results = self._test_symbol(symbol, skip=sorted(self._failed_tests))
-        result.failed_tests = {name for name, success in results.items() if not success}
-        if not passes:
-            result.failure = "test"
         return result
 
-    def _test_symbol(self, symbol: Symbol, skip: list[str]) -> tuple[bool, dict[str, bool]]:
-        assert self._tests is not None
-        logger.info(f"Testing symbol `{symbol.name}` ...")
+    def _wrap_main(self) -> _SymbolResult:
+        logger.info("Wrapping function `main` ...")
 
-        # Make sure the crate builds before testing
-        builds, feedback = self.crate.cargo_build()
-        if not builds:
-            raise RuntimeError(f"Crate does not build!\n{feedback}")
-
-        # Run cargo test
-        passes, jsonl, feedback, _ = self.crate.cargo_test(
-            self._tests, skip=skip, test_harness="nextest run", message_format="libtest-json"
-        )
-        results = _extract_test_results(jsonl)
-        if passes:
-            msg = f"Tested symbol `{symbol.name}`"
-            logger.info(msg)
-        else:
-            feedback = "Running `cargo test` fails!\n" + feedback
-            msg = f"Failed to test symbol `{symbol.name}`"
-            logger.error(msg)
-            msg += f"\n\n{feedback}"
-        self.crate.vcs.commit(msg)
-        return passes, results
-
-    def _wrap_main(self) -> _WrapperResult:
-        logger.info("Generating wrapper for function `main` ...")
-
-        # Declare C `main` as extern so Rust owns the definition and we avoid
-        # duplicate entrypoint symbols at link time.
-        clang_make_extern_(self.c_src_path, "main")
-        self.crate.vcs.add(self.c_src_path)
-
-        # Import the Rust translation crate from each hybrid root so linker-visible
-        # symbols stay reachable from the test/build target.
-        for root_path in (self.crate.lib_src_path, self.crate.main_src_path):
-            if root_path is None:
-                continue
-            root_path.write_text(f"use {self.rust_crate.lib_name}::*;\n")
-            self.crate.vcs.add(root_path)
+        # The bin's entrypoint now comes from the -rs crate instead of the C object
+        self._hybrid.take_over_main()
 
         # Fail fast after entrypoint/linkage edits so linker or compile regressions
         # are caught before continuing with additional wrapper work.
-        success, output = self.crate.cargo_build()
-        if not success:
-            raise RuntimeError(f"Failed to build crate!\n{output}")
+        if feedback := self._cargo_build():
+            raise RuntimeError(feedback)
         self.crate.vcs.commit("Wrapped function `main`")
-        return _WrapperResult()
+        return _SymbolResult()
 
-    def _wrap_variable(self, name: WrapperName, symbol: Symbol) -> _WrapperResult | None:
-        # No point in wrapping non-globals if no tests
-        if self._tests is None and not symbol.is_global:
-            return None
-
-        # Emit a Rust module containing FFI variable bindings and persist it
-        # under src/ so crate-root pub mod declarations can include it.
-        var_wrapper = bindgen(self.c_src_path, symbol.spelling)
-        wrapper_path = self.crate.src_dir / f"{name}.rs"
-        wrapper_path.parent.mkdir(exist_ok=True, parents=True)
-        wrapper_path.write_text(str(var_wrapper))
-        self.crate.vcs.add(wrapper_path)
-
-        # Ensure the C variable has external linkage so the wrapper can resolve
-        # the symbol at link time and access the same storage across crates.
-        clang_make_global_(self.c_src_path, symbol.spelling)
-        self.crate.vcs.add(self.c_src_path)
-
-        # Register the wrapper module in each crate root so tests and callers can
-        # resolve it by path and rustc includes it in the build graph.
-        for root_path in (self.crate.lib_src_path, self.crate.main_src_path):
-            if root_path is None:
-                continue
-            with root_path.open("a") as f:
-                f.write(f"pub mod {name};\n")
-            self.crate.vcs.add(root_path)
-
-        # Fail fast after wrapper/linkage edits so linker or compile regressions
-        # are caught before continuing with additional wrapper work.
-        success, output = self.crate.cargo_build()
-        if not success:
-            raise RuntimeError(f"Failed to build crate!\n{output}")
-
-        msg = f"Wrapped variable `{symbol.name}`"
-        logger.info(msg)
-        self.crate.vcs.commit(msg)
-        return _WrapperResult(pred=dspy.Prediction(wrapper=var_wrapper, success=True))
-
-    def _wrap_type(
+    def _wrap_variable(
         self,
-        name: WrapperName,
         symbol: Symbol,
-        context: TranslationContext,
+        context: WrapContext,
         snippet: CodeC,
         translation: CodeRust,
         prior_wrapper: CodeRust | None,
-    ) -> _WrapperResult | None:
+        feedback: Feedback = Feedback(),
+    ) -> _SymbolResult | None:
+        if self._wrapper is None:
+            return _SymbolResult()
+
+        # Generate a test asserting that the translated Rust global matches what the C
+        # compiler initialized
+        unimplemented_wrapper, tests_mod, sync_fns = generate_unimplemented_variable_wrapper(
+            symbol.spelling, self._hybrid.types_code, self._hybrid.bindings[symbol.name]
+        )
+
+        rust_lib_name = self.rust_crate.lib_name
+        assert rust_lib_name is not None  # _init_rust_crate rejects a crate without one
+        c_global = f"__c_globals::{mangle(symbol.spelling)}"
+
+        def static_errors(wrapper: CodeRust) -> list[str]:
+            # Report every static violation at once so one round of feedback fixes them all
+            src = str(wrapper)
+            errors: list[str] = []
+
+            # A renamed test module makes the filter below match nothing, which reads as a pass
+            if f"mod {tests_mod}" not in src:
+                errors.append(f"The test module must stay named `{tests_mod}`.")
+
+            # `initial_value_matches` only means something if it reads the translated global and
+            # reads it unaided, so check its body for both
+            if "fn initial_value_matches" not in src:
+                errors.append("The test function `initial_value_matches` must be implemented.")
+            else:
+                body = _test_body(src, "initial_value_matches")
+                if rust_lib_name not in body:
+                    errors.append(
+                        f"`initial_value_matches` must read the translated global as "
+                        f"`{rust_lib_name}::ITEM` and compare it against the C global "
+                        f"`{c_global}`. Comparing the C global against "
+                        "itself passes no matter how wrong the translation is. Spell that path "
+                        "out in the test body rather than importing it or reading it through a "
+                        "helper."
+                    )
+                if called := [fn for fn in sync_fns if fn in body]:
+                    errors.append(
+                        "`initial_value_matches` must not call "
+                        + ", ".join(f"`{fn}`" for fn in called)
+                        + ". That test is meant to measure whether the translated initializer "
+                        "already agrees with C, and any synchronization function overwrites "
+                        "one side with the other first, so the assertion would compare a value "
+                        "against itself and pass for any translation."
+                    )
+
+            # The sync functions are legal all or none, never partly gone, and the test goes
+            # with them
+            present_sync_fns = tuple(fn for fn in sync_fns if f"fn {fn}" in src)
+            has_round_trip = "fn round_trip_nontrivial" in src
+            names = ", ".join(f"`{fn}`" for fn in sync_fns)
+            if not sync_fns and has_round_trip:
+                errors.append(
+                    "This global has no synchronization functions, so "
+                    "`round_trip_nontrivial` has nothing to test. Remove it and implement "
+                    "`initial_value_matches` only."
+                )
+            elif 0 < len(present_sync_fns) < len(sync_fns):
+                errors.append(
+                    f"Keep all of {names} or none of them, spelled exactly as the template "
+                    "spells them."
+                )
+            elif present_sync_fns and not has_round_trip:
+                errors.append(
+                    f"You kept {names}, so `round_trip_nontrivial` must be implemented: it is "
+                    "the only test that exercises them. Dropping it means dropping them with "
+                    "it, which is allowed only when the translated global cannot be written."
+                )
+            elif not present_sync_fns and has_round_trip:
+                errors.append(
+                    f"`round_trip_nontrivial` exists to test {names}, so without them it "
+                    "asserts nothing. Restore them and keep the test, unless the translated "
+                    "global cannot be written, in which case remove the test too."
+                )
+            elif present_sync_fns and has_round_trip:
+                body = _test_body(src, "round_trip_nontrivial")
+                if uncalled := [fn for fn in sync_fns if f"{fn}(" not in body]:
+                    errors.append(
+                        "`round_trip_nontrivial` must call "
+                        + ", ".join(f"`{fn}`" for fn in uncalled)
+                        + ", since it is the only test that exercises them."
+                    )
+                if c_global not in body:
+                    errors.append(
+                        f"`round_trip_nontrivial` must write the C global "
+                        f"`{c_global}` and assert on it afterwards. Spell "
+                        "that path out in the test body rather than importing it or reaching "
+                        "it through a helper."
+                    )
+                if rust_lib_name not in body:
+                    errors.append(
+                        f"`round_trip_nontrivial` must read the translated global as "
+                        f"`{rust_lib_name}::ITEM` after `{sync_fns[0]}`. Without that "
+                        "assertion the value never leaves the C global, and two "
+                        "empty-bodied synchronization functions pass the test. Spell that "
+                        "path out in the test body rather than importing it or reading it "
+                        "through a helper."
+                    )
+
+            if "todo!()" in src:
+                errors.append(
+                    "The `todo!()` placeholder must be replaced with a real implementation."
+                )
+
+            return errors
+
+        return self._run_wrapper_session(
+            symbol,
+            context,
+            snippet,
+            translation,
+            prior_wrapper,
+            feedback,
+            _WrapperPlan(unimplemented_wrapper, static_errors, tests_mod=tests_mod),
+        )
+
+    def _wrap_type(
+        self,
+        symbol: Symbol,
+        context: WrapContext,
+        snippet: CodeC,
+        translation: CodeRust,
+        prior_wrapper: CodeRust | None,
+        feedback: Feedback = Feedback(),
+    ) -> _SymbolResult | None:
         if self._wrapper is None:
             return None
-        # Only struct declarations with linkage are wrappable: other type kinds have no
-        # meaningful field-by-field `c_to_r`/`r_to_c` pair, and structs without linkage
-        # are unnameable.
-        if not (symbol.is_struct and symbol.is_global):
+        # Only externally visible structs are wrappable: other type kinds have no meaningful
+        # field-by-field `to_rust`/`sync_to_c` pair, and a struct the rest of the program
+        # cannot name has nothing to bridge.
+        if not (symbol.is_struct and symbol.is_externally_visible):
+            return None
+        # An anonymous record, or one nested in one, has no predictable bindgen name to implement on
+        if (bindgen_name := symbol.bindgen_name) is None:
+            logger.warning(
+                f"Cannot wrap type `{symbol.name}`: it is or is nested in an anonymous "
+                "record, which bindgen names with a run-wide counter"
+            )
             return None
 
-        # Seed a concrete wrapper module on disk so the hybrid crate can build
-        # and the wrapper generator has a stable file path to iteratively replace.
-        unimplemented_wrapper = generate_unimplemented_type_wrapper(
-            self.c_src_path, symbol.spelling
+        # Generate an unimplemented wrapper so the hybrid crate can build and the wrapper
+        # generator has something to iteratively implement.
+        unimplemented_wrapper, tests_mod = generate_unimplemented_type_wrapper(
+            bindgen_name, self._hybrid.types_code
         )
-        wrapper_path = self.crate.src_dir / f"{name}.rs"
-        wrapper_path.parent.mkdir(exist_ok=True, parents=True)
-        wrapper_path.write_text(str(unimplemented_wrapper))
-        self.crate.vcs.add(wrapper_path)
 
-        # Register the wrapper module in each crate root so tests and callers can
-        # resolve it by path and rustc includes it in the build graph.
-        for root_path in (self.crate.lib_src_path, self.crate.main_src_path):
-            if root_path is None:
-                continue
-            with root_path.open("a") as f:
-                f.write(f"pub mod {name};\n")
-            self.crate.vcs.add(root_path)
-
-        # Fail fast after wrapper/linkage edits so we surface compiler errors
-        # before iterative wrapper generation starts.
-        builds, build_feedback = self.crate.cargo_build()
-        if not builds:
-            raise RuntimeError(f"The crate does not build!\n\n{build_feedback}")
-
-        def test(wrapper: CodeRust) -> str:
-            # Write wrapper to disk and add to VCS so commit can commit it
-            wrapper_path.write_text(str(wrapper))
-            self.crate.vcs.add(wrapper_path)
+        def static_errors(wrapper: CodeRust) -> list[str]:
+            # Report every static violation at once so one round of feedback fixes them all
+            src = str(wrapper)
+            errors: list[str] = []
 
             # Enforce that both required round-trip test functions are present
             missing = [
                 fn
                 for fn in ("round_trip_zeroed", "round_trip_nontrivial")
-                if f"fn {fn}" not in str(wrapper)
+                if f"fn {fn}" not in src
             ]
             if missing:
-                return (
-                    "Required test functions are missing: "
-                    + ", ".join(f"`{fn}`" for fn in missing)
-                    + ". Both `round_trip_zeroed` and `round_trip_nontrivial` must be implemented."
+                names = ", ".join(f"`{fn}`" for fn in missing)
+                errors.append(
+                    f"Required test functions are missing: {names}. Both "
+                    "`round_trip_zeroed` and `round_trip_nontrivial` must be implemented."
                 )
 
-            # Run the round-trip tests: cargo test provides both compilation errors
-            # and test failure messages, giving richer feedback than cargo build alone.
-            passes, _, feedback, _ = self.crate.cargo_test(f"{name}::tests", lib=True)
-            return "" if passes else f"Running `cargo test` fails!\n{feedback}"
+            # A dropped impl header or a surviving `()` placeholder still compiles, so
+            # neither cargo build nor cargo test would catch them
+            impl_header = f"impl CInterop for {bindgen_name}"
+            if impl_header not in src:
+                errors.append(f"The wrapper must contain an `{impl_header}` block.")
+            if "type Rust = ()" in src:
+                errors.append(
+                    "`type Rust = ()` is still the placeholder. Replace it with "
+                    f"`type Rust = {self.rust_crate.lib_name}::<TranslatedType>;`, where "
+                    f"`<TranslatedType>` is the actual name the C type `{symbol.spelling}` was "
+                    "translated to in `wrapped_crate_code` (it may have been renamed)."
+                )
 
-        def commit(msg: str, pred: dspy.Prediction):
-            if "reasoning" in pred and pred.reasoning:
-                msg += f"\n\n# Reasoning\n{indent(pred.reasoning, '  ')}"
-            if "build_feedback" in pred and pred.build_feedback:
-                msg += f"\n\n# Build Feedback\n{indent(pred.build_feedback, '  ')}"
-            self.crate.vcs.commit(msg)
+            # A renamed test module makes the filter below match nothing, which reads as a pass
+            if f"mod {tests_mod}" not in src:
+                errors.append(f"The test module must stay named `{tests_mod}`.")
 
-        pred = self._wrapper(
-            symbol=symbol,
-            crate_code=context.crate_code,
-            translation=translation,
-            unimplemented_wrapper=unimplemented_wrapper,
-            wrapper_path=wrapper_path.relative_to(self.crate.cargo_toml.parent),
-            wrapped_crate=self.rust_crate.lib_name,
-            other_wrappers=context.wrappers,
-            prior_wrapper=prior_wrapper,
-            support_code=context.support_code + snippet + context.dependent_code,
-            feedback_fn=test,
-            on_attempt=commit,
+            return errors
+
+        return self._run_wrapper_session(
+            symbol,
+            context,
+            snippet,
+            translation,
+            prior_wrapper,
+            feedback,
+            _WrapperPlan(unimplemented_wrapper, static_errors, tests_mod=tests_mod),
         )
-        return _WrapperResult.from_pred(pred)
 
     def _wrap_function(
         self,
-        name: WrapperName,
         symbol: Symbol,
-        context: TranslationContext,
+        context: WrapContext,
         snippet: CodeC,
         translation: CodeRust,
         prior_wrapper: CodeRust | None,
-    ) -> _WrapperResult | None:
+        feedback: Feedback = Feedback(),
+    ) -> _SymbolResult | None:
         if self._wrapper is None:
             return None
-        # No point in wrapping non-globals if no tests
-        if self._tests is None and not symbol.is_global:
+        # No point in wrapping non-globals if the oracle does not exercise it
+        if not symbol.is_externally_visible and not self._oracle.exercises(symbol):
             return None
 
-        # Seed a placeholder wrapper module so the crate can compile immediately
-        # and the wrapper generator has a stable file to iteratively overwrite.
-        unimplemented_wrapper = generate_unimplemented_function_wrapper(
-            self.c_src_path, symbol.spelling
-        )
+        # Generate an unimplemented wrapper so the hybrid crate can build and the wrapper
+        # generator has something to iteratively implement.
+        unimplemented_wrapper = self._hybrid.unimplemented_function_wrapper(symbol.spelling)
         if unimplemented_wrapper is None:
             logger.warning(f"Skipping wrap of function symbol `{symbol.name}`")
-            return _WrapperResult()
-        wrapper_path = self.crate.src_dir / f"{name}.rs"
-        wrapper_path.parent.mkdir(exist_ok=True, parents=True)
-        wrapper_path.write_text(str(unimplemented_wrapper))
-        self.crate.vcs.add(wrapper_path)
+            return _SymbolResult()
 
-        # Switch the C function declaration to extern so the Rust wrapper crate
-        # can provide the callable definition without duplicate symbol ownership.
-        clang_make_extern_(self.c_src_path, symbol.spelling)
-        self.crate.vcs.add(self.c_src_path)
+        return self._run_wrapper_session(
+            symbol,
+            context,
+            snippet,
+            translation,
+            prior_wrapper,
+            feedback,
+            _WrapperPlan(unimplemented_wrapper, extern_symbol=symbol.spelling),
+        )
 
-        # Register the wrapper module in each crate root so tests and callers can
-        # resolve it by path and rustc includes it in the build graph.
-        for root_path in (self.crate.lib_src_path, self.crate.main_src_path):
-            if root_path is None:
-                continue
-            with root_path.open("a") as f:
-                f.write(f"pub mod {name};\n")
-            self.crate.vcs.add(root_path)
-
-        # Fail fast after wrapper/linkage edits so linker or compile regressions
-        # are caught before iterative wrapper generation continues.
-        builds, build_feedback = self.crate.cargo_build()
-        if not builds:
-            raise RuntimeError(f"The crate does not build!\n\n{build_feedback}")
+    def _run_wrapper_session(
+        self,
+        symbol: Symbol,
+        context: WrapContext,
+        snippet: CodeC,
+        translation: CodeRust,
+        prior_wrapper: CodeRust | None,
+        feedback: Feedback,
+        plan: _WrapperPlan,
+    ) -> _SymbolResult:
+        assert self._wrapper is not None  # every caller checks before building a plan
+        rust_lib_name = self.rust_crate.lib_name
+        assert rust_lib_name is not None  # _init_rust_crate rejects a crate without one
 
         def build(wrapper: CodeRust) -> str:
-            wrapper_path.write_text(str(wrapper))
-            self.crate.vcs.add(wrapper_path)
-            builds, build_feedback = self.crate.cargo_build()
-            return build_feedback if not builds else ""
+            self._hybrid.set_wrapper(symbol.name, wrapper)
+            if plan.extern_symbol is not None:
+                self._hybrid.make_extern(plan.extern_symbol)
+            return self._cargo_build()
 
-        def commit(msg: str, pred: dspy.Prediction):
-            if "reasoning" in pred and pred.reasoning:
-                msg += f"\n\n# Reasoning\n{indent(pred.reasoning, '  ')}"
-            if "build_feedback" in pred and pred.build_feedback:
-                msg += f"\n\n# Build Feedback\n{indent(pred.build_feedback, '  ')}"
-            if "scope_feedback" in pred and pred.scope_feedback:
-                msg += f"\n\n# Scope Feedback\n{indent(pred.scope_feedback, '  ')}"
-            self.crate.vcs.commit(msg)
+        # Fail fast after wrapper/linkage edits so compile or linker regressions are caught
+        # before iterative wrapper generation starts
+        with self._checkpoint(hybrid_only=True) as state:
+            if error := build(plan.unimplemented_wrapper):
+                raise RuntimeError(error)
 
-        pred = self._wrapper(
+        wrapper_logger.info(f"Generating wrapper for `{symbol.name}` ...")
+        with self._wrapper.session(
             symbol=symbol,
-            crate_code=context.crate_code,
+            wrapped_crate_code=context.wrapped_crate_code,
             translation=translation,
-            unimplemented_wrapper=unimplemented_wrapper,
-            wrapper_path=wrapper_path.relative_to(self.crate.cargo_toml.parent),
-            wrapped_crate=self.rust_crate.lib_name,
-            other_wrappers=context.wrappers,
+            unimplemented_wrapper=plan.unimplemented_wrapper,
+            wrapped_crate=rust_lib_name,
+            other_wrappers=self._hybrid.render(
+                context.wrappers.values(),
+                *self._hybrid.type_slice(symbol.bindgen_name, plan.unimplemented_wrapper),
+            ),
             prior_wrapper=prior_wrapper,
-            support_code=context.support_code + snippet + context.dependent_code,
-            feedback_fn=build,
-            on_attempt=commit,
-        )
-        return _WrapperResult.from_pred(pred)
+            feedback=feedback,
+            support_code=context.support_code(snippet),
+        ) as session:
+            attempt: WrapperAttempt | None = None
+            for attempt in session:
+                if errors := plan.errors(attempt.wrapper):
+                    attempt.reject(scope=errors)
+                # Build first so a compile error is not reported as a test failure
+                elif error := build(attempt.wrapper):
+                    attempt.reject(build=[error])
+                elif plan.tests_mod is not None and (
+                    error := self._cargo_test(plan.tests_mod, lib=True)
+                ):
+                    attempt.reject(build=[error])
+                else:
+                    attempt.accept()
+                _commit(self.crate, attempt)
+
+                # A rejected candidate must not be on disk when the next one is generated
+                if not attempt.success:
+                    self._restore(state, hybrid_only=True)
+        return _SymbolResult(attempt=attempt)
+
+    def _judge_symbol(self, candidate: Candidate) -> Verdict:
+        # Only a hybrid that builds can be tested, and only an exercised symbol will be
+        if candidate.wrapped and self._oracle.exercises(candidate.symbol):
+            if error := self._cargo_build():
+                raise RuntimeError(error)
+
+        verdict = self._oracle.judge(candidate)
+        # A wrap rejection leaves no message: the session already committed every attempt
+        if verdict.message:
+            self.crate.vcs.commit(f"{verdict.message}\n\n{verdict.evidence}".strip())
+        return verdict
 
 
-def _extract_test_results(output: str) -> dict[str, bool]:
-    test_results: dict[str, bool] = {}
+def _undeclared_types(
+    types: Mapping[BindgenName, CodeRust], symbols: Iterable[Symbol]
+) -> list[BindgenName]:
+    # bindgen renames nested records after their whole ancestor chain, so a wrong
+    # `bindgen_name` silently yields a type slice that never declares the item the
+    # wrapper will `impl CInterop for`.
+    return sorted(
+        {
+            name
+            for s in symbols
+            if s.is_struct and s.is_externally_visible
+            if (name := s.bindgen_name) is not None and name not in types
+        }
+    )
 
-    for line in output.splitlines():
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("type") != "test":
-            continue
-        event = obj.get("event")
-        if event not in {"ok", "failed", "ignored"}:
-            continue
-        name = str(obj.get("name", "")).rsplit("$", 1)[-1].strip()
-        if name:
-            # Treat ignored as non-failing for disable-list purposes
-            test_results[name] = event != "failed"
 
-    return test_results
+def _commit(crate: Crate, attempt: CodeAttempt):
+    # The attempt's own module is what names the stage being committed
+    log = logging.getLogger(type(attempt).__module__)
+    (log.info if attempt.success else log.error)(attempt.headline)
+
+    # Cleared unconditionally so the commit never carries the previous attempt's prompt
+    prompt_dir = crate.cargo_toml.parent / ".prompt"
+    crate.vcs.rm(prompt_dir, force=True)
+    shutil.rmtree(prompt_dir, ignore_errors=True)
+    if prompt_files := attempt.pred.get("prompt_files"):
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        for name, text in prompt_files.items():
+            (prompt_dir / name).write_text(text, encoding="utf-8")
+        crate.vcs.add(prompt_dir)
+
+    crate.vcs.commit(attempt.message)
+
+
+def _test_body(wrapper: str, name: str) -> str:
+    # Crude slice of one `#[test]` function's source, used to check what a single test calls
+    # without paying for a full parse.
+    start = wrapper.find(f"fn {name}")
+    if start == -1:
+        return ""
+    body = wrapper[start:]
+    end = body.find("#[test]")
+    return body if end == -1 else body[:end]

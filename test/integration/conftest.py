@@ -5,6 +5,7 @@
 #
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -20,13 +21,15 @@ import ideas.translate as translate_mod
 REPO_ROOT = Path(__file__).resolve().parents[2]
 IDEAS_MK = REPO_ROOT / "IDEAS.mk"
 TRANSLATION_DIR = "translation.test"
+TEST_CRATES_DIR = "test_crates"
 CRATE = "driver"
 
 BUILD_TARGET = "bear"
 INIT_TARGET = "init"
+TRANSLATION_TEST = "smoke"
 
 BUILD_ENV = {**os.environ, "CARGO_NET_OFFLINE": "true", "RUSTFLAGS": "-Awarnings"}
-MAKE_ENV = {**os.environ, "UV_PROJECT": str(REPO_ROOT)}
+MAKE_ENV = {**os.environ, "IDEAS_DOCKER_IMAGE": "", "UV_PROJECT": str(REPO_ROOT)}
 
 _MINI_H = """\
 #ifndef MINI_H
@@ -78,6 +81,13 @@ add_executable({crate} src/mini.c)
 target_include_directories({crate} PUBLIC ${{CMAKE_CURRENT_SOURCE_DIR}}/include)
 """
 
+_SMOKE_TEST = """\
+#[test]
+fn smoke() {
+    assert_eq!(1, 1);
+}
+"""
+
 _TRANSLATION = {
     "add": "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
     "sub": "pub fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n",
@@ -92,37 +102,48 @@ def get_crate_name(template: str) -> str:
 @pytest.fixture
 def instrumented_workspace(tmp_path):
     """
-    cmake -> init -> tests/smoke.rs
+    test_crates/smoke.rs -> cmake -> init
     """
 
-    def _factory(template: str) -> Path:
+    def _factory(template: str, header: str | None = None, source: str | None = None) -> Path:
         instrumented = tmp_path / template
         instrumented.mkdir()
-        _write_project(instrumented, template)
+        _write_project(instrumented, template, header, source)
+        test = (
+            instrumented
+            / TEST_CRATES_DIR
+            / get_crate_name(template)
+            / "tests"
+            / f"{TRANSLATION_TEST}.rs"
+        )
+        test.parent.mkdir(parents=True)
+        test.write_text(_SMOKE_TEST)
         _make(instrumented, BUILD_TARGET)
         _make(instrumented, INIT_TARGET)
-        _make(
-            instrumented,
-            f"{TRANSLATION_DIR}/{get_crate_name(template)}-sys/tests/smoke.rs",
-        )
         return instrumented / TRANSLATION_DIR
 
     return _factory
 
 
-def _write_project(instrumented: Path, template: str) -> None:
+def _write_project(
+    instrumented: Path,
+    template: str,
+    header: str | None = None,
+    source: str | None = None,
+) -> None:
+    if template == "lib":
+        cmake, default_source = _CMAKE_LIB, _MINI_C_LIB
+    elif template == "bin":
+        cmake, default_source = _CMAKE_BIN, _MINI_C_BIN
+    else:
+        raise ValueError(template)
+
     test_case = instrumented / "test_case"
     (test_case / "src").mkdir(parents=True, exist_ok=True)
     (test_case / "include").mkdir(parents=True, exist_ok=True)
-    (test_case / "include" / "mini.h").write_text(_MINI_H)
-    if template == "lib":
-        (test_case / "src" / "mini.c").write_text(_MINI_C_LIB)
-        (test_case / "CMakeLists.txt").write_text(_CMAKE_LIB.format(crate=CRATE))
-    elif template == "bin":
-        (test_case / "src" / "mini.c").write_text(_MINI_C_BIN)
-        (test_case / "CMakeLists.txt").write_text(_CMAKE_BIN.format(crate=CRATE))
-    else:
-        raise ValueError(template)
+    (test_case / "include" / "mini.h").write_text(header or _MINI_H)
+    (test_case / "src" / "mini.c").write_text(source or default_source)
+    (test_case / "CMakeLists.txt").write_text(cmake.format(crate=CRATE))
 
 
 def _make(instrumented: Path, goal: str) -> None:
@@ -157,14 +178,19 @@ def build_ok(workspace: Path, crate: str, *extra: str) -> bool:
     return subprocess.run(cmd, env=BUILD_ENV, capture_output=True, text=True).returncode == 0
 
 
+def field_value(content: str, field: str) -> str:
+    """Slice one rendered `[[ ## <field> ## ]]` block out of a prompt."""
+    _, marker, rest = content.partition(f"[[ ## {field} ## ]]")
+    if not marker:
+        return ""
+    return rest.partition("[[ ## ")[0]
+
+
 def _snippet_field(content: str) -> str:
     # DummyLM keys match anywhere in the prompt, but `dependent_code` also carries the
     # C code of sibling symbols, so every translation prompt contains every definition.
     # Narrow matching to the `snippet` field so each key selects exactly one symbol.
-    _, marker, rest = content.partition("[[ ## snippet ## ]]")
-    if not marker:
-        return content
-    return rest.partition("[[ ## ")[0]
+    return field_value(content, "snippet") or content
 
 
 class _SnippetKeyedLM(DummyLM):
@@ -207,12 +233,59 @@ def error_lm() -> DummyLM:
     )
 
 
-def make_config(workspace: Path, template: str):
+_SYMBOLS = {"return a + b;": "add", "return a - b;": "sub", "int main": "main"}
+
+_WRAPPER = """\
+#[unsafe(export_name = "{name}")]
+pub extern "C" fn {name}(a: ::std::os::raw::c_int, b: ::std::os::raw::c_int) -> ::std::os::raw::c_int {{
+    {rs_crate}::{name}(a, b)
+}}
+"""
+
+_EXPORT_NAME = re.compile(r'export_name = "(?P<name>\w+)"')
+
+
+class _ScriptedLM(DummyLM):
+    # Answers both translation and wrapper prompts so a run reaches the export table
+    def __init__(self, template: str, fail: frozenset[str]):
+        super().__init__({}, adapter=adapters.ChatAdapter())
+        self._rs_crate = f"{get_crate_name(template)}_rs"
+        self._fail = fail
+
+    def __call__(self, prompt=None, messages=None, **kwargs):
+        content = messages[-1]["content"] if messages else (prompt or "")
+        if example := field_value(content, "example_wrapper").strip():
+            match = _EXPORT_NAME.search(example)
+            assert match is not None, f"unrecognized wrapper template:\n{example}"
+            answer = {
+                "reasoning": "trivial wrapper",
+                "wrapper": f"```rust\n{_WRAPPER.format(name=match['name'], rs_crate=self._rs_crate)}```",
+            }
+        else:
+            snippet = _snippet_field(content)
+            hits = [name for key, name in _SYMBOLS.items() if key in snippet]
+            assert len(hits) == 1, f"expected exactly one symbol in:\n{snippet}"
+            answer = (
+                {"unexpected_field": "not a translation"}
+                if hits[0] in self._fail
+                else {"reasoning": "trivial translation", "translation": _TRANSLATION[hits[0]]}
+            )
+        self.answers = {"": answer}
+        return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+
+def wrapping_lm(template: str, *, fail: frozenset[str] = frozenset()) -> DummyLM:
+    return _ScriptedLM(template, fail)
+
+
+def make_config(workspace: Path, template: str, **overrides):
     crate_name = get_crate_name(template)
-    return TranslateConfig(
+    defaults = dict(
         cargo_toml=workspace / crate_name / "Cargo.toml",
         bindings_cargo_toml=workspace / f"{crate_name}-sys" / "Cargo.toml",
-        tests="smoke",
+        tests=(
+            workspace.parent / TEST_CRATES_DIR / crate_name / "tests" / f"{TRANSLATION_TEST}.rs"
+        ),
         template=template,
         translator="ChainOfThought",
         translator_max_iters=1,
@@ -221,6 +294,7 @@ def make_config(workspace: Path, template: str):
         max_iters=1,
         vcs="none",
     )
+    return TranslateConfig(**{**defaults, **overrides})
 
 
 def install_mock(monkeypatch, workspace: Path, lm: dspy.LM, template: str) -> None:
@@ -247,6 +321,8 @@ def install_mock(monkeypatch, workspace: Path, lm: dspy.LM, template: str) -> No
     monkeypatch.setattr(translate_mod, "HydraConfig", _HydraConfig)
 
 
-def run_translate(monkeypatch, workspace: Path, template: str, lm: dspy.LM) -> None:
+def run_translate(
+    monkeypatch, workspace: Path, template: str, lm: dspy.LM, **overrides
+) -> None:
     install_mock(monkeypatch, workspace, lm, template)
-    translate_mod._main(make_config(workspace, template))
+    translate_mod._main(make_config(workspace, template, **overrides))

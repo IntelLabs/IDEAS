@@ -1,5 +1,6 @@
-# Ignore examples
+# IDEAS specific
 examples/
+docker/build.log
 
 .DS_Store
 *.*~

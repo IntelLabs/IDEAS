@@ -1,0 +1,25 @@
+--- PUBLIC-Test-Corpus/tools/cando2/src/runners/lib_runner.rs	2026-09-22 13:56:16.550459880 -0700
++++ IDEAS/tools/cando2/src/runners/lib_runner.rs	2026-09-22 13:55:25.350455837 -0700
+@@ -19,6 +19,7 @@
+     serde::{de::DeserializeOwned, Serialize},
+     std::{
+         collections::HashMap,
++        env,
+         fmt::Debug,
+         fs::{self, File},
+         io::{Read, Write},
+@@ -70,8 +71,12 @@
+     lib_name: &str,
+     run_rust: bool,
+ ) -> Result<Library, CandoError> {
+-    let build_dir = context.get_build_dir(run_rust);
+-    let lib = build_dir.join(get_full_lib_name(lib_name));
++    let lib = match env::var_os("CANDO_LIBRARY_PATH") {
++        Some(path) if run_rust => PathBuf::from(path),
++        _ => context
++            .get_build_dir(run_rust)
++            .join(get_full_lib_name(lib_name)),
++    };
+     if !lib.exists() {
+         let lib_str = lib
+             .to_str()

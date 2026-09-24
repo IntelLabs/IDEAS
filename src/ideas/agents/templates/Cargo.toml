@@ -1,0 +1,26 @@
+[package]
+name = "testgen-templates"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "__LIB_NAME__"
+
+[[bin]]
+name = "testgen-templates"
+path = "src/main.rs"
+
+[features]
+cc_asan = []
+cc_ubsan = []
+cc_coverage = []
+
+[dev-dependencies]
+assert_cmd = "2.0.17"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+
+[workspace]
