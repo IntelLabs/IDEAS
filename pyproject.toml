@@ -14,7 +14,7 @@ dependencies = [
     "networkx==3.6.1",
     "tomlkit>=0.14.0",
     "tree-sitter==0.25.2",
-    "tree-sitter-rust-orchard==0.16.8",
+    "tree-sitter-rust-orchard==0.16.10",
 ]
 
 [dependency-groups]
