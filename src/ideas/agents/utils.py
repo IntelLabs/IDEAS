@@ -25,7 +25,8 @@ _TEMPLATE_DIR = Path(__file__).with_name("templates") / "tests"
 _ASAN_OPTIONS = (
     "detect_leaks=0"  # This is assumed a non-issue for short-lived instrumentation
     ":allocator_may_return_null=1"  # https://github.com/google/sanitizers/wiki/SanitizerCommonFlags
-    ":detect_invalid_pointer_pairs=2"  # https://github.com/llvm/llvm-project/blob/03fdf3e62c9c647649168a2edb50b0ebb55cdb47/compiler-rt/lib/asan/asan_flags.inc#L149
+    # Need to use level 1 because some C code compares against bounds that are deliberately NULL
+    ":detect_invalid_pointer_pairs=1"  # https://github.com/llvm/llvm-project/blob/03fdf3e62c9c647649168a2edb50b0ebb55cdb47/compiler-rt/lib/asan/asan_flags.inc#L149
     ":exitcode=86"
 )
 _UBSAN_OPTIONS = (
@@ -450,7 +451,6 @@ def write_test_templates(path: Path, template: str, lib_name: str | None = None)
     _write_test_template(path / "io.rs", template, "assert", lib_name)
 
 
-TESTGEN_BOTTOM_UP = os.environ.get("TESTGEN_BOTTOM_UP", "0") not in ("0", "", "false", "False")
 TESTGEN_FINISH_EARLY = os.environ.get("TESTGEN_FINISH_EARLY", "1") not in (
     "0",
     "",

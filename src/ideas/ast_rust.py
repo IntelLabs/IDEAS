@@ -4,8 +4,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-from textwrap import indent
-from collections import OrderedDict
+import re
+import difflib
+from collections import Counter, OrderedDict
 
 from tree_sitter import Language, Parser, Node, Query, QueryCursor
 import tree_sitter_rust_orchard
@@ -15,7 +16,10 @@ from .adapters import Code
 # Initialize the Rust language once
 RUST_LANGUAGE = Language(tree_sitter_rust_orchard.language())
 RUST_PARSER = Parser(RUST_LANGUAGE)
-CodeRust = Code["rust"]
+
+
+class CodeRust(Code):
+    language = "rust"
 
 
 # The name bindgen gives an item, already mangled into a usable Rust identifier
@@ -44,6 +48,23 @@ class RustFnSignature:
         self.params: Node | None = node.child_by_field_name("parameters")
         self.return_type: Node | None = node.child_by_field_name("return_type")
 
+        # The exact source from the first qualifier up to the body, without attributes
+        head = [child for child in node.children if child.type != "attributes"]
+        body = node.child_by_field_name("body")
+        start = head[0].start_byte if head else node.start_byte
+        end = body.start_byte if body else node.end_byte
+        self.text: str = (
+            (node.text or b"")[start - node.start_byte : end - node.start_byte].decode().strip()
+        )
+        # Doc comments share the `attributes` node but are prose, not behavior
+        self.attributes: list[str] = [
+            get_node_text(attribute)
+            for child in node.children
+            if child.type == "attributes"
+            for attribute in child.named_children
+            if attribute.type == "attribute_item"
+        ]
+
     def __repr__(self) -> str:
         text = ""
         if _text := self.name.text:
@@ -60,7 +81,40 @@ class RustFnSignature:
         if not isinstance(other, RustFnSignature):
             return NotImplemented
 
-        return self.__repr__() == other.__repr__()
+        # The whole head, since dropping `unsafe` or `extern "C"` still compiles and links
+        return self.text == other.text
+
+
+def attribute_feedback(template: RustFnSignature, signature: RustFnSignature) -> str | None:
+    missing_attributes = Counter(template.attributes) - Counter(signature.attributes)
+    if not missing_attributes:
+        return None
+    expected = "\n".join(template.attributes)
+    return (
+        f"The attributes of `{get_node_text(template.name)}` do not match the template. "
+        f"Keep every template attribute exactly as written. Additional attributes are allowed.\n"
+        f"Required attributes:\n~~~rust\n{expected}\n~~~"
+    )
+
+
+def signature_feedback(template: RustFnSignature, signature: RustFnSignature | None) -> str:
+    feedback = (
+        f"The signature of `{get_node_text(template.name)}` does not match the template. It "
+        "must be copied character-for-character: the same line breaks, spaces, and "
+        "punctuation, without adding or removing trailing commas. Only the function body may "
+        f"change.\nExpected exactly:\n~~~rust\n{template.text}\n~~~"
+    )
+    if signature is None:
+        return feedback
+
+    diff = difflib.unified_diff(
+        template.text.splitlines(),
+        signature.text.splitlines(),
+        fromfile="template",
+        tofile="yours",
+        lineterm="",
+    )
+    return feedback + "\nYour signature differs:\n~~~diff\n" + "\n".join(diff) + "\n~~~"
 
 
 def get_root(code: str | bytes) -> Node:
@@ -84,13 +138,63 @@ def get_node_text(node: Node | None) -> str:
     return node.text.decode()
 
 
-_TYPE_IDENTIFIER_QUERY = Query(RUST_LANGUAGE, "(type_identifier) @name")
+# Only these share the value namespace with an exported `fn` or an extern static
+_VALUE_ITEMS = ("function_item", "static_item", "const_item")
 
 
-def get_referenced_type_names(node: Node) -> set[BindgenName]:
-    # Every type named anywhere under `node`, e.g. the field types of a struct item
-    captures = QueryCursor(_TYPE_IDENTIFIER_QUERY).captures(node)
-    return {BindgenName(text) for n in captures.get("name", []) if (text := get_node_text(n))}
+def top_level_value_names(code: CodeRust) -> set[str]:
+    # FIXME: Misses value names from `extern` blocks, `use` imports, unit/tuple struct
+    # constructors and macro-generated items
+    return {
+        get_node_text(node.child_by_field_name("name"))
+        for node in get_root(str(code)).children
+        if node.type in _VALUE_ITEMS
+    }
+
+
+_PUBLIC_ITEMS = (
+    "function_item",
+    "struct_item",
+    "union_item",
+    "enum_item",
+    "type_item",
+    "static_item",
+    "const_item",
+    "trait_item",
+)
+
+
+def _is_pub(node: Node) -> bool:
+    vis = next((c for c in node.children if c.type == "visibility_modifier"), None)
+    return get_node_text(vis) == "pub"
+
+
+def non_public_items(code: CodeRust) -> list[str]:
+    missing = []
+    for item in get_root(str(code)).children:
+        if item.type not in _PUBLIC_ITEMS:
+            continue
+        name = get_node_text(item.child_by_field_name("name"))
+        if not _is_pub(item):
+            missing.append(name)
+        body = item.child_by_field_name("body")
+        if body is None or item.type not in ("struct_item", "union_item"):
+            continue
+        if body.type == "field_declaration_list":
+            for field in body.named_children:
+                if field.type == "field_declaration" and not _is_pub(field):
+                    missing.append(f"{name}.{get_node_text(field.child_by_field_name('name'))}")
+        elif body.type == "ordered_field_declaration_list":
+            # Tuple fields have no wrapper node: a visibility applies to the type after it
+            index, pub = 0, False
+            for child in body.named_children:
+                if child.type == "visibility_modifier":
+                    pub = get_node_text(child) == "pub"
+                elif child.type not in ("attributes", "attribute_item"):
+                    if not pub:
+                        missing.append(f"{name}.{index}")
+                    index, pub = index + 1, False
+    return missing
 
 
 def get_ancestor_nodes(node: Node, node_type: str | None = None) -> list[Node]:
@@ -205,7 +309,7 @@ def validate_changes(code: CodeRust, template: CodeRust) -> OrderedDict[str, str
 
             if not node.type == "function_item" or (node.type != template_node.type):
                 scope_feedback["signature_changes"] = (
-                    "You must preserve the function signature in the template intact and **not modify it**!"
+                    "You must preserve the function signature in `example_wrapper` intact (including **any** formatting) and only modify the function body!"
                 )
             else:
                 # Compare signatures
@@ -216,9 +320,13 @@ def validate_changes(code: CodeRust, template: CodeRust) -> OrderedDict[str, str
                     signature = None
 
                 if template_signature != signature:
-                    scope_feedback["signature_changes"] = (
-                        "You must preserve the function signature in the template intact and **not modify it**!"
+                    scope_feedback["signature_changes"] = signature_feedback(
+                        template_signature, signature
                     )
+                if signature is not None and (
+                    feedback := attribute_feedback(template_signature, signature)
+                ):
+                    scope_feedback["attribute_changes"] = feedback
 
     return scope_feedback
 
@@ -247,48 +355,76 @@ def mangle(name: str) -> str:
     return name
 
 
-def _rust_node_signature(node: Node, source: bytes, delete: bool = False) -> str | None:
-    ntype = node.type
-    if ntype in ("function_item", "function_signature_item"):
-        if delete:
-            return None
-
-        # Find the block body and remove it
-        body = node.child_by_field_name("body")
-        if body:
-            # Everything before the body is the signature
-            sig = source[node.start_byte : body.start_byte].rstrip()
-            return sig.decode() + ";"
-
-    # Recurse into impl/trait/mod bodies so nested functions are also stripped/deleted
-    if ntype in ("impl_item", "trait_item", "mod_item"):
-        body = node.child_by_field_name("body")
-        if body is not None:
-            header = source[node.start_byte : body.start_byte].decode()
-            parts = [
-                sig
-                for child in body.named_children
-                if (sig := _rust_node_signature(child, source, delete=delete)) is not None
-            ]
-            if not parts:
-                return header + "{}"
-            return header + "{\n" + indent("\n".join(parts), " " * 4) + "\n}"
-
-    # Keep everything else as-is
-    return source[node.start_byte : node.end_byte].decode()
-
-
-def strip_fns(code: CodeRust, delete: bool = False) -> CodeRust:
-    if not str(code).strip():
-        return code
-
+def strip_cfg_test(code: CodeRust) -> CodeRust:
     source = str(code).encode()
-    root = get_root(source)
-    parts: list[str] = []
+    kept: list[bytes] = []
+    start = 0
+    # Outer attributes arrive either as siblings before the item or nested inside it
+    attributes: list[Node] = []
+    for node in get_root(source).children:
+        if node.type == "attribute_item":
+            attributes.append(node)
+            continue
+        nested = [
+            attribute
+            for child in node.children
+            if child.type == "attributes"
+            for attribute in child.children
+        ]
+        if any(
+            "".join(get_node_text(a).split()) == "#[cfg(test)]" for a in attributes + nested
+        ):
+            kept.append(source[start : (attributes or [node])[0].start_byte])
+            start = node.end_byte
+        attributes.clear()
+    kept.append(source[start:])
+    return CodeRust(b"".join(kept).decode())
 
-    for node in root.children:
-        sig = _rust_node_signature(node, source, delete=delete)
-        if sig is not None:
-            parts.append(sig)
 
-    return CodeRust("\n".join(parts)) if parts else CodeRust("")
+_EXPORT_ATTRIBUTE = re.compile(r"#\[(unsafe\()?(no_mangle|export_name)\b")
+
+
+def strip_exports(code: CodeRust) -> CodeRust:
+    # Rust can still name the items, but the linker no longer exports them
+    source = str(code).encode()
+    kept: list[bytes] = []
+    start = 0
+    for node in get_root(source).children:
+        attributes = (
+            [node]
+            if node.type == "attribute_item"
+            else [
+                attribute
+                for child in node.children
+                if child.type == "attributes"
+                for attribute in child.children
+            ]
+        )
+        for attribute in attributes:
+            if _EXPORT_ATTRIBUTE.match("".join(get_node_text(attribute).split())):
+                kept.append(source[start : attribute.start_byte])
+                # The attribute's own line break goes with it
+                end = attribute.end_byte
+                while end < len(source) and source[end : end + 1].isspace():
+                    end += 1
+                start = end
+    kept.append(source[start:])
+    return CodeRust(b"".join(kept).decode())
+
+
+def strip_visibility(code: CodeRust) -> CodeRust:
+    # Drop the visibility of top-level items, so only their own crate can name them
+    source = str(code).encode()
+    kept: list[bytes] = []
+    start = 0
+    for node in get_root(source).children:
+        for child in node.children:
+            if child.type == "visibility_modifier":
+                kept.append(source[start : child.start_byte])
+                # The whitespace after it goes with it
+                end = child.end_byte
+                while end < len(source) and source[end : end + 1].isspace():
+                    end += 1
+                start = end
+    kept.append(source[start:])
+    return CodeRust(b"".join(kept).decode())

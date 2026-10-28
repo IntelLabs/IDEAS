@@ -10,6 +10,7 @@ from textwrap import dedent
 import pytest
 
 from ideas import ast
+from ideas.tools import run_subprocess
 from clang.cindex import TranslationUnit, CursorKind, Diagnostic
 
 
@@ -205,6 +206,32 @@ def test_forward_declaration_of_anonymous_inline_tag_return_type():
     assert declarations["anon_enum_ret"] is None
     assert str(declarations["tagged_ret"]).strip() == "struct Tag tagged_ret(void);"
     assert str(declarations["plain"]).strip() == "int plain(int a);"
+
+
+_LIBC_HEADERS = """\
+    assert.h complex.h ctype.h errno.h fenv.h float.h inttypes.h limits.h locale.h math.h
+    setjmp.h signal.h stdarg.h stdatomic.h stdbool.h stddef.h stdint.h stdio.h stdlib.h
+    string.h threads.h time.h uchar.h wchar.h wctype.h strings.h unistd.h fcntl.h dirent.h
+    pthread.h sys/stat.h sys/socket.h sys/mman.h netdb.h poll.h dlfcn.h search.h regex.h
+""".split()
+
+
+def test_libc_declarations_reprint_as_compatible_redeclarations():
+    headers = "#define _GNU_SOURCE\n" + "".join(f"#include <{h}>\n" for h in _LIBC_HEADERS)
+    tr = ast.extract_info_c(parse_c(headers))
+
+    redeclarations = []
+    for symbol in tr.symbols.values():
+        if (symbol.is_function or symbol.is_variable) and not symbol.is_definition:
+            # Headers shadow many functions with function-like macros
+            redeclarations += [f"#undef {symbol.spelling}", symbol.code]
+            if symbol.forward_declaration is not None:
+                redeclarations.append(symbol.forward_declaration)
+
+    code = headers + "\n".join(map(str, redeclarations))
+    cmd = ["clang-23", "-Wno-gcc-install-dir-libstdcxx", "-Wall", "-Werror", "-fsyntax-only"]
+    success, out, err, _ = run_subprocess([*cmd, "-x", "c", "-"], input=code)
+    assert success, out + err
 
 
 def test_fake_quotes_unicode():
@@ -533,6 +560,57 @@ def test_local_struct():
     assert len(tr.complete_graph["c:@F@test2"]) == 0
     assert len(tr.complete_graph["c:@F@test"]) == 1
     assert tr.complete_graph["c:@F@test"][0] == "c:@S@a_s"
+
+
+def test_inline_tag_definitions_are_printed_where_they_are_owned():
+    code = dedent(
+        """
+        struct outer {
+            struct inner { int a; } *items;
+            union { int i; float f; } u;
+        };
+
+        int f(int v) {
+            union { int i; float f; } conv;
+            static const struct kw { int n; } table[] = {{1}, {2}};
+            struct kw *p = &table[0];
+            conv.i = v;
+            return (int)conv.f + p->n + (int)sizeof(struct kw);
+        }
+        """
+    )
+    tr = ast.extract_info_c(parse_c(code))
+
+    assert tr.symbols["c:@S@outer"].code.code == dedent(
+        """\
+        struct outer {
+            struct inner {
+                int a;
+            } *items;
+            union {
+                int i;
+                float f;
+            } u;
+        };
+        """
+    )
+    # The definition belongs to the declarator that owns it, not to later uses of the tag
+    assert tr.symbols["c:@F@f"].code.code == dedent(
+        """\
+        int f(int v) {
+            union {
+                int i;
+                float f;
+            } conv;
+            static const struct kw {
+                int n;
+            } table[] = {{1}, {2}};
+            struct kw *p = &table[0];
+            conv.i = v;
+            return (int)conv.f + p->n + (int)sizeof(struct kw);
+        }
+        """
+    )
 
 
 def test_complex_typedef():

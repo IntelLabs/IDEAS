@@ -1,0 +1,12 @@
+[package]
+name = "_cando_librunner"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+unexpected_cfgs = "allow"
+non_camel_case_types = "allow"
+non_snake_case = "allow"
+
+[dependencies]
+cando2 = { git = "https://github.com/mariusarvinte/PUBLIC-Test-Corpus", rev = "bf3f39e49e5eca8409934f1a874ab6c099a4ecda" }

@@ -9,19 +9,29 @@ import re
 import json
 import shutil
 import signal
-from textwrap import dedent
 
 import tomlkit
 import logging
 import subprocess
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import suppress
-from functools import cached_property
+from dataclasses import dataclass, replace
+from functools import cache, cached_property
 from typing import Any, Literal
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
+from .ast_rust import CodeRust
+
 
 logger = logging.getLogger("ideas.tools")
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# A rapx finding is a log line naming the bug followed by an annotate-snippets location
+RAPX_BUG = re.compile(
+    r"\|RAPx\|WARN\|: warning: (?P<bug>[^\n]+?)\.?\n\s*-+> (?P<file>[^\n:]+):(?P<line>\d+):"
+)
+RAPX_NOISE = re.compile(r"\s*\bdetected\b")
 
 
 class VCS:
@@ -107,6 +117,57 @@ class VCS:
         return success, output + error
 
 
+class Workspace:
+    def __init__(self, root: Path, vcs: Literal["none", "git"] = "none"):
+        self.root = root
+        self.vcs = VCS(repo_dir=root, vcs=vcs)
+
+    @property
+    def cargo_toml(self) -> Path:
+        return self.root / "Cargo.toml"
+
+    @property
+    def cargo_lock(self) -> Path:
+        return self.root / "Cargo.lock"
+
+    def stage(self) -> None:
+        self.vcs.add(*(path for path in (self.cargo_toml, self.cargo_lock) if path.exists()))
+
+    def _member(self, crate: "Crate") -> str:
+        return str(crate.cargo_toml.parent.relative_to(self.root))
+
+    def add_default_member(self, crate: "Crate") -> None:
+        manifest = tomlkit.loads(self.cargo_toml.read_text())
+        default_members = manifest["workspace"].setdefault("default-members", tomlkit.array())  # type: ignore[union-attr]
+        if (member := self._member(crate)) not in default_members:
+            default_members.append(member)
+            self.cargo_toml.write_text(tomlkit.dumps(manifest))
+            self.vcs.add(self.cargo_toml)
+
+    def remove_member(self, crate: "Crate") -> None:
+        manifest = tomlkit.loads(self.cargo_toml.read_text())
+        manifest["workspace"]["members"].remove(self._member(crate))  # type: ignore[union-attr]
+        self.cargo_toml.write_text(tomlkit.dumps(manifest))
+
+        crate_dir = crate.cargo_toml.parent
+        self.vcs.rm(crate_dir, force=True)
+        shutil.rmtree(crate_dir, ignore_errors=True)
+
+        # Re-resolving the workspace drops the member from Cargo.lock
+        success, output, error, _ = run_subprocess(
+            ["cargo", "metadata", "--format-version=1", "--manifest-path", str(self.cargo_toml)]
+        )
+        if not success:
+            raise ValueError(f"Failed to re-resolve workspace {self.root}!\n{output + error}")
+        self.stage()
+
+    def clean(self) -> None:
+        cmd = ["cargo", "clean", "--quiet", f"--manifest-path={self.cargo_toml}"]
+        success, output, error, _ = run_subprocess(cmd)
+        if not success:
+            logger.warning(f"Failed to clean workspace at {self.root}:\n\n{output + error}")
+
+
 class Crate:
     def __init__(
         self,
@@ -115,12 +176,10 @@ class Crate:
         template: Literal["bin", "lib"] | None = None,
         reinit: bool = False,
         *,
-        jobs: int | None = None,
-        codegen_units: int | None = None,
+        jobs: int | None = 1,
     ):
         self.cargo_toml = cargo_toml.resolve()
         self.jobs = jobs
-        self.codegen_units = codegen_units
 
         crate_dir = self.cargo_toml.parent
         self.vcs = VCS(repo_dir=crate_dir, vcs=vcs)
@@ -180,13 +239,24 @@ class Crate:
         root_package = next(filter(lambda p: p["id"] == root, self.metadata["packages"]))
         return root_package
 
+    def dependency_packages(self, names: Iterable[str]) -> dict[str, dict[str, Any]]:
+        packages = {p["id"]: p for p in self.metadata["packages"]}
+        root = self.root_package["id"]
+        node = next(n for n in self.metadata["resolve"]["nodes"] if n["id"] == root)
+        # Only normal deps: dev/build deps are not available to the library's code
+        direct = {
+            packages[d["pkg"]]["name"]: packages[d["pkg"]]
+            for d in node["deps"]
+            if any(k["kind"] is None for k in d["dep_kinds"])
+        }
+        return {name: direct[name] for name in names}
+
     @property
-    def workspace_root(self) -> Path:
-        workspace_root = self.metadata.get("workspace_root", None)
-        if workspace_root is None:
-            # Standalone crates without workspace metadata fall back to crate directory.
-            return self.cargo_toml.parent
-        return Path(workspace_root)
+    def workspace(self) -> Workspace:
+        root = self.metadata.get("workspace_root", None)
+        # Standalone crates without workspace metadata fall back to crate directory.
+        root = self.cargo_toml.parent if root is None else Path(root)
+        return Workspace(root, vcs=self.vcs.vcs)  # type: ignore[reportArgumentType]
 
     @property
     def bin_targets(self) -> list[dict[str, Any]]:
@@ -224,28 +294,25 @@ class Crate:
         return None
 
     @property
-    def src_dir(self) -> Path:
-        src_paths: list[Path] = []
-        if self.lib_src_path is not None:
-            src_paths.append(self.lib_src_path.parent)
-        if self.main_src_path is not None:
-            src_paths.append(self.main_src_path.parent)
-
-        if not src_paths:
-            raise ValueError(f"Crate {self.name} has neither lib.rs nor main.rs!")
-        if len({path.resolve() for path in src_paths}) > 1:
-            raise ValueError(
-                f"Crate {self.name} has inconsistent src directories: {src_paths!r}"
-            )
-        return src_paths[0]
-
-    @property
     def name(self) -> str:
         return self.root_package["name"]
 
     def cargo_add(
-        self, dep: str, section: str | None = None, features: list[str] | None = None
+        self,
+        dep: str,
+        section: str | None = None,
+        features: list[str] | None = None,
+        copy_from: Path | None = None,
     ) -> str:
+        source = copy_from or self.workspace.cargo_toml
+        manifest = tomlkit.loads(source.read_text()).unwrap()
+        # A bare name missing from the workspace would silently fall back to the registry
+        if (spec := manifest.get("workspace", {}).get("dependencies", {}).get(dep)) is None:
+            raise ValueError(f"`{dep}` is not in [workspace.dependencies] of {source}")
+        if copy_from is not None:
+            spec = {"version": spec} if isinstance(spec, str) else spec
+            dep = f"{dep}@{spec['version']}"
+            features = [*spec.get("features", []), *(features or [])]
         cmd = [
             "cargo",
             "add",
@@ -268,43 +335,6 @@ class Crate:
         self.invalidate_metadata()
         return output
 
-    # Workaround for https://github.com/rust-lang/cargo/issues/9454
-    def add_self_alias(self, alias: str) -> None:
-        lib_name = self.lib_name
-        if lib_name is None:
-            raise ValueError(f"Crate {self.name} has no library target to alias as `{alias}`!")
-
-        shim_name = f"{self.name}-{alias.replace('_', '-')}"
-        shim_dir = self.cargo_toml.parent / alias
-        (shim_dir / "src").mkdir(parents=True, exist_ok=True)
-        (shim_dir / "src" / "lib.rs").write_text(f"pub use {lib_name}::*;\n")
-        (shim_dir / "Cargo.toml").write_text(
-            dedent(f"""\
-                [package]
-                name = "{shim_name}"
-                version = "0.1.0"
-                edition = "{self.root_package["edition"]}"
-
-                [dependencies]
-                {lib_name} = {{ path = "..", package = "{self.name}" }}
-
-                [lib]
-                test = false
-                doctest = false
-            """)
-        )
-
-        # Add the shim crate as a fixed-name dev dependency in this crate
-        manifest_path = Path(self.cargo_toml)
-        doc = tomlkit.parse(manifest_path.read_text())
-        dev_deps = doc.setdefault("dev-dependencies", tomlkit.table())
-        entry = tomlkit.inline_table()
-        entry["path"] = alias
-        entry["package"] = shim_name
-        dev_deps[alias] = entry
-        manifest_path.write_text(tomlkit.dumps(doc))
-        self.invalidate_metadata()
-
     def cargo_feature(self, **features: list[str]) -> None:
         # Set/overwrite new features
         cargo_toml = tomlkit.loads(self.cargo_toml.read_text())
@@ -320,14 +350,18 @@ class Crate:
     def configure_target(
         self,
         section: Literal["bin", "lib"],
-        name: str,
+        name: str | None = None,
         test: bool = True,
         doctest: bool = True,
         crate_type: list[str] | None = None,
+        path: str | None = None,
     ) -> None:
         content = tomlkit.loads(self.cargo_toml.read_text())
         table = tomlkit.table()
-        table.add("name", name)
+        if name is not None:
+            table.add("name", name)
+        if path is not None:
+            table.add("path", path)
         if crate_type is not None:
             table.add("crate-type", crate_type)
         table.add("test", test)
@@ -341,11 +375,20 @@ class Crate:
         self.cargo_toml.write_text(tomlkit.dumps(content))
         self.invalidate_metadata()
 
-    def add_workspace_dependencies(self, names: list[str]) -> None:
-        if not names:
+    def add_workspace_dependencies(
+        self, names: list[str | Mapping[str, str]], *, dev: bool = False
+    ) -> None:
+        # A mapping names a package by alias only, e.g. `{"safe_crate": "libfoo-rs"}`
+        deps: list[tuple[str | None, str]] = []
+        for entry in names:
+            if isinstance(entry, str):
+                deps.append((None, entry.strip()))
+            else:
+                deps.extend((alias.strip(), name.strip()) for alias, name in entry.items())
+        if not deps:
             return
-
-        workspace_root = self.workspace_root
+        section = "dev-dependencies" if dev else "dependencies"
+        workspace_root = self.workspace.root
         workspace_toml_path = workspace_root / "Cargo.toml"
         workspace_toml = tomlkit.loads(workspace_toml_path.read_text())
         workspace_table = workspace_toml.get("workspace", tomlkit.table())
@@ -359,12 +402,11 @@ class Crate:
         }
 
         cargo_toml = tomlkit.loads(self.cargo_toml.read_text())
-        dependencies = cargo_toml.get("dependencies", tomlkit.table())
+        dependencies = cargo_toml.get(section, tomlkit.table())
 
-        for dep_name in names:
-            dep_name = dep_name.strip()
-            if not dep_name:
-                raise ValueError("workspace dependency names must be non-empty")
+        for alias, dep_name in deps:
+            if not dep_name or alias == "":
+                raise ValueError("workspace dependency names and aliases must be non-empty")
 
             pkg = workspace_packages.get(dep_name)
             if pkg is None:
@@ -376,27 +418,22 @@ class Crate:
             dep_dir = manifest_path.parent
             rel_path = dep_dir.relative_to(workspace_root)
             workspace_deps[dep_name] = {"path": str(rel_path)}
-            dependencies[dep_name] = {"workspace": True}
+            if alias is None:
+                dependencies[dep_name] = {"workspace": True}
+            else:
+                # rustc only gets `--extern {alias}` so no leaked names are allowed
+                dependencies[alias] = {
+                    "path": os.path.relpath(dep_dir, self.cargo_toml.parent),
+                    "package": dep_name,
+                }
 
         workspace_table["dependencies"] = workspace_deps
         workspace_toml["workspace"] = workspace_table
         workspace_toml_path.write_text(tomlkit.dumps(workspace_toml))
 
-        cargo_toml["dependencies"] = dependencies
+        cargo_toml[section] = dependencies
         self.cargo_toml.write_text(tomlkit.dumps(cargo_toml))
         self.invalidate_metadata()
-
-    def cargo_clean(self, workspace: bool = False) -> None:
-        manifest_path = self.workspace_root / "Cargo.toml" if workspace else self.cargo_toml
-        cmd = [
-            "cargo",
-            "clean",
-            "--quiet",
-            f"--manifest-path={manifest_path}",
-        ]
-        success, output, error, _ = run_subprocess(cmd)
-        if not success:
-            logger.warning(f"Failed to clean crate at {manifest_path}:\n\n{output + error}")
 
     def cargo_build(self) -> tuple[bool, str]:
         cmd = [
@@ -414,10 +451,79 @@ class Crate:
 
     def _cargo_env(self) -> dict[str, str]:
         env = os.environ.copy()
-        if self.codegen_units is not None:
-            rustflags = env.get("RUSTFLAGS", "")
-            env["RUSTFLAGS"] = (rustflags + f" -C codegen-units={self.codegen_units}").strip()
+        if self.jobs is not None:
+            env["CARGO_BUILD_JOBS"] = str(self.jobs)
+            env["RUST_TEST_THREADS"] = str(self.jobs)
+            env["NEXTEST_TEST_THREADS"] = str(self.jobs)
         return env
+
+    def cargo_clippy(
+        self, *clippy_args: str, targets: str | tuple[str, ...] = "--lib"
+    ) -> "ClippyResult":
+        if isinstance(targets, str):
+            targets = (targets,)
+        cmd = [
+            "cargo",
+            "clippy",
+            "--quiet",
+            "--color=never",
+            f"--manifest-path={self.cargo_toml}",
+            "--message-format=json",
+            "--no-deps",
+            *targets,
+        ]
+        if self.jobs is not None:
+            cmd.extend(["-j", str(self.jobs)])
+        if clippy_args:
+            cmd.extend(["--", *clippy_args])
+
+        _, output, error, returncode = run_subprocess(cmd, env=self._cargo_env())
+        return ClippyResult.from_json(
+            output,
+            error,
+            returncode,
+            package_id=self.root_package["id"],
+            root=self.workspace.root,
+            lib_src_path=self.lib_src_path,
+        )
+
+    def cargo_rapx(self, toolchain: str, timeout: int | None = None) -> list[dict[str, Any]]:
+        # rapx links against rustc internals, so it runs on the nightly it was built for
+        cmd = ["cargo", f"+{toolchain}", "rapx"]
+        if timeout is not None:
+            cmd.extend(["--timeout", str(timeout)])
+        # `-f` only: `-m` reports leaks, which are safe in Rust and so not UB-adjacent
+        cmd.extend(["check", "-f"])
+
+        env = self._cargo_env()
+        # Cleaning would evict the build cache the pipeline shares, and a separate target dir
+        # keeps the stable and nightly rustcs from invalidating each other
+        env["RAPX_CLEAN"] = "false"
+        env["RAPX_RECURSIVE"] = "none"
+        env.setdefault("CARGO_TARGET_DIR", str(self.workspace.root / "target" / "rapx"))
+
+        # rapx analyses the package at the cwd; `--manifest-path` only reaches `cargo check`
+        success, output, error, reason = run_subprocess(
+            cmd,
+            cwd=self.cargo_toml.parent,
+            env=env,
+            # Margin over rapx's own deadline so it gets to bail out and report first
+            timeout=None if timeout is None else timeout + 60,
+        )
+        if not success:
+            raise RuntimeError(
+                f"`cargo rapx` failed on {self.cargo_toml} ({reason}):\n\n{output + error}"
+            )
+
+        return [
+            {
+                "bug": RAPX_NOISE.sub("", match["bug"]).strip(),
+                "file": match["file"],
+                "line": int(match["line"]),
+            }
+            # rapx has no machine-readable output; it renders findings to stderr
+            for match in RAPX_BUG.finditer(ANSI.sub("", error))
+        ]
 
     def cargo_test_list(self, name: str, features: list[str] | None = None) -> list[str]:
         cmd = [
@@ -434,7 +540,7 @@ class Crate:
         if features:
             cmd.extend(["--features", ",".join(features)])
 
-        ok, output, error, _ = run_subprocess(cmd)
+        ok, output, error, _ = run_subprocess(cmd, env=self._cargo_env())
         if not ok:
             raise RuntimeError(
                 f"Failed to list the tests of `{name}` in {self.cargo_toml.parent}!\n{output + error}"
@@ -477,6 +583,9 @@ class Crate:
             cmd.append("--no-run")
 
         env = self._cargo_env()
+        rustflags = env.get("RUSTFLAGS", "")
+        if "-Awarnings" not in rustflags.split():
+            env["RUSTFLAGS"] = f"{rustflags} -Awarnings".strip()
         if message_format is not None:
             cmd.extend(["--message-format", message_format])
             if message_format == "libtest-json":
@@ -509,6 +618,140 @@ class Crate:
             raise ValueError("path must not be absolute")
         path = self.cargo_toml.parent / path
         return path.write_text(data, **kwargs)
+
+
+@dataclass(frozen=True)
+class ClippyResult:
+    success: bool
+    # This package's diagnostics that point somewhere
+    diagnostics: list[dict[str, Any]]
+    # Errors left out of `diagnostics`, which still fail Clippy
+    errors: list[str]
+    stderr: str
+    root: Path
+    lib_src_path: Path | None
+
+    @classmethod
+    def from_json(
+        cls,
+        stdout: str,
+        stderr: str,
+        returncode: int | Literal["timeout"],
+        *,
+        package_id: str,
+        root: Path,
+        lib_src_path: Path | None,
+    ) -> "ClippyResult":
+        # Path dependencies (`--no-deps` skips only their Clippy lints) and span-less summaries
+        # are not this package's to fix, but their errors still fail clippy
+        diagnostics: dict[str, dict[str, Any]] = {}
+        errors: dict[str, None] = {}
+        for line in stdout.splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("reason") != "compiler-message":
+                continue
+            if not isinstance(message := record.get("message"), dict):
+                continue
+            if record.get("package_id") == package_id and _primary_spans(message):
+                key = message.get("rendered") or json.dumps(message, sort_keys=True)
+                diagnostics.setdefault(key, message)
+            elif _is_error(message):
+                errors[_text(message)] = None
+
+        success = returncode == 0
+        stderr = stderr.strip()
+        package_errors = any(_is_error(d) for d in diagnostics.values())
+        if not success and not errors and not stderr and not package_errors:
+            stderr = f"`cargo clippy` failed ({returncode}) without saying why"
+        return cls(
+            success=success,
+            diagnostics=list(diagnostics.values()),
+            errors=list(errors),
+            stderr=stderr,
+            root=root,
+            lib_src_path=lib_src_path,
+        )
+
+    @property
+    def output(self) -> str:
+        return "\n\n".join(text for text in [*self.errors, self.stderr] if text)
+
+    @property
+    def has_errors(self) -> bool:
+        return any(_is_error(d) for d in self.diagnostics)
+
+    def render(
+        self, levels: tuple[str, ...] = ("warning", "error"), *, failure: bool = True
+    ) -> str:
+        # Levels match by prefix, so "error" also covers "error: internal compiler error"
+        relevant = [d for d in self.diagnostics if str(d.get("level", "")).startswith(levels)]
+        texts = [_text(d) for d in relevant]
+        if failure and not self.success:
+            texts.append(self.output.strip())
+        rendered = "\n\n".join(text for text in texts if text)
+        if relevant and not rendered:
+            rendered = "Clippy reported a warning or error without diagnostic details."
+        return rendered
+
+    def only_in(self, code: CodeRust) -> "ClippyResult":
+        # Code the attempt may not edit, like bindgen's bitfield accessors, can carry warnings
+        # it could never fix
+        # FIXME: Scope to the whole package, to catch warnings attempts cause in earlier code,
+        # once generated code is clippy-clean
+        kept, outside = self._split(code)
+        errors = {_text(d): None for d in outside if _is_error(d)}
+        errors.update(dict.fromkeys(self.errors))
+        # Errors elsewhere fail Clippy but not this scope; they stay in `output` for the caller
+        success = self.success or (bool(errors) and not any(_is_error(d) for d in kept))
+        return replace(self, success=success, diagnostics=kept, errors=list(errors))
+
+    def not_in(self, code: CodeRust) -> "ClippyResult":
+        # What `only_in` leaves out: the package's diagnostics outside `code`
+        return replace(self, diagnostics=self._split(code)[1])
+
+    def _split(self, code: CodeRust) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        assert self.lib_src_path is not None
+        lib_src_path = self.lib_src_path.resolve()
+        text, src = lib_src_path.read_text(), str(code)
+        start = text.rfind(src) if src else -1
+        # None of the file is the attempt's if it is not there, so none of it is held against it
+        first = text.count("\n", 0, start) + 1
+        lines = range(first, first + src.count("\n")) if start >= 0 else range(0)
+
+        def in_code(diagnostic: dict[str, Any]) -> bool:
+            return any(
+                path == lib_src_path and line in lines
+                for span in _primary_spans(diagnostic)
+                for path, line in _span_locations(self.root, span)
+            )
+
+        inside = [d for d in self.diagnostics if in_code(d)]
+        return inside, [d for d in self.diagnostics if not in_code(d)]
+
+
+def _primary_spans(diagnostic: dict[str, Any]) -> list[dict[str, Any]]:
+    return [s for s in diagnostic.get("spans") or [] if s.get("is_primary")]
+
+
+def _is_error(diagnostic: dict[str, Any]) -> bool:
+    return str(diagnostic.get("level", "")).startswith("error")
+
+
+def _text(diagnostic: dict[str, Any]) -> str:
+    return (diagnostic.get("rendered") or diagnostic.get("message", "")).rstrip()
+
+
+def _span_locations(root: Path, span: dict[str, Any]) -> Iterator[tuple[Path, int]]:
+    # Macro expansions report the definition site first, then each call site, innermost first
+    while True:
+        path = Path(span["file_name"])
+        yield (path if path.is_absolute() else root / path).resolve(), span["line_start"]
+        if not (expansion := span.get("expansion")):
+            return
+        span = expansion["span"]
 
 
 def _kill_group(
@@ -565,7 +808,7 @@ def check_rust(
     flags: list[str] | None = None,
     structured_output: bool = False,
 ) -> tuple[bool, str]:
-    cmd = ["rustc", "-Awarnings"]
+    cmd = ["rustc", "--edition=2024", "-Awarnings"]
 
     if flags:
         cmd.extend(flags)
@@ -580,10 +823,14 @@ def check_rust(
     return success, output + error
 
 
+@cache
+def rustc_version() -> tuple[int, int, int]:
+    ok, output, error, _ = run_subprocess(["rustc", "--version"])
+    if not ok or (match := re.match(r"rustc (\d+)\.(\d+)\.(\d+)", output)) is None:
+        raise RuntimeError(f"`rustc --version` failed!\n{output}{error}")
+    return int(match[1]), int(match[2]), int(match[3])
+
+
 def rustfmt(path: Path) -> None:
     cmd = ["rustfmt", str(path)]
     run_subprocess(cmd)
-
-
-MAX_DEPENDENT_CHARS = int(os.environ.get("MAX_DEPENDENT_CHARS", "20000"))
-REDUCED_CONTEXT = os.environ.get("REDUCED_CONTEXT", "1") not in ("0", "", "false", "False")

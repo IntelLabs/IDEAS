@@ -6,12 +6,20 @@
 
 BEAR_VERSION = 4.1.5## bear version to install
 CMAKE_VERSION = 4.1.2## Cmake version to install
-LLVM_VERSION = 21## LLVM version to install
-TRANSLATION_TOOLCHAIN = 1.88.0## Rust toolchain to use for IDEAS translation
+LLVM_VERSION = 23## LLVM version to install
+TRANSLATION_TOOLCHAIN = 1.99.0## Rust toolchain to use for IDEAS translation
 RUNNER_TOOLCHAIN = 1.94.1## Rust toolchain for building cando runners
-CODEX_RELEASE = 0.148.0## Codex version to install
-UV_VERSION = 0.11.13## uv version to install
+CANDO2_GIT = https://github.com/mariusarvinte/PUBLIC-Test-Corpus## cando2 fork (keep in sync with runner manifests)
+CANDO2_REV = bf3f39e49e5eca8409934f1a874ab6c099a4ecda## cando2 commit (keep in sync with runner manifests)
+RAPX_TOOLCHAIN = nightly-2026-09-18## Rust toolchain rapx links its rustc internals against
+RAPX_VERSION = 0.7.50## rapx version to install
+CODEX_RELEASE = 0.156.1## Codex version to install
+UV_VERSION = 0.13.5## uv version to install
 export RUNNER_TOOLCHAIN # Generated tests read it from the environment
+
+# rustup only patches future login shells, so recipes that follow the installer must be told where it landed
+CARGO_BIN := $(or ${CARGO_HOME},${HOME}/.cargo)/bin
+install-rust install-bear: export PATH := ${CARGO_BIN}:${PATH}
 
 .PHONY: install
 install:## Install all dependencies
@@ -46,13 +54,18 @@ install-rust:## Install Rust toolchains and CLI tools
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain ${TRANSLATION_TOOLCHAIN} -y
 	rustup default ${TRANSLATION_TOOLCHAIN}
 	rustup toolchain install ${RUNNER_TOOLCHAIN}
+	rustup toolchain install ${RAPX_TOOLCHAIN} --profile minimal --component rustc-dev,rust-src,llvm-tools-preview
 	rustup component add rustfmt
+	rustup component add clippy
 	rustup component add llvm-tools-preview --toolchain ${TRANSLATION_TOOLCHAIN}-x86_64-unknown-linux-gnu
 	cargo install bindgen-cli --version 0.72.1
 	cargo install cargo-llvm-cov --version 0.8.6
 	cargo install cargo-nextest --version 0.9.114 --locked
 	cargo install cargo-insta --version 1.48.0 --locked
 	cargo install ast-grep --version 0.45.0 --locked
+	cargo install cargo-geiger --version 0.13.0 --locked
+	cargo +${RAPX_TOOLCHAIN} install rapx --version ${RAPX_VERSION} --locked
+	cargo +${RUNNER_TOOLCHAIN} install cando2 --git ${CANDO2_GIT} --rev ${CANDO2_REV} --bin cando_binrunner --locked
 
 .PHONY: install-sys-deps
 install-sys-deps:## Install miscellaneous dependencies

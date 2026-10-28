@@ -4,158 +4,185 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import json
 import logging
 from typing import Any
+from pathlib import Path
+from functools import cache
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from collections.abc import Iterator
-from dataclasses import dataclass
 
-import dspy
 from omegaconf import MISSING
-from litellm import cost_per_token
-from dspy.dsp.utils.settings import settings
-from dspy.utils.usage_tracker import track_usage
 
 from hydra.core.config_store import ConfigStore
 
+from .ast_rust import CodeRust
+
 logger = logging.getLogger(__name__)
 
-# Surface DSPy logging to Hydra and disable verbose to sys.stderr to avoid duplicates
-dspy_logger = logging.getLogger("dspy")
-dspy_logger.propagate = True
-dspy.disable_logging()
+# What an LM reports per call, keyed by model name, summed across calls by UsageTracker
+type LMUsage = dict[str, dict[str, Any]]
+
+PRICES_PATH = Path(__file__).with_name("model_prices.json")
+
+
+@cache
+def _model_prices() -> tuple[dict[str, dict[str, Any]], dict[str, str], frozenset[str]]:
+    models = json.loads(PRICES_PATH.read_bytes())
+    lowercase = {key.lower(): key for key in models}
+    providers = frozenset(info.get("litellm_provider") for info in models.values())
+    return models, lowercase, providers
+
+
+def model_info(model: str) -> dict[str, Any] | None:
+    models, lowercase, providers = _model_prices()
+
+    vendor, _, bare = model.partition("/")
+    provider, split = (vendor, bare) if bare and vendor in providers else (None, model)
+
+    for candidate in (model, split):
+        key = candidate if candidate in models else lowercase.get(candidate.lower())
+        if key is None:
+            continue
+        info = models[key]
+        entry_provider = info.get("litellm_provider")
+        # litellm reroutes AI21 and Cohere to `_chat` providers; leave them unpriced
+        if entry_provider in ("ai21", "cohere", "cohere_chat"):
+            return None
+        if provider is None or entry_provider in (None, provider):
+            return info
+    return None
 
 
 @dataclass
 class ModelConfig:
     name: str = MISSING
     reasoning_effort: str = MISSING
-    cache: bool = False
-    text_output: bool = True
-    revision: str | None = None
-    base_url: str | None = None
-    api_key: str | None = None
+    provider: str = MISSING
+    base_url: str = MISSING
+    env_key: str = MISSING
+    output_schema: bool | None = None
+
+    # `name` stays OpenRouter-shaped so `model_info` can price it, but a vendor's own API
+    # wants the bare id
+    @property
+    def api_name(self) -> str:
+        if self.provider == "openai":
+            return self.name.removeprefix("openai/")
+
+        if self.provider == "azure":
+            vendor, _ = self.name.split("/", 1)
+            if vendor != "openai":
+                raise ValueError(f"Unsupported vendor '{vendor}' for Azure deployment!")
+
+            # Strip vendor prefix from Azure model name
+            return self.name.removeprefix(f"{vendor}/")
+
+        return self.name
+
+    # Other models are likely to apply the schema on every step, which breaks Codex tool calls
+    @property
+    def enable_output_schema(self) -> bool:
+        if self.output_schema is not None:
+            return self.output_schema
+        return self.provider == "openai" or self.name.startswith("openai/")
 
 
-@dataclass
-class GenerateConfig:
-    max_new_tokens: int = 128000
-    temperature: float = 0.0
-    top_p: float = 1.0
-    top_k: int | None = None
-    timeout: int | None = 600
-
+_PROVIDERS = (
+    ModelConfig(
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        env_key="OPENROUTER_API_KEY",
+    ),
+    ModelConfig(
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        env_key="OPENAI_API_KEY",
+    ),
+    ModelConfig(
+        provider="vllm",
+        base_url=MISSING,
+        env_key="VLLM_API_KEY",
+    ),
+    ModelConfig(
+        provider="azure",
+        base_url=MISSING,
+        env_key="AZURE_OPENAI_API_KEY",
+    ),
+)
 
 cs = ConfigStore.instance()
 cs.store(name="model", node=ModelConfig)
-cs.store(name="generate", node=GenerateConfig)
+for _preset in _PROVIDERS:
+    cs.store(group="model", name=_preset.provider, node=_preset)
 
 
-class CostTrackingLM(dspy.LM):
-    _warned_missing_cost = False
-
-    # DSPy records only token counts in the usage tracker and discards litellm's per-call
-    # cost into `lm.history`. Re-injecting it lets costs be summed instead of recomputed
-    # from aggregated tokens, which would misapply long-context (>200k) pricing tiers.
-    def forward(self, prompt=None, messages=None, **kwargs):
-        results = super().forward(prompt=prompt, messages=messages, **kwargs)
-
-        tracker = dspy.settings.usage_tracker
-        if tracker is None or getattr(results, "cache_hit", False):
-            return results
-
-        cost = getattr(results, "_hidden_params", {}).get("response_cost")
-        if cost is not None:
-            # Merges into the token entry recorded by super().forward()
-            tracker.add_usage(self.model, {"cost": cost})
-        else:
-            # Counted so mixed priced/unpriced totals can be flagged as underestimates
-            tracker.add_usage(self.model, {"cost_missing": 1})
-            if not CostTrackingLM._warned_missing_cost:
-                CostTrackingLM._warned_missing_cost = True
-                logger.warning(
-                    f"litellm reported no cost for `{self.model}`; reported spend is an underestimate"
-                )
-
-        return results
+# One turn of code generation, whether the model produced it or a cache hit replayed it
+@dataclass(kw_only=True)
+class Generation:
+    # None when the turn came back without the code it was asked for
+    code: CodeRust | None = None
+    reasoning: str = ""
+    usage: LMUsage = field(default_factory=dict)
+    was_generated: bool = False
+    prompt_files: dict[str, str] = field(default_factory=dict)
 
 
-def get_lm(model: ModelConfig, generate: GenerateConfig) -> dspy.LM:
-    lm = CostTrackingLM(
-        model=model.name,
-        cache=model.cache,
-        api_key=model.api_key,
-        api_base=model.base_url,
-        temperature=generate.temperature,
-        max_tokens=generate.max_new_tokens,
-        timeout=generate.timeout,
-    )
-
-    # Add OpenRouter-specific provider routing: https://openrouter.ai/docs/features/provider-routing
-    if model.name.startswith("openrouter/"):
-        provider: dict[str, Any] = {}
-
-        # Deny data collection
-        provider["data_collection"] = "deny"
-        if "openai" in model.name:
-            provider["order"] = ["openai", "azure"]
-        if "anthropic" in model.name:
-            provider["order"] = ["anthropic", "anthropic/2", "google-vertex/us-east5", "azure"]
-
-        lm.kwargs["provider"] = provider  # type: ignore[reportArgumentType]
-
-        # Mask and/or disable reasoning if desired and possible
-        if model.text_output:
-            lm.kwargs["reasoning"] = {"exclude": True}  # type: ignore[reportArgumentType]
-
-    if model.name.startswith("openai/"):
-        lm.model_type = "responses"
-
-    # NOTE: Covers exotic variants like gpt-5.5-pro
-    if model.name.startswith(("openai/gpt-5.5", "openai/gpt-5.6")):
-        lm.kwargs["temperature"] = 1.0
-        # Choices: "none", "low", "medium" (default), "high", "xhigh", "max"
-        lm.kwargs["reasoning_effort"] = "high"  # type: ignore[reportArgumentType]
-
-    if model.name.startswith("hosted_vllm/zai-org/GLM"):
-        # Choices: enable_thinking: False, "high", "max" (default)
-        lm.kwargs["extra_body"] = {  # type: ignore[reportArgumentType]
-            "chat_template_kwargs": {"reasoning_effort": "high"},
-        }
-
-    return lm
+# A response a fresh attempt might still survive, as opposed to a failure of the run
+class GenerationParseError(Exception):
+    pass
 
 
-def configure(model: ModelConfig, generate: GenerateConfig):
-    lm = get_lm(model, generate)
-    dspy.configure(lm=lm, track_usage=True)
+# Every counter a turn reports is a flat token count or cost, so summing keys is enough
+class UsageTracker:
+    def __init__(self) -> None:
+        self.totals: LMUsage = {}
+
+    def add(self, model_name: str, usage: dict[str, Any]) -> None:
+        per_lm = self.totals.setdefault(model_name, {})
+        for key, value in usage.items():
+            if isinstance(value, (int, float)):
+                per_lm[key] = per_lm.get(key, 0) + value
+
+
+_tracker: ContextVar[UsageTracker | None] = ContextVar("ideas_usage_tracker", default=None)
+
+
+# The tracker every generator in this context reports into, if anyone installed one
+def current_tracker() -> UsageTracker | None:
+    return _tracker.get()
 
 
 @contextmanager
-def track_lm_usage() -> Iterator[dict[str, dict[str, Any]]]:
-    # A nested tracker hides the enclosing one from dspy, so this block's usage has to be
-    # folded back into the parent by hand. The yielded dict is filled on exit.
-    parent = settings.usage_tracker
-    if parent is None:
-        yield {}
-        return
+def track_usage() -> Iterator[UsageTracker]:
+    tracker = UsageTracker()
+    token = _tracker.set(tracker)
+    try:
+        yield tracker
+    finally:
+        _tracker.reset(token)
 
-    total: dict[str, dict[str, Any]] = {}
+
+@contextmanager
+def track_lm_usage() -> Iterator[LMUsage]:
+    # A nested tracker shadows the enclosing one, so this block's usage has to be folded
+    # back into the parent by hand. The yielded dict is filled on exit.
+    parent = current_tracker()
+
+    total: LMUsage = {}
     with track_usage() as tracker:
         try:
             yield total
         finally:
-            total.update(tracker.get_total_tokens())
-            for lm_name, usage_entry in total.items():
-                parent.add_usage(lm_name, usage_entry)
+            total.update(tracker.totals)
+            if parent is not None:
+                for lm_name, usage_entry in total.items():
+                    parent.add(lm_name, usage_entry)
 
 
-def format_usage(pred: dspy.Prediction) -> str:
-    return format_lm_usage(pred.get_lm_usage())
-
-
-def format_lm_usage(lm_usage: dict[str, dict[str, Any]] | None) -> str:
-    # lm_usage maps lm_name to that LM's totals — aggregate across all of them
+def format_usage(lm_usage: LMUsage | None) -> str:
     if lm_usage is None:
         return "unknown usage"
 
@@ -169,91 +196,17 @@ def format_lm_usage(lm_usage: dict[str, dict[str, Any]] | None) -> str:
     completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
     total_tokens = usage.get("total_tokens") or (prompt_tokens + completion_tokens)
 
-    # Costs summed per LM call by CostTrackingLM; a genuine $0.00 must not fall back
+    # Costs summed per Codex turn in codex.py; a genuine $0.00 must not be dropped
     cost_usd = None
     for key in ("cost", "cost_usd", "total_cost"):
         if usage.get(key) is not None:
             cost_usd = usage[key]
             break
-    summed = cost_usd is not None
-
-    # Fallback for models litellm cannot price per call; approximate, tiers may be wrong
-    if cost_usd is None and lm_usage:
-        cost_usd = 0.0
-        for model_name, per_lm in lm_usage.items():
-            pt = per_lm.get("prompt_tokens") or per_lm.get("input_tokens") or 0
-            ct = per_lm.get("completion_tokens") or per_lm.get("output_tokens") or 0
-            try:
-                pc, cc = cost_per_token(model_name, prompt_tokens=pt, completion_tokens=ct)
-            except Exception:
-                pc, cc = 0.0, 0.0
-            cost_usd += pc + cc
 
     cost = f"${cost_usd:.6f}, " if cost_usd is not None else ""
 
     # A summed cost silently undercounts when only some calls were priced
     unpriced = usage.get("cost_missing") or 0
-    missing = f" ({unpriced:,} calls unpriced)" if summed and unpriced else ""
+    missing = f" ({unpriced:,} calls unpriced)" if unpriced else ""
 
     return f"{cost}{total_tokens:,} tok ({prompt_tokens:,} in / {completion_tokens:,} out){missing}"
-
-
-def render_prompt(
-    module: dspy.Module, inputs: dict[str, Any], was_generated: bool = True
-) -> dict[str, str]:
-    # Re-rendering assumes `inputs` is verbatim what the predictor received. Other modules,
-    # like ReAct and ProgramOfThought, reshape them or send several prompts per forward.
-    if not isinstance(module, (dspy.Predict, dspy.ChainOfThought)):
-        logger.warning(f"Unable to record prompt for {type(module).__name__} module")
-        return {}
-
-    # ChainOfThought extends the signature, so its inner Predict holds the original signature
-    signature = module.predictors()[0].signature
-    assert isinstance(signature, type)
-
-    adapter = settings.adapter or dspy.ChatAdapter()
-    files = {"_system.md": adapter.format_system_message(signature)}
-    if not was_generated:
-        files["_cached.md"] = (
-            "THIS PROMPT WAS NOT SENT: A CACHED OR STATIC RESULT WAS USED INSTEAD.\n"
-        )
-    for name, input_field in signature.input_fields.items():
-        # Only dspy.Code subclasses carry a `language`; anything else renders as .md
-        match getattr(input_field.annotation, "language", None):
-            case "c":
-                ext = ".c"
-            case "rust":
-                ext = ".rs"
-            case _:
-                ext = ".md"
-        files[f"{name}{ext}"] = str(inputs[name])
-
-    # A NUL would make git treat the file as binary and suppress the diff
-    return {name: text.replace("\x00", "\\0") for name, text in files.items()}
-
-
-def predict(
-    module: dspy.Module,
-    inputs: dict[str, Any],
-    output_field: str,
-    replay: Any | None = None,
-) -> dspy.Prediction:
-    parent_usage_tracker = settings.usage_tracker
-    if replay is not None:
-        pred = dspy.Prediction(**{output_field: replay})
-        if parent_usage_tracker is not None:
-            pred.set_lm_usage({})
-    elif parent_usage_tracker is None:
-        pred = module(**inputs)
-    else:
-        # dspy installs a tracker only at the outermost module, so this call's own usage
-        # has to be measured locally before being folded back into the enclosing total
-        with track_usage() as local_usage_tracker:
-            pred = module(**inputs)
-        lm_usage = local_usage_tracker.get_total_tokens()
-        pred.set_lm_usage(lm_usage)
-        for lm_name, usage_entry in lm_usage.items():
-            parent_usage_tracker.add_usage(lm_name, usage_entry)
-    pred.was_generated = replay is None
-    pred.prompt_files = render_prompt(module, inputs, pred.was_generated)
-    return pred

@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import copy
 import json
 import logging
 from typing import Literal, Protocol
@@ -53,6 +54,8 @@ class SymbolOracle(Protocol):
     @property
     def regressions(self) -> dict[str, SymbolGroup]: ...
 
+    def counts(self) -> str: ...
+
     def build(self) -> str: ...
 
     def baseline(self) -> None: ...
@@ -62,6 +65,8 @@ class SymbolOracle(Protocol):
     def judge(self, candidate: Candidate) -> Verdict: ...
 
     def blame(self, group: SymbolGroup, signals: set[str]) -> None: ...
+
+    def on(self, crate: Crate) -> "SymbolOracle": ...
 
 
 def _wrap_rejection(candidate: Candidate) -> Verdict:
@@ -84,6 +89,9 @@ class NullOracle:
     def regressions(self) -> dict[str, SymbolGroup]:
         return {}
 
+    def counts(self) -> str:
+        return ""
+
     def build(self) -> str:
         return ""
 
@@ -100,30 +108,51 @@ class NullOracle:
     def blame(self, group: SymbolGroup, signals: set[str]) -> None:
         pass
 
+    def on(self, crate: Crate) -> "NullOracle":
+        return self
+
+
+@dataclass
+class _Record:
+    baseline_failures: frozenset[str] = frozenset()
+    expected_tests: frozenset[str] = frozenset()
+    regressions: dict[str, SymbolGroup] = field(default_factory=dict)
+
 
 class TestOracle:
     def __init__(self, crate: Crate, tests: str, *, share_evidence: bool = False):
         self._crate = crate
         self._tests = tests
         self._share_evidence = share_evidence
-        self._baseline_failures: frozenset[str] = frozenset()
-        self._expected_tests: frozenset[str] = frozenset()
-        self._regressions: dict[str, SymbolGroup] = {}
+        self._record = _Record()
+
+    def on(self, crate: Crate) -> "TestOracle":
+        # Shares the baseline and blame, so verdicts on `crate` count against this oracle's tests
+        view = copy.copy(self)
+        view._crate = crate
+        return view
 
     def exercises(self, symbol: Symbol) -> bool:
         return True
 
     @property
     def baseline_failures(self) -> frozenset[str]:
-        return self._baseline_failures
+        return self._record.baseline_failures
 
     @property
     def expected_tests(self) -> frozenset[str]:
-        return self._expected_tests
+        return self._record.expected_tests
 
     @property
     def regressions(self) -> dict[str, SymbolGroup]:
-        return dict(self._regressions)
+        return dict(self._record.regressions)
+
+    def counts(self) -> str:
+        return (
+            f"regressed={len(self._record.regressions)} "
+            f"total={len(self._record.expected_tests)} "
+            f"baseline_failures={len(self._record.baseline_failures)}"
+        )
 
     def build(self) -> str:
         # cargo build skips test targets, which can fail to compile on their own
@@ -158,12 +187,12 @@ class TestOracle:
         return f"{action} fails!\n{error}", events
 
     def blame(self, group: SymbolGroup, signals: set[str]):
-        self._regressions.update(dict.fromkeys(signals, group))
+        self._record.regressions.update(dict.fromkeys(signals, group))
 
     def baseline(self):
-        self._baseline_failures = frozenset()
-        self._expected_tests = frozenset()
-        self._regressions = {}
+        self._record.baseline_failures = frozenset()
+        self._record.expected_tests = frozenset()
+        self._record.regressions.clear()
 
         logger.info(f"Verifying test `{self._tests}` against the untranslated crate ...")
 
@@ -180,7 +209,7 @@ class TestOracle:
         passing = {name for name, event in events.items() if event == "ok"}
         broken = {name for name, event in events.items() if event == "failed"}
         # A later run missing one of these was truncated, not green
-        self._expected_tests = frozenset(events)
+        self._record.expected_tests = frozenset(events)
         # An ignored test never ran, so it is no evidence that anything can judge a translation
         if not passing:
             raise UntrustedBaselineError(
@@ -195,12 +224,12 @@ class TestOracle:
                 f"{', '.join(sorted(broken))}"
             )
         logger.info(f"Verified {len(passing)}/{len(events)} of `{self._tests}` passed!")
-        self._baseline_failures = frozenset(broken)
+        self._record.baseline_failures = frozenset(broken)
 
     def audit(self) -> str:
-        error, events = self._run(self._tests, skip=sorted(self._baseline_failures))
+        error, events = self._run(self._tests, skip=sorted(self.baseline_failures))
         # A test the baseline ran but this run never mentioned did not pass, it disappeared
-        vanished = self._expected_tests - self._baseline_failures - set(events)
+        vanished = self.expected_tests - self.baseline_failures - set(events)
         if vanished:
             missing = ", ".join(sorted(vanished))
             return f"Test(s) did not run against the stranded crate: {missing}\n\n{error}"
@@ -214,15 +243,15 @@ class TestOracle:
         logger.info(f"Testing symbol `{symbol.name}` ...")
 
         # Skip only what the C already fails; an earlier regression still runs, just unblamed
-        error, events = self._run(self._tests, skip=sorted(self._baseline_failures))
+        error, events = self._run(self._tests, skip=sorted(self.baseline_failures))
 
         # The baseline and earlier symbol groups already own their failures
-        prior_failures = self._baseline_failures | set(self._regressions)
+        prior_failures = self.baseline_failures | set(self._record.regressions)
         # Only a test nobody else owns can say anything about this symbol
         judged = set(events) - prior_failures
         regressed = {n for n in judged if events[n] == "failed"}
         # A test the baseline ran but this run never mentioned did not pass, it disappeared
-        vanished = self._expected_tests - prior_failures - set(events)
+        vanished = self.expected_tests - prior_failures - set(events)
 
         if not events and error:  # cargo test failed
             regressed, vanished = set(), set()  # nothing ran, so blame no test
@@ -308,7 +337,7 @@ def _unwrappable_feedback(candidate: Candidate) -> str:
             "types that a C caller can convert for the duration of one call. Preserve ownership "
             "and aliases without requiring a borrow to outlive its owner, hiding required state "
             "inside a closure, or returning a reference whose backing owner is unavailable at "
-            "the boundary. If `{name}` belongs to a mutually recursive candidate, include and "
+            f"the boundary. If `{name}` belongs to a mutually recursive candidate, include and "
             "correct the whole required group rather than adding a differently named entry point. "
         )
 
@@ -338,8 +367,8 @@ def _diverged_feedback(symbol: Symbol) -> str:
         "pointee values; independent conditional reads stay lazy; live length is not capacity; "
         "and no idiomatic Rust layout is used as a C size. "
         "Also check null and sentinel states, pointer identity and shallow aliases, callback "
-        "reentrancy and post-callback rereads, configured allocator call order and failure, C "
-        "string termination, integer conversion and wrapping, every early return, and states "
+        "reentrancy and post-callback rereads, configured allocator call order and failure, "
+        "integer conversion and wrapping, every early return, and states "
         "the public C representation lets callers mutate. Do not assume inputs are normalized "
         "or well formed where C has defined behavior. "
         "If this audit shows the safe candidate is correct, return it unchanged and leave the "
@@ -353,25 +382,23 @@ def _diverged_feedback(symbol: Symbol) -> str:
 def _diverged_wrap_feedback(symbol: Symbol) -> str:
     name = symbol.spelling
     return (
-        f"The wrapper in `prior_wrapper` passed its local build and any wrapper-specific tests, "
+        "The wrapper in `prior_wrapper` passed its local build and any wrapper-specific tests, "
         f"but routing `{name}` through it changed the program's observable behavior. The oracle "
         "cannot distinguish a safe-operation defect from a boundary defect, so change the "
-        "wrapper only where a comparison with C and `wrapped_crate_code` demonstrates it is "
+        "wrapper only where a comparison with C and the Rust crate demonstrates it is "
         "wrong. Preserve exactly "
         "the top-level items and signatures in `example_wrapper`; for a function wrapper, edit "
         "only its existing body and keep any helper or callback context local to that body. "
-        f"Verify that every path on which C reaches the operation makes exactly one call to the "
-        f"exact safe `{name}` entry point and that the wrapper performs conversion and "
-        "synchronization only. Recheck "
-        "both directions for null and sentinel states, pointer identity and graph aliases, live "
-        "length versus capacity, initialized versus dead storage, integer conversions, C string "
-        "NUL termination, callback ABI and reentrant mutation, globals, and out-parameters. A "
-        "new or resized C buffer must contain all live Rust results before it is published, and "
-        "old storage must be released through the configured allocator only when C would do so. "
+        f"Verify that every path calls the exact safe `{name}` and that the wrapper performs "
+        "conversion and synchronization only. Recheck both directions for NULL, pointer "
+        "identity and aliases, every object reached from the values the call touched, "
+        "callback trampolines and what they re-read, the `sync_` calls for mutable globals, "
+        "and out-parameters. A new or resized C "
+        "buffer must contain all live Rust results before it is published, and old storage "
+        "must be released through the configured allocator only when C would do so. "
         f"Do not compensate for a suspect translation by reimplementing `{name}`'s logic, "
         "calling a renamed substitute, discarding a safe mutation, or stepping outside what "
-        "`example_wrapper` allows. If the exact safe symbol or a convertible representation is "
-        "missing, let wrapper generation fail so the translation can be regenerated."
+        "`example_wrapper` allows."
     )
 
 

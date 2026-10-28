@@ -11,7 +11,7 @@ import pytest
 from conftest import get_crate_name, build_ok, make_config
 
 from ideas.tools import Crate
-from ideas.translate import _init_crates
+from ideas.translate import TranslationWorkspace
 from ideas.agents.utils import write_instrumentation_script
 
 
@@ -73,9 +73,11 @@ def test_ported_test_builds_when_binding_matches_crate_name(instrumented_workspa
         "}\n"
     )
 
-    _init_crates(cfg)
-
-    assert build_ok(ws, "libdriver", "--test", "smoke")
+    TranslationWorkspace(cfg)
+    # -ffi keeps the tests it was given, as the hybrid does
+    assert (ws / "libdriver-ffi" / "tests" / "smoke.rs").exists()
+    assert build_ok(ws, "libdriver-ffi", "--test", "smoke")
+    assert build_ok(ws, "libdriver-hybrid", "--test", "smoke")
 
 
 # Referencing a C symbol makes the linker pull in the object defining `main`, which must

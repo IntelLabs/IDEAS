@@ -1,5 +1,3 @@
-use __LIB_NAME__::*;
-
 use assert_cmd::Command;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};

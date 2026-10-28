@@ -161,6 +161,30 @@ def test_audit_rejects_a_zero_exit_run_that_dropped_a_test() -> None:
     assert "did not run against the stranded crate: also" in oracle.audit()
 
 
+def test_a_view_on_another_crate_shares_the_baseline_and_blame() -> None:
+    # As in translation: baseline and verdicts on the hybrid, the audit on the shipped crate
+    oracle, shipped = _oracle()
+    shipped.cargo_test.side_effect = [(True, _libtest_json(works="ok"), "", 0)]
+    _, hybrid = _oracle(
+        (False, _libtest_json(works="ok", also="ok", broken="failed"), "", 101),
+        (False, _libtest_json(works="ok", also="failed"), "", 101),
+    )
+    view = oracle.on(hybrid)
+
+    view.baseline()
+    view.blame(("c:@F@bar",), view.judge(_candidate()).blamed)
+    findings = oracle.audit()
+
+    assert hybrid.cargo_test.call_count == 3  # build-only pre-pass, baseline, verdict
+    assert oracle.baseline_failures == {"broken"}
+    assert oracle.regressions == {"also": ("c:@F@bar",)}
+    # The audit ran on the shipped crate, skipping what failed in the hybrid's baseline
+    assert shipped.cargo_test.call_count == 1
+    assert shipped.cargo_test.call_args.kwargs["skip"] == ["broken"]
+    # Only the hybrid's baseline knew to expect `also`
+    assert "did not run against the stranded crate: also" in findings
+
+
 def test_new_failure_beside_a_baseline_failure_is_blamed() -> None:
     oracle, _ = _oracle(
         (False, _libtest_json(works="ok", fresh="ok", broken="failed"), "", 101),

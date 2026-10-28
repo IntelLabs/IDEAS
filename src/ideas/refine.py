@@ -4,16 +4,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import shutil
 import logging
 from abc import ABC, abstractmethod
 from typing import Self
 from dataclasses import dataclass, field, replace
 from collections.abc import Iterator, Sequence
 
-import dspy
-from dspy.utils.exceptions import AdapterParseError
-
-from .model import format_usage
+from .model import Generation, GenerationParseError, format_usage
+from .tools import Crate
 
 
 @dataclass(kw_only=True)
@@ -47,15 +46,16 @@ class Attempt:
 class Feedback:
     review: str = ""
     build: str = ""
+    lint: str = ""
     scope: str = ""
 
     def __bool__(self) -> bool:
-        return bool(self.review or self.build or self.scope)
+        return bool(self.review or self.build or self.lint or self.scope)
 
 
 @dataclass(kw_only=True)
-class CodeAttempt(Attempt, ABC):
-    pred: dspy.Prediction
+class GeneratedAttempt(Attempt, ABC):
+    gen: Generation
     prior_feedback: Feedback
     rejection: Feedback = field(default=Feedback(), init=False)
 
@@ -63,16 +63,28 @@ class CodeAttempt(Attempt, ABC):
     @abstractmethod
     def summary(self) -> str: ...
 
-    def reject(self, *, build: Sequence[str] = (), scope: Sequence[str] = ()) -> None:
-        if not build and not scope:
+    def reject(
+        self,
+        *,
+        build: Sequence[str] = (),
+        lint: Sequence[str] = (),
+        scope: Sequence[str] = (),
+    ) -> None:
+        if not build and not lint and not scope:
             raise ValueError("Attempt was rejected with no reason!")
         super().reject()
-        self.rejection = Feedback(build=_bullets(build), scope=_bullets(scope))
+        self.rejection = Feedback(
+            build=_bullets(build), lint=_bullets(lint), scope=_bullets(scope)
+        )
 
     # Both channels at once, for readers that do not care which one complained
     @property
     def reason(self) -> str:
-        return "\n".join(text for text in (self.rejection.build, self.rejection.scope) if text)
+        return "\n".join(
+            text
+            for text in (self.rejection.build, self.rejection.lint, self.rejection.scope)
+            if text
+        )
 
     # Only the session judges build and scope, so the review carries over untouched
     @property
@@ -82,21 +94,39 @@ class CodeAttempt(Attempt, ABC):
     @property
     def headline(self) -> str:
         counter = "" if self.success else f" ({self.index}/{self.total})"
-        return f"{self.summary}{counter}: {format_usage(self.pred)}"
+        return f"{self.summary}{counter}: {format_usage(self.gen.usage)}"
 
     # The headline alone is what gets logged; the sections below it are for the commit body
     @property
     def message(self) -> str:
         msg = self.headline
         for heading, text in (
-            ("Reasoning", self.pred.get("reasoning", "")),
+            ("Reasoning", self.gen.reasoning),
             ("Feedback", self.prior_feedback.review),
             ("Build Feedback", self.rejection.build),
+            ("Lint Feedback", self.rejection.lint),
             ("Scope Feedback", self.rejection.scope),
         ):
             if text:
                 msg += f"\n\n# {heading}\n{text}"
         return msg
+
+    def commit(self, crate: Crate):
+        # The attempt's own module is what names the stage being committed
+        log = logging.getLogger(type(self).__module__)
+        (log.info if self.success else log.error)(self.headline)
+
+        # Cleared unconditionally so the commit never carries the previous attempt's prompt
+        prompt_dir = crate.cargo_toml.parent / ".prompt"
+        crate.vcs.rm(prompt_dir, force=True)
+        shutil.rmtree(prompt_dir, ignore_errors=True)
+        if prompt_files := self.gen.prompt_files:
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+            for name, text in prompt_files.items():
+                (prompt_dir / name).write_text(text, encoding="utf-8")
+            crate.vcs.add(prompt_dir)
+
+        crate.vcs.commit(self.message)
 
 
 def _bullets(feedback: Sequence[str]) -> str:
@@ -133,7 +163,7 @@ class PredictSession[A: Attempt, R](ABC):
             try:
                 attempt = self._attempt(prior, replay)
             # A malformed response is a failure a fresh attempt might survive
-            except AdapterParseError:
+            except GenerationParseError:
                 # The caller's own log line names what is being generated
                 logging.getLogger(type(self).__module__).exception(
                     f"Generation failed on iteration {i + 1}/{max_iters}!"

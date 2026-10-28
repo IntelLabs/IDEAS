@@ -10,9 +10,10 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import hydra
-from omegaconf import MISSING
+from omegaconf import MISSING, OmegaConf
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 
@@ -48,25 +49,27 @@ def is_bin_test(test_case: Path):
 
 def add_deps_for_exec(crate: Crate) -> None:
     # Add test dependencies
-    crate.cargo_add(dep="assert_cmd@2.0.17", section="dev")
-    crate.cargo_add(dep="predicates@3.1.3", section="dev")
+    crate.cargo_add(dep="assert_cmd", section="dev")
+    crate.cargo_add(dep="predicates", section="dev")
     crate.invalidate_metadata()
 
 
 def add_deps_for_lib(crate: Crate) -> None:
     # The template parses `cargo build --message-format=json` to locate the candidate library
-    crate.cargo_add(dep="serde_json@1", section="dev")
+    crate.cargo_add(dep="serde_json", section="dev")
     crate.invalidate_metadata()
 
 
-def convert_tests_for_exec(test_cases: list[Path]) -> str:
+def convert_tests_for_exec(test_cases: list[Path], bin_names: list[str]) -> str:
     test_cases = list(filter(is_bin_test, test_cases))
     if len(test_cases) == 0:
         return ""
+    if len(bin_names) != 1:
+        raise ValueError(f"Exec tests need exactly one bin target, found {bin_names}")
+    bin_name = bin_names[0]
 
     output = ""
     output += "use assert_cmd::Command;\n"
-    output += "use predicates::prelude::*;\n"
     output += "\n"
 
     for test_case in test_cases:
@@ -113,11 +116,11 @@ def convert_tests_for_exec(test_cases: list[Path]) -> str:
 
         output += "#[test]\n"
         output += f"fn test_case_{test_case.stem}() {{\n"
-        output += "let pkg_name_path = assert_cmd::cargo::cargo_bin(assert_cmd::pkg_name!());\n"
+        output += f'let bin_path = env!("CARGO_BIN_EXE_{bin_name}");\n'
         output += '    Command::new("stdbuf")'
         output += '.arg("-e0")'
         output += '.arg("-o0")'
-        output += ".arg(pkg_name_path)"
+        output += ".arg(bin_path)"
         args = [to_rust_str(arg) for arg in args]
         if args:
             output += f".args([{', '.join(args)}])"
@@ -188,8 +191,10 @@ def _main(cfg: ConvertConfig) -> None:
     test_vectors = [Path(path).absolute() for path in cfg.test_vectors]
     cargo_toml = output_dir / "Cargo.toml"
     output_file = output_dir / cfg.output
+    crate = Crate(cargo_toml, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
 
-    exec_tests = convert_tests_for_exec(test_vectors)
+    bin_names = [t["name"] for t in crate.bin_targets]
+    exec_tests = convert_tests_for_exec(test_vectors, bin_names)
     lib_tests = convert_tests_for_lib(test_vectors, runner_manifest, cfg.template)
     # Write and format tests
     output_file.parent.mkdir(exist_ok=True)
@@ -197,7 +202,6 @@ def _main(cfg: ConvertConfig) -> None:
     rustfmt(output_file)
 
     # Add crate dependencies
-    crate = Crate(cargo_toml, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
     if exec_tests:
         add_deps_for_exec(crate)
     if lib_tests:
@@ -209,6 +213,7 @@ def _main(cfg: ConvertConfig) -> None:
     if (output_subdir := HydraConfig.get().output_subdir) is not None:
         crate.vcs.add(output_dir / output_subdir)
     crate.invalidate_metadata()
+    crate.workspace.stage()
     msg = "Converted JSON test vectors to Rust tests"
     logger.info(msg)
     crate.vcs.commit(msg)
@@ -217,7 +222,7 @@ def _main(cfg: ConvertConfig) -> None:
 @hydra.main(version_base=None, config_name="convert_tests")
 def main(cfg: ConvertConfig) -> None:
     try:
-        _main(cfg)
+        _main(cast(ConvertConfig, OmegaConf.to_object(cfg)))
     except Exception as e:
         logger.exception(e)
         sys.exit(1)
