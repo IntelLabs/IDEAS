@@ -13,17 +13,20 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 import pytest
-from conftest import CRATE, TEST_CRATES_DIR, field_value, get_crate_name, run_translate
-from dspy.utils.dummies import DummyLM
+from conftest import (
+    TEST_CRATES_DIR,
+    field_value,
+    get_crate_name,
+    get_hybrid_lib,
+    get_hybrid_name,
+    run_translate,
+)
 
-from ideas import adapters
+from ideas.hybrid import SAFE_CRATE
 from ideas.oracle import TestOracle
-from ideas.tools import Crate
-import ideas.translate as translate_mod
-from ideas.translate_recurrent import RecurrentTranslator
+from ideas.tools import Workspace
 
 TEMPLATE = "lib"
 ORDER = ("add", "scale", "square", "magnitude")
@@ -89,6 +92,10 @@ const CAPTURE_CHILD: &str = "TRACTOR_SMOKE_CAPTURE_CHILD";
 const CAPTURE_BEGIN: &str = "--- smoke stdout begin ---";
 const CAPTURE_END: &str = "--- smoke stdout end ---";
 
+fn expected(var: &str) -> String {
+    env::var(var).unwrap_or_else(|_| panic!("{var} not set"))
+}
+
 fn assert_stdout(test: &str, expected: &str, call: impl FnOnce()) {
     if env::var_os(CAPTURE_CHILD).is_some() {
         println!("{}", CAPTURE_BEGIN);
@@ -123,7 +130,7 @@ fn assert_stdout(test: &str, expected: &str, call: impl FnOnce()) {
 fn smoke_1_add() {
     assert_stdout(
         "smoke_1_add",
-        r#"__ADD_STDOUT__"#,
+        &expected("SMOKE_ADD_STDOUT"),
         || unsafe {
             assert_eq!(add(2, 3), 5);
         },
@@ -134,7 +141,7 @@ fn smoke_1_add() {
 fn smoke_2_scale() {
     assert_stdout(
         "smoke_2_scale",
-        r#"__SCALE_STDOUT__"#,
+        &expected("SMOKE_SCALE_STDOUT"),
         || unsafe {
             assert_eq!(scale(2, 3), 12);
         },
@@ -145,7 +152,7 @@ fn smoke_2_scale() {
 fn smoke_3_square() {
     assert_stdout(
         "smoke_3_square",
-        r#"__SQUARE_STDOUT__"#,
+        &expected("SMOKE_SQUARE_STDOUT"),
         || unsafe {
             assert_eq!(square(2), 8);
         },
@@ -156,7 +163,7 @@ fn smoke_3_square() {
 fn smoke_4_magnitude() {
     assert_stdout(
         "smoke_4_magnitude",
-        r#"__MAGNITUDE_STDOUT__"#,
+        &expected("SMOKE_MAGNITUDE_STDOUT"),
         || unsafe {
             assert_eq!(magnitude(2), 9);
         },
@@ -165,26 +172,23 @@ fn smoke_4_magnitude() {
 """
 
 
+# The calls each smoke test makes, in the order they print
+_EXPECTED_CALLS = {
+    "SMOKE_ADD_STDOUT": ("add",),
+    "SMOKE_SCALE_STDOUT": ("scale", "add"),
+    "SMOKE_SQUARE_STDOUT": ("square", "scale", "add"),
+    "SMOKE_MAGNITUDE_STDOUT": ("magnitude", "square", "scale", "add", "add"),
+}
+
+
 def _expected_stdout(wrapped: tuple[str, ...], *calls: str) -> str:
     return "\n".join(
         f"hello from {'Rust' if name in wrapped else 'C'} {name}" for name in calls
     )
 
 
-def _smoke_test(wrapped: tuple[str, ...]) -> str:
-    return (
-        _TEST_RS_TEMPLATE.replace("__ADD_STDOUT__", _expected_stdout(wrapped, "add"))
-        .replace("__SCALE_STDOUT__", _expected_stdout(wrapped, "scale", "add"))
-        .replace(
-            "__SQUARE_STDOUT__",
-            _expected_stdout(wrapped, "square", "scale", "add"),
-        )
-        .replace(
-            "__MAGNITUDE_STDOUT__",
-            _expected_stdout(wrapped, "magnitude", "square", "scale", "add", "add"),
-        )
-        .replace("__SYS_CRATE__", f"{get_crate_name(TEMPLATE)}_sys")
-    )
+def _smoke_test() -> str:
+    return _TEST_RS_TEMPLATE.replace("__SYS_CRATE__", f"{get_crate_name(TEMPLATE)}_sys")
 
 
 _TRANSLATIONS = {
@@ -215,34 +219,11 @@ pub fn magnitude(v: i32) -> i32 {
 """,
 }
 
-_WRAPPERS = {
-    "add": """\
-#[unsafe(export_name = "add")]
-pub extern "C" fn add(a: ::std::os::raw::c_int, b: ::std::os::raw::c_int) -> ::std::os::raw::c_int {
-    __RS_CRATE__::add(a, b)
-}
-""",
-    "scale": """\
-#[unsafe(export_name = "scale")]
-pub extern "C" fn scale(
-    v: ::std::os::raw::c_int,
-    k: ::std::os::raw::c_int,
-) -> ::std::os::raw::c_int {
-    __RS_CRATE__::scale(v, k)
-}
-""",
-    "square": """\
-#[unsafe(export_name = "square")]
-pub extern "C" fn square(v: ::std::os::raw::c_int) -> ::std::os::raw::c_int {
-    __RS_CRATE__::square(v)
-}
-""",
-    "magnitude": """\
-#[unsafe(export_name = "magnitude")]
-pub extern "C" fn magnitude(v: ::std::os::raw::c_int) -> ::std::os::raw::c_int {
-    __RS_CRATE__::magnitude(v)
-}
-""",
+_WRAPPER_BODIES = {
+    "add": "add(a, b)",
+    "scale": "scale(v, k)",
+    "square": "square(v)",
+    "magnitude": "magnitude(v)",
 }
 
 _EXPORT_NAME = re.compile(r'export_name = "(?P<name>\w+)"')
@@ -257,21 +238,18 @@ def _translation_for(snippet: str) -> str:
 def _wrapper_for(template: str) -> str:
     match = _EXPORT_NAME.search(template)
     assert match is not None, f"unrecognized wrapper template:\n{template}"
-    return f"```rust\n{_WRAPPERS[match['name']].replace('__RS_CRATE__', f'{get_crate_name(TEMPLATE)}_rs')}```"
+    # Filling in the template keeps its signature and attributes exactly as validated
+    body = f"{SAFE_CRATE}::{_WRAPPER_BODIES[match['name']]}"
+    return f"```rust\n{template.replace('unimplemented!()', body)}\n```"
 
 
-class _ScriptedLM(DummyLM):
-    def __init__(self):
-        super().__init__({}, adapter=adapters.ChatAdapter())
-
-    def __call__(self, prompt=None, messages=None, **kwargs):
-        content = messages[-1]["content"] if messages else (prompt or "")
-        if template := field_value(content, "example_wrapper").strip():
-            answer = {"wrapper": _wrapper_for(template)}
-        else:
-            answer = {"translation": _translation_for(field_value(content, "snippet"))}
-        self.answers = {"": answer}
-        return super().__call__(prompt=prompt, messages=messages, **kwargs)
+def _respond(prompt: str) -> dict[str, str]:
+    if template := field_value(prompt, "example_wrapper").strip():
+        return {"reasoning": "trivial wrapper", "output": _wrapper_for(template)}
+    return {
+        "reasoning": "trivial translation",
+        "output": _translation_for(field_value(prompt, "snippet")),
+    }
 
 
 @dataclass(frozen=True)
@@ -309,7 +287,7 @@ def _link_command(workspace: Path) -> list[str]:
         "--manifest-path",
         str(workspace / "Cargo.toml"),
         "-p",
-        get_crate_name(TEMPLATE),
+        get_hybrid_name(TEMPLATE),
         "--lib",
         "--crate-type",
         "cdylib",
@@ -336,11 +314,13 @@ def _inspect(
     target = workspace / "target" / "debug"
     print(f"wrappers {list(wrapped)}: {shlex.join(_link_command(workspace))}")
     link = _strict_link(workspace)
-    cdylib = target / f"lib{CRATE}.so"
+    cdylib = target / f"lib{get_hybrid_lib(TEMPLATE)}.so"
     return _Step(
         wrapped=wrapped,
         c_archive=_nm(_c_archive(workspace), "--defined-only", "--extern-only"),
-        rust_wrappers=_nm(target / f"lib{CRATE}.rlib", "--defined-only", "--extern-only"),
+        rust_wrappers=_nm(
+            target / f"lib{get_hybrid_lib(TEMPLATE)}.rlib", "--defined-only", "--extern-only"
+        ),
         linked=_nm(cdylib, "--defined-only", "--extern-only"),
         undefined=_nm(cdylib, "--undefined-only"),
         test_events=tuple(sorted(test_events.items())),
@@ -349,32 +329,24 @@ def _inspect(
     )
 
 
-def _record_steps(monkeypatch, workspace: Path, source_test: Path, test: Path) -> list[_Step]:
+def _record_steps(monkeypatch, workspace: Path, hybrid_dir: Path) -> list[_Step]:
     steps: list[_Step] = []
+    oracle_run = TestOracle._run
 
-    class _Recorder(RecurrentTranslator):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            # The oracle only ever runs the smoke test, so every call is worth recording
-            oracle = cast(TestOracle, self._oracle)
-            oracle_run = oracle._run
+    # The oracle only ever runs the smoke test, so every run against the hybrid is worth recording
+    def _run(self: TestOracle, name, *, skip=None, build_only=False):
+        if self._crate.cargo_toml.parent != hybrid_dir:
+            return oracle_run(self, name, skip=skip, build_only=build_only)
+        lib_rs = (hybrid_dir / "src" / "lib.rs").read_text()
+        wrapped = tuple(m["name"] for m in _EXPORT_NAME.finditer(lib_rs))
+        for var, calls in _EXPECTED_CALLS.items():
+            monkeypatch.setenv(var, _expected_stdout(wrapped, *calls))
+        result = oracle_run(self, name, skip=skip, build_only=build_only)
+        if not build_only:
+            steps.append(_inspect(workspace, wrapped, *result))
+        return result
 
-            def _run(name, *, skip=None, build_only=False):
-                wrapped = tuple(symbol.split("@")[-1] for symbol in self._hybrid.wrappers)
-                source = _smoke_test(wrapped)
-                if source_test.read_text() != source:
-                    source_test.write_text(source)
-                translate_mod.copy_and_port_tests(
-                    source_test, test, f"{get_crate_name(TEMPLATE)}_sys", "driver"
-                )
-                result = oracle_run(name, skip=skip, build_only=build_only)
-                if not build_only:
-                    steps.append(_inspect(workspace, wrapped, *result))
-                return result
-
-            oracle._run = _run  # type: ignore[method-assign]
-
-    monkeypatch.setattr(translate_mod, "RecurrentTranslator", _Recorder)
+    monkeypatch.setattr(TestOracle, "_run", _run)
     return steps
 
 
@@ -388,8 +360,7 @@ def chain_translation(instrumented_workspace, monkeypatch, request):
     source_test = (
         workspace.parent / TEST_CRATES_DIR / get_crate_name(TEMPLATE) / "tests" / f"{TESTS}.rs"
     )
-    test = workspace / get_crate_name(TEMPLATE) / "tests" / f"{TESTS}.rs"
-    source_test.write_text(_smoke_test(()))
+    source_test.write_text(_smoke_test())
 
     # Hold the pipeline's own builds to the same standard as the relink below
     monkeypatch.setenv("CARGO_NET_OFFLINE", "true")
@@ -398,18 +369,16 @@ def chain_translation(instrumented_workspace, monkeypatch, request):
 
     # The pipeline cleans the workspace when it finishes, but these tests inspect the artifacts
     # it leaves behind
-    monkeypatch.setattr(Crate, "cargo_clean", lambda self, workspace=False: None)
+    monkeypatch.setattr(Workspace, "clean", lambda self: None)
 
     # Snapshot at every step using a wrapped pipeline
-    steps = _record_steps(monkeypatch, workspace, source_test, test)
+    steps = _record_steps(monkeypatch, workspace, workspace / get_hybrid_name(TEMPLATE))
     run_translate(
         monkeypatch,
         workspace,
         TEMPLATE,
-        _ScriptedLM(),
+        _respond,
         tests=source_test,
-        translator="Predict",
-        wrapper="Predict",
         wrapper_max_iters=1,
     )
     return workspace, steps
@@ -418,90 +387,65 @@ def chain_translation(instrumented_workspace, monkeypatch, request):
 def test_symbol_ownership_moves_from_c_to_rust(chain_translation):
     _, steps = chain_translation
 
-    assert steps[0].wrapped == ()
-    assert steps[0].c_archive == ("add", "magnitude", "scale", "square")
-    assert steps[0].rust_wrappers == ()
-    assert steps[0].linked == ()
-    assert steps[0].undefined == ()
-    # Empty link log means no errors
-    assert steps[0].link_log == ""
+    # The baseline and the audit after importing types and variables see the C-only hybrid
+    for step in steps[:2]:
+        assert step.wrapped == ()
+        assert step.c_archive == ("add", "magnitude", "scale", "square")
+        assert step.rust_wrappers == ()
+        assert step.linked == ()
+        assert step.undefined == ()
+        # Empty link log means no errors
+        assert step.link_log == ""
 
-    assert steps[1].wrapped == ("add",)
-    assert steps[1].c_archive == ("magnitude", "scale", "square")
-    assert steps[1].rust_wrappers == ("add",)
-    assert steps[1].linked == ("add",)
-    assert steps[1].undefined == ()
-    assert steps[1].link_log == ""
-
-    assert steps[2].wrapped == ("add", "scale")
-    assert steps[2].c_archive == ("magnitude", "square")
-    assert steps[2].rust_wrappers == ("add", "scale")
-    assert steps[2].linked == ("add", "scale")
+    assert steps[2].wrapped == ("add",)
+    assert steps[2].c_archive == ("magnitude", "scale", "square")
+    assert steps[2].rust_wrappers == ("add",)
+    assert steps[2].linked == ("add",)
     assert steps[2].undefined == ()
     assert steps[2].link_log == ""
 
-    assert steps[3].wrapped == ("add", "scale", "square")
-    assert steps[3].c_archive == ("magnitude",)
-    assert steps[3].rust_wrappers == ("add", "scale", "square")
-    assert steps[3].linked == ("add", "scale", "square")
+    assert steps[3].wrapped == ("add", "scale")
+    assert steps[3].c_archive == ("magnitude", "square")
+    assert steps[3].rust_wrappers == ("add", "scale")
+    assert steps[3].linked == ("add", "scale")
     assert steps[3].undefined == ()
     assert steps[3].link_log == ""
 
-    assert steps[4].wrapped == ("add", "scale", "square", "magnitude")
-    assert steps[4].c_archive == ()
-    assert steps[4].rust_wrappers == ("add", "magnitude", "scale", "square")
-    assert steps[4].linked == ("add", "magnitude", "scale", "square")
+    assert steps[4].wrapped == ("add", "scale", "square")
+    assert steps[4].c_archive == ("magnitude",)
+    assert steps[4].rust_wrappers == ("add", "scale", "square")
+    assert steps[4].linked == ("add", "scale", "square")
     assert steps[4].undefined == ()
     assert steps[4].link_log == ""
+
+    assert steps[5].wrapped == ("add", "scale", "square", "magnitude")
+    assert steps[5].c_archive == ()
+    assert steps[5].rust_wrappers == ("add", "magnitude", "scale", "square")
+    assert steps[5].linked == ("add", "magnitude", "scale", "square")
+    assert steps[5].undefined == ()
+    assert steps[5].link_log == ""
 
 
 def test_all_smoke_tests_pass_at_every_hybrid_state(chain_translation):
     _, steps = chain_translation
 
-    assert steps[0].wrapped == ()
-    assert steps[0].test_feedback == ""
-    assert steps[0].test_events == (
-        ("smoke_1_add", "ok"),
-        ("smoke_2_scale", "ok"),
-        ("smoke_3_square", "ok"),
-        ("smoke_4_magnitude", "ok"),
-    )
-
-    assert steps[1].wrapped == ("add",)
-    assert steps[1].test_feedback == ""
-    assert steps[1].test_events == (
-        ("smoke_1_add", "ok"),
-        ("smoke_2_scale", "ok"),
-        ("smoke_3_square", "ok"),
-        ("smoke_4_magnitude", "ok"),
-    )
-
-    assert steps[2].wrapped == ("add", "scale")
-    assert steps[2].test_feedback == ""
-    assert steps[2].test_events == (
-        ("smoke_1_add", "ok"),
-        ("smoke_2_scale", "ok"),
-        ("smoke_3_square", "ok"),
-        ("smoke_4_magnitude", "ok"),
-    )
-
-    assert steps[3].wrapped == ("add", "scale", "square")
-    assert steps[3].test_feedback == ""
-    assert steps[3].test_events == (
-        ("smoke_1_add", "ok"),
-        ("smoke_2_scale", "ok"),
-        ("smoke_3_square", "ok"),
-        ("smoke_4_magnitude", "ok"),
-    )
-
-    assert steps[4].wrapped == ("add", "scale", "square", "magnitude")
-    assert steps[4].test_feedback == ""
-    assert steps[4].test_events == (
-        ("smoke_1_add", "ok"),
-        ("smoke_2_scale", "ok"),
-        ("smoke_3_square", "ok"),
-        ("smoke_4_magnitude", "ok"),
-    )
+    expected_wrapped = [
+        (),
+        (),
+        ("add",),
+        ("add", "scale"),
+        ("add", "scale", "square"),
+        ("add", "scale", "square", "magnitude"),
+    ]
+    assert [step.wrapped for step in steps[:6]] == expected_wrapped
+    for step in steps[:6]:
+        assert step.test_feedback == ""
+        assert step.test_events == (
+            ("smoke_1_add", "ok"),
+            ("smoke_2_scale", "ok"),
+            ("smoke_3_square", "ok"),
+            ("smoke_4_magnitude", "ok"),
+        )
 
 
 def test_duplicate_definition_collides_and_is_fatal(chain_translation):
@@ -520,12 +464,17 @@ def test_duplicate_definition_collides_and_is_fatal(chain_translation):
 
     c_defines = _nm(_c_archive(workspace), "--defined-only", "--extern-only")
     rust_defines = _nm(
-        workspace / "target" / "debug" / f"lib{CRATE}.rlib", "--defined-only", "--extern-only"
+        workspace / "target" / "debug" / f"lib{get_hybrid_lib(TEMPLATE)}.rlib",
+        "--defined-only",
+        "--extern-only",
     )
     assert c_defines == ("add",)
     assert rust_defines == ("add", "magnitude", "scale", "square")
     assert link.returncode != 0, link.stdout + link.stderr
-    assert "multiple definition of `add'" in link.stderr, link.stderr
+    # GNU ld (rustc < 1.90) or rust-lld wording
+    assert re.search(r"multiple definition of `add'|duplicate symbol: add\b", link.stderr), (
+        link.stderr
+    )
 
 
 def test_undefined_reference_is_visible_and_fatal(chain_translation):
@@ -544,4 +493,7 @@ def test_undefined_reference_is_visible_and_fatal(chain_translation):
 
     assert _nm(_c_archive(workspace), "--undefined-only", names=None) == ("missing",)
     assert link.returncode != 0, link.stdout + link.stderr
-    assert "undefined reference to `missing'" in link.stderr, link.stderr
+    # GNU ld (rustc < 1.90) or rust-lld wording
+    assert re.search(
+        r"undefined reference to `missing'|undefined symbol: missing\b", link.stderr
+    ), link.stderr

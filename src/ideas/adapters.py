@@ -4,40 +4,41 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-from typing import Any
+import re
+from typing import ClassVar, Self
+from dataclasses import dataclass
 from collections.abc import Iterable
 
-import dspy
-import json_repair
-import dspy.adapters.chat_adapter
-
-from unittest.mock import patch
-from pydantic import ConfigDict, field_validator
-from pydantic.fields import FieldInfo
-from json_repair import loads as _json_repair_loads
-from dspy.adapters.chat_adapter import ChatAdapter as _ChatAdapter
-from dspy.adapters.utils import translate_field_type as _translate_field_type
-from dspy.signatures.utils import get_dspy_field_type
-from dspy.signatures.signature import Signature
+# A model asked for code answers with it fenced as often as not, with or without a language
+_FENCED = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+_FENCED_INLINE = re.compile(r"```(.*?)```", re.DOTALL)
 
 
-class Code(dspy.Code):
-    model_config = ConfigDict(frozen=True)
+def _unfence(code: str) -> str:
+    for pattern in (_FENCED, _FENCED_INLINE):
+        if match := pattern.search(code):
+            return match.group(1).strip()
+    return code
 
-    @field_validator("code", mode="before")
-    @classmethod
-    def _normalize_code(cls, v: str) -> str:
-        stripped = v.rstrip()
-        return stripped + "\n" if stripped else ""
 
-    def __init__(self, code: str = "", **kwargs):
-        kwargs["code"] = code
-        super().__init__(**kwargs)
+# `eq=False` keeps the comparisons below, which hold between any two Code of one language
+@dataclass(frozen=True, eq=False)
+class Code:
+    code: str = ""
+
+    language: ClassVar[str] = ""
+
+    def __post_init__(self):
+        stripped = _unfence(self.code).rstrip()
+        object.__setattr__(self, "code", stripped + "\n" if stripped else "")
 
     def __str__(self):
         return self.code
 
-    def __add__(self, other):
+    def __bool__(self):
+        return bool(self.code)
+
+    def __add__(self, other: Self) -> Self:
         if not isinstance(other, Code):
             return NotImplemented
         if self.language != other.language:
@@ -49,7 +50,7 @@ class Code(dspy.Code):
         return type(self)(self.code + "\n" + other.code)
 
     @classmethod
-    def join(cls, parts: Iterable["Code"]) -> "Code":
+    def join(cls, parts: Iterable[Self]) -> Self:
         result = cls()
         seen = set()
         for part in parts:
@@ -74,55 +75,3 @@ class Code(dspy.Code):
 
     def __hash__(self):
         return hash((self.language, self.code))
-
-    def format(self):
-        return f"```{self.language.lower()}\n{self.code}```"
-
-    @classmethod
-    def short_description(cls):
-        return f"must be {cls.__name__}"
-
-
-class ChatAdapter(_ChatAdapter):
-    def format_field_structure(self, signature: type[dspy.Signature]) -> str:
-        with patch.object(
-            dspy.adapters.chat_adapter, "translate_field_type", translate_field_type
-        ):
-            return super().format_field_structure(signature)
-
-    # Disable json_repair.loads for dspy.Code-like outputs when parsing completions.
-    # The following snippet is treated as "repaired json", which is clearly wrong:
-    #   ```rust
-    #   pub struct Program<'a> {
-    #       pub code: &'a [i32],
-    #       pub n: usize,
-    #       pub ip: usize,
-    #   }
-    #   ```
-    # That snippet is repaired as:
-    #   a [i32]
-    # Unfortunately, dspy always runs json_repair.loads on every field and there is no
-    # option in dspy to disable it.
-    def parse(self, signature: type[Signature], completion: str) -> dict[str, Any]:
-        with patch.object(json_repair, "loads", json_repair_loads):
-            return super().parse(signature, completion)
-
-
-def translate_field_type(field_name: str, field_info: FieldInfo) -> str:
-    # If a non-input field has a short_description, then use that.
-    field_type = field_info.annotation
-    if not field_type:
-        raise RuntimeError(f"Field '{field_name}' is missing a type annotation")
-
-    if hasattr(field_type, "short_description") and get_dspy_field_type(field_info) != "input":
-        desc = field_type.short_description()
-        desc = (" " * 8) + f"# note: the value you produce {desc}" if desc else ""
-        return f"{{{field_name}}}{desc}"
-    return _translate_field_type(field_name, field_info)
-
-
-def json_repair_loads(json_str: str, *args, **kwargs):
-    # If json_str starts with a fence (```), then immediately fail repair.
-    if isinstance(json_str, str) and json_str.startswith("```"):
-        return ""
-    return _json_repair_loads(json_str, *args, **kwargs)

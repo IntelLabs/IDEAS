@@ -175,7 +175,7 @@ def verify_instrumentation(
         staged_root = Path(scratch) / "workspace"
         shutil.copytree(workspace, staged_root, ignore=_ignore_artifacts)
         fresh = Crate(staged_root / fresh_manifest)
-        pristine_workspace = fresh.workspace_root
+        pristine_workspace = fresh.workspace.root
         try:
             verify_tests_are_portable(Crate(candidate_manifest), fresh, tests)
             shutil.rmtree(pristine_workspace / "target", ignore_errors=True)
@@ -224,7 +224,7 @@ def run_cli(arguments: list[str]) -> tuple[int, str | None]:
 @contextlib.contextmanager
 def verification_service(candidate: Crate, crate: Crate) -> Generator[None]:
     """Verify script runs and retain the latest successful generated-test pair."""
-    workspace = crate.workspace_root.resolve()
+    workspace = crate.workspace.root.resolve()
     fresh_manifest = crate.cargo_toml.relative_to(workspace)
     latest_pair: dict[str, tuple[bytes, int]] = {}
     completed = False

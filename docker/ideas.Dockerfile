@@ -42,11 +42,11 @@ RUN groupadd -g ${USER_GID} ideas && \
     chown -R user:ideas /opt/codex && \
     chown -R user:ideas /usr/local/cargo
 USER user
-RUN mkdir -p /home/user/IDEAS
+RUN mkdir -p /home/user/IDEAS /home/user/.cache/uv /home/user/.local/share/uv
 WORKDIR /home/user/IDEAS
 
-# No nested docker runs
-ENV IDEAS_DOCKER_IMAGE=""
+# No nested docker runs; confine steps with Landlock instead
+ENV IDEAS_RUNNER="landlock"
 
 # Set up a basic git identity
 ENV GIT_AUTHOR_NAME="ideas"
@@ -63,27 +63,3 @@ ENV IDEAS_CODEX_SANDBOX="danger-full-access"
 # Cache Python dependencies
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV UV_LINK_MODE="copy"
-COPY pyproject.toml uv.lock .
-RUN uv sync --frozen --no-install-project && rm -rf pyproject.toml uv.lock .venv
-
-# Cache cargo dependencies
-RUN cargo init --lib cargo_deps && \
-    cd cargo_deps && \
-    cargo add libc@0.2.185 \
-              openssl@0.10.79 \
-              flate2@1 \
-              regex@1 && \
-    cargo add --dev \
-              assert_cmd@2.0.17 \
-              predicates@3.1.3 \
-              serde_json@1 \
-              tempfile@3 \
-              walkdir@2 && \
-    cargo add --dev \
-              --features derive serde@1 && \
-    cargo add --dev \
-              --features json insta@1.48.0 && \
-    cargo add --build \
-              cc@1.2.53 && \
-    CARGO_NET_OFFLINE=false cargo fetch --manifest-path /home/user/IDEAS/cargo_deps/Cargo.toml --locked && \
-    rm -rf /home/user/IDEAS/cargo_deps

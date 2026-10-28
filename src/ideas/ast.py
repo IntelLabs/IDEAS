@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from functools import cmp_to_key
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import astuple, dataclass, field, fields
 from typing import get_args
 
@@ -20,13 +20,24 @@ from clang.cindex import conf, SourceLocation, File, _CXString, c_object_p
 from ctypes import byref, pointer, c_size_t, c_char_p, c_uint
 
 from .adapters import Code
-from .ast_rust import BindgenName, mangle as rust_mangle
+from .ast_rust import BindgenName, CodeRust, mangle as rust_mangle
+from .deterministic import translate
 
 logger = logging.getLogger("ideas.ast")
 FILENAME = "file.c"
-CodeC = Code["c"]
+
+
+class CodeC(Code):
+    language = "c"
+
 
 _VA_LIST_DESUGARED = "struct __va_list_tag *"
+
+# Since clang-22 (llvm/llvm-project#149613) redeclared library builtins such as `strlen` print
+# with `__size_t`; not predeclaring them keeps the types as written in the header:
+# https://github.com/llvm/llvm-project/blob/llvmorg-23.1.2/clang/lib/Basic/Builtins.cpp#L159
+# This won't help if `__SIZE_TYPE__` itself becomes `__size_t` (open llvm/llvm-project#155979)
+PARSE_ARGS = ["-fno-builtin"]
 
 # Cursor kinds that become symbols, ranked by order in which they should be translated
 _KIND_RANK = {
@@ -47,6 +58,35 @@ _TAG_PREFIX = {
     CursorKind.ENUM_DECL: "enum ",
 }
 _TAG_KEYWORDS = frozenset(prefix.strip() for prefix in _TAG_PREFIX.values())
+
+# Builtin types
+# FIXME: Add support for fields in structs too
+_BUILTIN_KINDS = frozenset(
+    {
+        TypeKind.BOOL,
+        TypeKind.CHAR_U,
+        TypeKind.CHAR_S,
+        TypeKind.SCHAR,
+        TypeKind.UCHAR,
+        TypeKind.SHORT,
+        TypeKind.USHORT,
+        TypeKind.INT,
+        TypeKind.UINT,
+        TypeKind.LONG,
+        TypeKind.ULONG,
+        TypeKind.LONGLONG,
+        TypeKind.ULONGLONG,
+        TypeKind.INT128,
+        TypeKind.UINT128,
+        TypeKind.HALF,
+        TypeKind.FLOAT16,
+        TypeKind.FLOAT,
+        TypeKind.DOUBLE,
+        TypeKind.LONGDOUBLE,
+        TypeKind.FLOAT128,
+        TypeKind.IBM128,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -173,8 +213,14 @@ class Symbol:
     # `typedef struct Foo Foo;` — a second name for a tag that already has it
     is_alias_typedef: bool = False
 
+    # The builtin type of a typedef if any
+    builtin_type: str | None = None
+
     # The name bindgen gives this symbol, or None when bindgen's name is unpredictable
     bindgen_name: BindgenName | None = None
+
+    # A static translation of `code` if any
+    deterministic_translation: CodeRust | None = None
 
     @property
     def difficulty(self) -> tuple[int, ...]:
@@ -212,7 +258,9 @@ class Symbol:
             is_struct=cursor.kind == CursorKind.STRUCT_DECL
             or _inline_struct(cursor) is not None,
             is_alias_typedef=_is_alias_typedef(cursor),
+            builtin_type=_builtin_type(cursor),
             bindgen_name=_bindgen_name(cursor),
+            deterministic_translation=translate(parent_or_cursor),
         )
 
     @property
@@ -347,6 +395,24 @@ def _is_alias_typedef(cursor: Cursor) -> bool:
     )
 
 
+def _builtin_type(cursor: Cursor) -> str | None:
+    # A typedef of a builtin type means exactly that builtin
+    if cursor.kind != CursorKind.TYPEDEF_DECL:
+        return None
+    canonical = cursor.underlying_typedef_type.get_canonical()
+    if canonical.kind not in _BUILTIN_KINDS:
+        return None
+
+    # An attribute such as `aligned` changes the type without showing in its canonical
+    # type, so any attribute along the typedef chain disqualifies it
+    decl = cursor
+    while decl.kind == CursorKind.TYPEDEF_DECL:
+        if any(child.kind.is_attribute() for child in decl.get_children()):
+            return None
+        decl = decl.underlying_typedef_type.get_declaration()
+    return canonical.spelling
+
+
 def _synthesize_forward_declaration(cursor: Cursor) -> CodeC | None:
     # A name sits inside its declarator, so `static int (*callbacks[])(void)` cannot be built
     # by appending a name to a type spelling. Let clang print the declarator instead.
@@ -465,9 +531,11 @@ def create_translation_unit(path_or_code: Path | CodeC) -> TranslationUnit:
     # Parse the code using clang
     if isinstance(path_or_code, CodeC):
         code = path_or_code
-        tu = TranslationUnit.from_source(FILENAME, unsaved_files=[(FILENAME, str(code))])
+        tu = TranslationUnit.from_source(
+            FILENAME, args=PARSE_ARGS, unsaved_files=[(FILENAME, str(code))]
+        )
     else:
-        tu = TranslationUnit.from_source(str(path_or_code.resolve()))
+        tu = TranslationUnit.from_source(str(path_or_code.resolve()), args=PARSE_ARGS)
     if any(d.severity >= Diagnostic.Error for d in tu.diagnostics):
         raise TranslationUnitLoadError("\n".join([d.format() for d in tu.diagnostics]))
     return tu
@@ -592,19 +660,10 @@ def get_code_from_tu_range(
 
 
 def get_cursor_prettyprinted(cursor: Cursor) -> CodeC:
-    # Include tag definition when:
-    #    node is not struct/enum/union
-    #    and any child is a struct/enum/union definition
-    CONTAINER_DECL = (CursorKind.STRUCT_DECL, CursorKind.UNION_DECL, CursorKind.ENUM_DECL)
-    include_tag_definition = 0
-    if (cursor.kind not in CONTAINER_DECL) and any(
-        child.kind in CONTAINER_DECL and child.is_definition()
-        for child in cursor.get_children()
-    ):
-        include_tag_definition = 1
-
     policy = PrintingPolicy.create(cursor)
-    policy.set_property(PrintingPolicyProperty.IncludeTagDefinition, include_tag_definition)
+    # Since clang 22 this inlines tag definitions written inside the declaration itself with the right flag set in the printing policy
+    # https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/clang/lib/AST/TypePrinter.cpp#L1557
+    policy.set_property(PrintingPolicyProperty.IncludeTagDefinition, 1)
     # Emit C99 builtin spelling to avoid dependence on stdbool.h macro context.
     policy.set_property(PrintingPolicyProperty.Bool, 0)
     # Clang desugars array-typed va_list parameters to a prototype-scoped struct tag,
@@ -1191,7 +1250,7 @@ SymbolGroup = tuple[SymbolName, ...]
 
 
 def create_symbol_lexical_key_fn(
-    symbols: dict[SymbolName, Symbol],
+    symbols: Mapping[SymbolName, Symbol],
     ast_order: dict[Path, TreeResult] | None = None,
 ):
     def compare_symbol_lexical(a: SymbolName | SymbolGroup, b: SymbolName | SymbolGroup) -> int:
@@ -1256,7 +1315,7 @@ def create_symbol_lexical_key_fn(
 
 
 def create_symbol_ordering_key_fn(
-    symbols: dict[SymbolName, Symbol],
+    symbols: Mapping[SymbolName, Symbol],
     ast_order: dict[Path, TreeResult] | None = None,
 ):
     # Order symbols by translation difficulty, falling back to lexical source order. This
@@ -1287,7 +1346,7 @@ def _cmp_symbol_tu_order(symbol_a: Symbol, symbol_b: Symbol) -> int:
         return 1
     if symbol_a.name != symbol_b.name:
         raise ValueError(
-            f"Unable to order distinct symbols with identical lexical priority and location:"
+            "Unable to order distinct symbols with identical lexical priority and location:"
             f" {symbol_a.name} @ {order_a} vs {symbol_b.name} @ {order_b}"
         )
     return 0

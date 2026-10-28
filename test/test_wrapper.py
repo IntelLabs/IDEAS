@@ -8,16 +8,67 @@ from pathlib import Path
 from textwrap import dedent, indent
 from unittest.mock import MagicMock
 
-import dspy
 import pytest
 
 from clang.cindex import CursorKind
 
 from ideas import ast
+from ideas import bindgen as bindgen_mod
+from ideas.hybrid import Hybrid
 from ideas import wrapper as wrapper_mod
 from ideas.ast_rust import BindgenName, CodeRust
+from ideas.model import Generation
 from ideas.refine import Feedback
-from ideas.tools import check_rust
+from ideas.tools import Crate, check_rust, run_subprocess, rustc_version
+
+
+def test_hybrid_flush_suppresses_other_lints_but_forbids_undocumented_unsafe(
+    tmp_path: Path,
+):
+    crate = Crate(tmp_path / "hybrid" / "Cargo.toml", template="lib")
+    sys_crate = MagicMock()
+    sys_crate.lib_name = "lib_sys"
+    sys_crate.lib_src_path = tmp_path / "sys" / "src" / "lib.rs"
+
+    hybrid = Hybrid(crate, sys_crate)
+    hybrid.wrap(
+        "type",
+        CodeRust("""\
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn works() {}
+}
+"""),
+    )
+    hybrid.wrap("function", CodeRust("pub fn laterFunction(foo: i32) { let _ = foo; }"))
+    hybrid.wrap("sys_alias", CodeRust("extern crate self as lib_sys;"))
+
+    assert crate.lib_src_path is not None
+    rendered = crate.lib_src_path.read_text()
+
+    command = [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--all-targets",
+        f"--manifest-path={crate.cargo_toml}",
+    ]
+    success, stdout, stderr, _ = run_subprocess(command)
+    assert success, stdout + stderr
+    assert rendered.index("mod tests") < rendered.index("pub fn laterFunction")
+    assert "fn works() {}" in rendered
+
+    hybrid.wrap(
+        "unsafe",
+        CodeRust(
+            "static mut c_global: i32 = 0;\n"
+            "pub fn read_c_global() -> i32 { unsafe { c_global } }"
+        ),
+    )
+    success, stdout, stderr, _ = run_subprocess(command)
+    assert not success
+    assert "unsafe block missing a safety comment" in stdout + stderr
 
 
 @pytest.mark.parametrize(
@@ -156,8 +207,8 @@ def test_bindgen_emits_expected_text_for_global_shapes(
     c_path = tmp_path / "input.c"
     c_path.write_text(source)
 
-    types = wrapper_mod.bindgen_types(c_path, [symbol])
-    binding = wrapper_mod.bindgen_binding(c_path, symbol, types)
+    types = bindgen_mod.bindgen_types(c_path, [symbol])
+    binding = bindgen_mod.bindgen_binding(c_path, symbol, types)
 
     # The two segments are complementary, so joined they are the full recursive binding
     assert str(types + binding).strip() == expected
@@ -172,13 +223,13 @@ def test_bindgen_restores_source_when_bindgen_fails(
     c_path.write_text(original_src)
 
     monkeypatch.setattr(
-        wrapper_mod,
+        bindgen_mod,
         "run_subprocess",
         lambda *_args, **_kwargs: (False, "", "boom", 1),
     )
 
     with pytest.raises(ValueError, match="Bindgen failed"):
-        wrapper_mod.bindgen_binding(c_path, "foo", CodeRust())
+        bindgen_mod.bindgen_binding(c_path, "foo", CodeRust())
 
     assert c_path.read_text() == original_src
 
@@ -188,13 +239,13 @@ def test_bindgen_raises_for_empty_binding(tmp_path: Path, monkeypatch: pytest.Mo
     c_path.write_text("int foo(void) { return 1; }\n")
 
     monkeypatch.setattr(
-        wrapper_mod,
+        bindgen_mod,
         "run_subprocess",
         lambda *_args, **_kwargs: (True, "   \n", "", 0),
     )
 
     with pytest.raises(ValueError, match="no binding"):
-        wrapper_mod.bindgen_binding(c_path, "foo", CodeRust())
+        bindgen_mod.bindgen_binding(c_path, "foo", CodeRust())
 
 
 def test_bindgen_bindings_batch_matches_one_call_per_symbol(tmp_path: Path):
@@ -212,11 +263,11 @@ def test_bindgen_bindings_batch_matches_one_call_per_symbol(tmp_path: Path):
     c_path.write_text(source)
 
     symbols = ["alpha", "beta", "gamma_s", "match", "use_alpha"]
-    types = wrapper_mod.bindgen_types(c_path, symbols)
-    batched = wrapper_mod.bindgen_bindings(c_path, symbols, types)
+    types = bindgen_mod.bindgen_types(c_path, symbols)
+    batched = bindgen_mod.bindgen_bindings(c_path, symbols, types)
 
     # Splitting one run must give each symbol exactly what its own run would have
-    assert batched == {s: wrapper_mod.bindgen_binding(c_path, s, types) for s in symbols}
+    assert batched == {s: bindgen_mod.bindgen_binding(c_path, s, types) for s in symbols}
     assert c_path.read_text() == source
 
 
@@ -234,8 +285,8 @@ def test_bindgen_bindings_keep_per_symbol_link_name_attributes(tmp_path: Path):
     c_path.write_text(source)
 
     symbols = ["match", "loop", "plain"]
-    types = wrapper_mod.bindgen_types(c_path, symbols)
-    bindings = wrapper_mod.bindgen_bindings(c_path, symbols, types)
+    types = bindgen_mod.bindgen_types(c_path, symbols)
+    bindings = bindgen_mod.bindgen_bindings(c_path, symbols, types)
 
     # Each symbol keeps its own attribute, its own indentation, and none of the other's
     assert (
@@ -274,13 +325,13 @@ def test_bindgen_bindings_keep_per_symbol_link_name_attributes(tmp_path: Path):
 
 def _crate(types: CodeRust, *values: CodeRust) -> CodeRust:
     # Mirror the hybrid crate's layout: types bare at the root, values in `__c_globals`
-    type_items, const_items = wrapper_mod.partition_values(types)
-    return type_items + wrapper_mod.wrap_values(const_items, *values)
+    type_items, const_items = bindgen_mod.partition_values(types)
+    return type_items + bindgen_mod.wrap_values(const_items, *values)
 
 
 def test_values_module_reaches_the_types_when_the_crate_root_is_not_its_parent():
     types = CodeRust("#[repr(C)]\npub struct house_t {\n    pub floors: i32,\n}")
-    values = wrapper_mod.wrap_values(
+    values = bindgen_mod.wrap_values(
         CodeRust("pub static mut the_house: house_t = house_t { floors: 0 };")
     )
 
@@ -311,11 +362,11 @@ def test_bindgen_types_keep_a_bitfield_constructor_named_after_a_static(tmp_path
     )
 
     symbols = ["opts", "o", "pattern"]
-    types = wrapper_mod.bindgen_types(c_path, symbols)
+    types = bindgen_mod.bindgen_types(c_path, symbols)
     assert "new_bitfield_" in str(types)
     assert "pub fn set_pattern" in str(types)
 
-    bindings = wrapper_mod.bindgen_bindings(c_path, ["o", "pattern"], types)
+    bindings = bindgen_mod.bindgen_bindings(c_path, ["o", "pattern"], types)
     crate = _crate(types, *bindings.values())
     success, output = check_rust(str(crate), flags=["--crate-type=lib", "--emit=metadata"])
     assert success, output
@@ -335,8 +386,8 @@ def _bitfield_global_crate(c_path: Path, global_name: str) -> CodeRust:
         ).lstrip()
     )
 
-    types = wrapper_mod.bindgen_types(c_path, ["opts", "o", global_name])
-    bindings = wrapper_mod.bindgen_bindings(c_path, ["o", global_name], types)
+    types = bindgen_mod.bindgen_types(c_path, ["opts", "o", global_name])
+    bindings = bindgen_mod.bindgen_bindings(c_path, ["o", global_name], types)
     return _crate(types, *bindings.values())
 
 
@@ -373,7 +424,7 @@ def test_function_wrapper_survives_a_parameter_named_after_an_enum_constant(tmp_
         ).lstrip()
     )
 
-    types = wrapper_mod.bindgen_types(c_path, ["use_flags", "flags"])
+    types = bindgen_mod.bindgen_types(c_path, ["use_flags", "flags"])
     assert "pub const flags:" in str(types)
 
     wrapper = wrapper_mod.generate_unimplemented_function_wrapper(c_path, "use_flags", types)
@@ -383,6 +434,111 @@ def test_function_wrapper_survives_a_parameter_named_after_an_enum_constant(tmp_
         flags=["--crate-type=lib", "--emit=metadata"],
     )
     assert success, output
+
+
+@pytest.mark.skipif(
+    rustc_version() < (1, 99, 0), reason="C-variadic definitions are stable from Rust 1.99"
+)
+@pytest.mark.parametrize(
+    ("symbol", "signature"),
+    [
+        ("sum", 'pub unsafe extern "C" fn sum(args: ::std::os::raw::c_int, mut _args: ...)'),
+        ("vsum", "mut ap: ::std::ffi::VaList<'_>,"),
+    ],
+)
+def test_function_wrapper_takes_c_variadic_arguments(
+    tmp_path: Path, symbol: str, signature: str
+):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            #include <stdarg.h>
+            int vsum(int n, va_list ap) { int s = 0; while (n--) s += va_arg(ap, int); return s; }
+            int sum(int args, ...) {
+                va_list ap;
+                va_start(ap, args);
+                int s = vsum(args, ap);
+                va_end(ap);
+                return s;
+            }
+            """
+        ).lstrip()
+    )
+
+    types = bindgen_mod.bindgen_types(c_path, ["sum", "vsum"])
+    wrapper = wrapper_mod.generate_unimplemented_function_wrapper(c_path, symbol, types)
+    assert wrapper is not None
+    assert signature in str(wrapper)
+    success, output = check_rust(
+        str(_crate(types) + wrapper),
+        flags=["--crate-type=lib", "--emit=metadata"],
+    )
+    assert success, output
+
+
+@pytest.mark.skipif(
+    rustc_version() < (1, 99, 0), reason="C-variadic definitions are stable from Rust 1.99"
+)
+@pytest.mark.parametrize(("symbol", "variadics"), [("sum", "_args"), ("vsum", "ap")])
+def test_function_wrapper_template_lets_the_body_read_c_variadic_arguments(
+    tmp_path: Path, symbol: str, variadics: str
+):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            #include <stdarg.h>
+            int vsum(int n, va_list ap) { int s = 0; while (n--) s += va_arg(ap, int); return s; }
+            int sum(int args, ...) {
+                va_list ap;
+                va_start(ap, args);
+                int s = vsum(args, ap);
+                va_end(ap);
+                return s;
+            }
+            """
+        ).lstrip()
+    )
+
+    types = bindgen_mod.bindgen_types(c_path, ["sum", "vsum"])
+    wrapper = wrapper_mod.generate_unimplemented_function_wrapper(c_path, symbol, types)
+    assert wrapper is not None
+
+    # An `unimplemented!()` body never borrows the list, so only a real read checks its binding
+    body = f"unsafe {{ {variadics}.next_arg::<::std::os::raw::c_int>() }}"
+    implemented = CodeRust(str(wrapper).replace("unimplemented!()", body))
+    success, output = check_rust(
+        str(_crate(types) + implemented),
+        flags=["--crate-type=lib", "--emit=metadata"],
+    )
+    assert success, output
+
+
+@pytest.mark.parametrize("symbol", ["sum", "vsum"])
+def test_function_wrapper_is_none_for_c_variadics_before_rust_1_99(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, symbol: str
+):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """
+            #include <stdarg.h>
+            int vsum(int n, va_list ap) { int s = 0; while (n--) s += va_arg(ap, int); return s; }
+            int sum(int args, ...) {
+                va_list ap;
+                va_start(ap, args);
+                int s = vsum(args, ap);
+                va_end(ap);
+                return s;
+            }
+            """
+        ).lstrip()
+    )
+    monkeypatch.setattr(wrapper_mod, "rustc_version", lambda: (1, 88, 0))
+
+    types = bindgen_mod.bindgen_types(c_path, ["sum", "vsum"])
+    assert wrapper_mod.generate_unimplemented_function_wrapper(c_path, symbol, types) is None
 
 
 def test_function_wrapper_survives_a_parameter_named_after_a_global(tmp_path: Path):
@@ -398,8 +554,8 @@ def test_function_wrapper_survives_a_parameter_named_after_a_global(tmp_path: Pa
         ).lstrip()
     )
 
-    types = wrapper_mod.bindgen_types(c_path, ["name", "use_name"])
-    bindings = wrapper_mod.bindgen_bindings(c_path, ["name"], types)
+    types = bindgen_mod.bindgen_types(c_path, ["name", "use_name"])
+    bindings = bindgen_mod.bindgen_bindings(c_path, ["name"], types)
     wrapper = wrapper_mod.generate_unimplemented_function_wrapper(c_path, "use_name", types)
     assert wrapper is not None
 
@@ -410,8 +566,8 @@ def test_function_wrapper_survives_a_parameter_named_after_a_global(tmp_path: Pa
 
 
 def _binding(c_path: Path, symbol: str) -> CodeRust:
-    types = wrapper_mod.bindgen_types(c_path, [symbol])
-    return types + wrapper_mod.bindgen_binding(c_path, symbol, types)
+    types = bindgen_mod.bindgen_types(c_path, [symbol])
+    return types + bindgen_mod.bindgen_binding(c_path, symbol, types)
 
 
 def test_bindgen_handles_dependent_declarations_for_target_global(tmp_path: Path):
@@ -446,20 +602,20 @@ def test_bindgen_handles_dependent_declarations_for_target_function(tmp_path: Pa
     assert dependent_binding == baseline_binding
 
 
-@pytest.mark.parametrize(
-    "signature",
-    [
-        wrapper_mod.FunctionWrapperSignature,
-        wrapper_mod.TypeWrapperSignature,
-        wrapper_mod.VariableWrapperSignature,
-    ],
-    ids=["function", "type", "variable"],
-)
-def test_wrapper_signatures_separate_the_two_crates(signature) -> None:
-    # Merging these into one field makes the LLM reach for `crate::` paths that
-    # actually live in the wrapped crate
-    assert "crate" in signature.input_fields
-    assert "wrapped_crate_code" in signature.input_fields
+class _StubWrapperGenerator(wrapper_mod.WrapperGenerator):
+    # The real generator shells out to the Codex CLI; tests answer the call in process
+    def __init__(self, respond, max_iters: int = 1, cache: Path | None = None) -> None:
+        self.max_iters = max_iters
+        self.cache = wrapper_mod._init_cache(cache)
+        self._respond = respond
+
+    def generate(self, **kwargs) -> Generation:
+        # Only generation is stubbed; replaying a cache hit stays the real code path
+        if kwargs["wrapper"] is not None:
+            return super().generate(**kwargs)
+        gen = self._respond(**kwargs)
+        gen.was_generated = True
+        return gen
 
 
 def _capture_wrapper_inputs(**session_kwargs) -> dict:
@@ -467,7 +623,7 @@ def _capture_wrapper_inputs(**session_kwargs) -> dict:
 
     def record(**kwargs):
         captured.update(kwargs)
-        return dspy.Prediction(wrapper=CodeRust("// wrapper"))
+        return Generation(code=CodeRust("// wrapper"))
 
     symbol = MagicMock()
     symbol.name = "c:@F@bar"
@@ -475,14 +631,12 @@ def _capture_wrapper_inputs(**session_kwargs) -> dict:
     symbol.is_type = False
     symbol.is_function = True
 
-    generator = wrapper_mod.WrapperGenerator(
-        wrapper=MagicMock(return_value=MagicMock(side_effect=record)),  # type: ignore[arg-type]
-        max_iters=1,
-    )
+    generator = _StubWrapperGenerator(record)
     session = generator.session(
         symbol=symbol,
         unimplemented_wrapper=CodeRust("// template"),
         wrapped_crate="libfoo_rs",
+        hybrid_src=Path("hybrid/src/lib.rs"),
         **session_kwargs,
     )
     with session:
@@ -491,33 +645,14 @@ def _capture_wrapper_inputs(**session_kwargs) -> dict:
     return captured
 
 
-def test_translations_reach_the_prompt_as_wrapped_crate_code():
-    translation = CodeRust("pub fn bar() {}")
-    other = CodeRust("pub fn baz_wrapper() -> i32 { 0 }")
-    captured = _capture_wrapper_inputs(
-        wrapped_crate_code=CodeRust("pub struct Prior;"),
-        translation=translation,
-        other_wrappers=other,
-    )
-
-    # The -rs crate's code is not reachable via `crate::`, so it must not be labelled `crate`
-    assert translation in captured["wrapped_crate_code"]
-    assert CodeRust("pub struct Prior;") in captured["wrapped_crate_code"]
-    assert translation not in captured["crate"]
-
-    # `crate` carries only what actually lives in the hybrid crate
-    assert other in captured["crate"]
-
-
 def test_prior_rejection_reaches_the_first_prompt():
     # A retry hands over `prior_wrapper` but the code alone does not say what was wrong with it
     captured = _capture_wrapper_inputs(
-        wrapped_crate_code=CodeRust(),
-        translation=CodeRust(),
         prior_wrapper=CodeRust("// broken"),
         feedback=Feedback(
             review="the wrapper changed the program's behavior",
             build="error[E0308]: mismatched types",
+            lint="warning: an unnecessary conversion",
             scope="do not add public items",
         ),
     )
@@ -525,6 +660,7 @@ def test_prior_rejection_reaches_the_first_prompt():
     # Each channel keeps its own field so the model knows what produced it
     assert captured["feedback"] == "the wrapper changed the program's behavior"
     assert captured["build_feedback"] == "error[E0308]: mismatched types"
+    assert captured["lint_feedback"] == "warning: an unnecessary conversion"
     assert captured["scope_feedback"] == "do not add public items"
 
 
@@ -540,23 +676,17 @@ def _generate_wrapper(
     symbol.is_type = False
     symbol.is_function = True
 
-    generator = wrapper_mod.WrapperGenerator(
-        wrapper=MagicMock(  # type: ignore[arg-type]
-            return_value=MagicMock(
-                return_value=dspy.Prediction(wrapper=generated)
-                if generated is not None
-                else dspy.Prediction()
-            )
+    generator = _StubWrapperGenerator(
+        MagicMock(
+            return_value=Generation(code=generated) if generated is not None else Generation()
         ),
-        max_iters=1,
         cache=cache,
     )
     session = generator.session(
         symbol=symbol,
-        wrapped_crate_code=CodeRust(),
-        translation=CodeRust(),
         unimplemented_wrapper=template,
         wrapped_crate="libfoo_rs",
+        hybrid_src=Path("hybrid/src/lib.rs"),
     )
     # Nothing here builds the wrapper, so the scope check alone decides the verdict
     attempt: wrapper_mod.WrapperAttempt | None = None
@@ -604,7 +734,7 @@ def test_mentioning_unimplemented_in_a_comment_passes_scope_validation():
     assert attempt.rejection.scope == ""
 
 
-def test_a_prediction_without_a_wrapper_is_rejected():
+def test_a_generation_without_a_wrapper_is_rejected():
     stub = CodeRust("pub fn bar_wrapper() -> i32 { unimplemented!() }")
     attempt = _generate_wrapper(None, template=stub)
 
@@ -691,7 +821,7 @@ def test_a_cached_wrapper_using_catch_unwind_fails_scope_validation(tmp_path: Pa
     replayed = attempts[0]
 
     # A replayed entry is scope-checked like a fresh one, so the rule still applies to it
-    assert not replayed.pred.was_generated
+    assert not replayed.gen.was_generated
     assert "catch_unwind" in replayed.rejection.scope
     assert not replayed.success
 
@@ -700,7 +830,7 @@ def test_type_wrapper_template_is_an_interop_impl(tmp_path: Path):
     c_path = tmp_path / "input.c"
     c_path.write_text("typedef struct { int floors; } house_t;\nhouse_t the_house;\n")
 
-    types = wrapper_mod.bindgen_types(c_path, ["house_t"])
+    types = bindgen_mod.bindgen_types(c_path, ["house_t"])
     wrapper, tests_mod = wrapper_mod.generate_unimplemented_type_wrapper("house_t", types)
     assert tests_mod == "test_house_t"
 
@@ -713,6 +843,7 @@ def test_type_wrapper_template_is_an_interop_impl(tmp_path: Path):
     assert "type Rust = ();" in str(wrapper)
     assert "fn round_trip_zeroed" in str(wrapper)
     assert "fn round_trip_nontrivial" in str(wrapper)
+    assert "fn round_trip_mutated" in str(wrapper)
 
     # todo!() keeps validate_changes from constraining the signature edits
     assert "unimplemented!()" not in str(wrapper)
@@ -726,9 +857,9 @@ def test_nested_record_is_wrapped_under_its_bindgen_name(tmp_path: Path):
     )
 
     # bindgen keys its allowlist by the name it generates, so the bare tag misses
-    assert "histindex_record" not in str(wrapper_mod.bindgen_types(c_path, ["record"]))
+    assert "histindex_record" not in str(bindgen_mod.bindgen_types(c_path, ["record"]))
 
-    types = wrapper_mod.bindgen_types(c_path, ["histindex_record"])
+    types = bindgen_mod.bindgen_types(c_path, ["histindex_record"])
     assert "pub struct histindex_record" in str(types)
 
     # ...while the impl must name the record after its parent, or it would not compile
@@ -762,7 +893,7 @@ def test_struct_typedef_is_wrapped_under_the_struct_bindgen_declares(tmp_path: P
     assert (bindgen_name := typedef.bindgen_name) is not None
 
     # The alias would compile as an `impl` target, so only the declaration catches the miss
-    types = wrapper_mod.bindgen_types(c_path, [bindgen_name])
+    types = bindgen_mod.bindgen_types(c_path, [bindgen_name])
     assert f"pub struct {bindgen_name}" in str(types)
 
 
@@ -770,7 +901,7 @@ def test_variable_wrapper_template_pairs_sync_fns_with_tests(tmp_path: Path):
     c_path = tmp_path / "input.c"
     c_path.write_text("typedef struct { int floors; } house_t;\nhouse_t the_house;\n")
 
-    types = wrapper_mod.bindgen_types(c_path, ["the_house"])
+    types = bindgen_mod.bindgen_types(c_path, ["the_house"])
     binding = CodeRust('unsafe extern "C" { pub static mut the_house: house_t; }')
     wrapper, tests_mod, sync_fns = wrapper_mod.generate_unimplemented_variable_wrapper(
         "the_house", types, binding
@@ -793,7 +924,7 @@ def test_variable_wrapper_template_pairs_sync_fns_with_tests(tmp_path: Path):
 def test_const_variable_wrapper_template_omits_the_sync_pair(tmp_path: Path):
     c_path = tmp_path / "input.c"
     c_path.write_text("const int limit = 7;\n")
-    types = wrapper_mod.bindgen_types(c_path, ["limit"])
+    types = bindgen_mod.bindgen_types(c_path, ["limit"])
 
     # bindgen drops `mut` for a const-qualified global, whose Rust counterpart is therefore
     # immutable: sync_to_rust could only be a stub and the round trip could never hold
@@ -809,10 +940,39 @@ def test_const_variable_wrapper_template_omits_the_sync_pair(tmp_path: Path):
     assert "fn initial_value_matches" in str(wrapper)
 
 
+def test_const_array_binding_omits_the_sync_pair(tmp_path: Path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        "static const unsigned short table[2][2] = {{0, 1}, {2, 3}};\n"
+        "static const unsigned short *table_ptr = table[0];\n"
+    )
+    names = ["table", "table_ptr"]
+    types = bindgen_mod.bindgen_types(c_path, names)
+
+    ast.clang_make_global_(c_path, names)
+    bindings = bindgen_mod.bindgen_bindings(c_path, names, types)
+
+    assert "pub static table:" in str(bindings["table"])
+    assert "pub static mut table:" not in str(bindings["table"])
+    assert "pub static mut table_ptr:" in str(bindings["table_ptr"])
+
+    _, _, table_sync_fns = wrapper_mod.generate_unimplemented_variable_wrapper(
+        "table", types, bindings["table"]
+    )
+    _, _, pointer_sync_fns = wrapper_mod.generate_unimplemented_variable_wrapper(
+        "table_ptr", types, bindings["table_ptr"]
+    )
+    assert table_sync_fns == ()
+    assert pointer_sync_fns == (
+        "sync_table_ptr_to_rust",
+        "sync_table_ptr_to_c",
+    )
+
+
 def test_variable_test_module_cannot_collide_with_a_type_of_the_same_name(tmp_path: Path):
     c_path = tmp_path / "input.c"
     c_path.write_text("typedef struct { int floors; } house_t;\nhouse_t house_t_value;\n")
-    types = wrapper_mod.bindgen_types(c_path, ["house_t"])
+    types = bindgen_mod.bindgen_types(c_path, ["house_t"])
 
     # C keeps tags and ordinary identifiers in separate namespaces, so a variable and a
     # type can share a spelling while both wrappers land in the same crate root
@@ -834,7 +994,7 @@ def test_type_wrapper_template_names_its_test_module(tmp_path: Path):
         "house_t the_house;\n"
         "car_t the_car;\n"
     )
-    types = wrapper_mod.bindgen_types(c_path, ["house_t", "car_t"])
+    types = bindgen_mod.bindgen_types(c_path, ["house_t", "car_t"])
 
     # Every wrapper shares the crate root, so a fixed `mod tests` would collide
     house, _ = wrapper_mod.generate_unimplemented_type_wrapper("house_t", types)
@@ -854,8 +1014,8 @@ def test_narrowing_the_allowlist_only_deletes_types(tmp_path: Path):
         "void use_car(car_t *c);\n"
     )
 
-    full = wrapper_mod.bindgen_types(c_path, ["house_t", "car_t", "use_house", "use_car"])
-    sliced = wrapper_mod.bindgen_types(c_path, ["use_house"])
+    full = bindgen_mod.bindgen_types(c_path, ["house_t", "car_t", "use_house", "use_car"])
+    sliced = bindgen_mod.bindgen_types(c_path, ["use_house"])
 
     # Types unreachable from the allowlisted symbol drop out
     assert "pub struct car_t" in str(full)
@@ -877,8 +1037,8 @@ def test_splitting_types_keys_every_item_by_the_type_it_belongs_to(tmp_path: Pat
         "void use_house(alias_t *h);\n"
     )
 
-    types = wrapper_mod.bindgen_types(c_path, ["house_t", "alias_t", "use_house"])
-    split = wrapper_mod.split_types(types)
+    types = bindgen_mod.bindgen_types(c_path, ["house_t", "alias_t", "use_house"])
+    split = bindgen_mod.split_types(types)
 
     # Attributes stay with the item they decorate rather than starting a bucket
     assert "#[repr(C)]\n#[derive" in str(split[BindgenName("house_t")])
@@ -906,13 +1066,13 @@ def test_splitting_types_attaches_bindgen_helper_impls_to_their_type(tmp_path: P
         "void use_both(flags_t *f, plain_t *p);\n"
     )
 
-    split = wrapper_mod.split_types(
-        wrapper_mod.bindgen_types(c_path, ["flags_t", "plain_t", "use_both"])
+    split = bindgen_mod.split_types(
+        bindgen_mod.bindgen_types(c_path, ["flags_t", "plain_t", "use_both"])
     )
 
     # The helper's generic impl blocks are ~130 lines that would otherwise land in the
     # preamble and be charged to every slice, including ones with no bitfields at all
-    assert wrapper_mod.TYPES_PREAMBLE not in split
+    assert bindgen_mod.TYPES_PREAMBLE not in split
     assert "impl<Storage> __BindgenBitfieldUnit<Storage>" in str(
         split[BindgenName("__BindgenBitfieldUnit")]
     )
@@ -928,7 +1088,7 @@ def test_libc_internals_are_collapsed_to_opaque_blobs(tmp_path: Path):
         "void use_probe(struct probe *p);\n"
     )
 
-    types = wrapper_mod.bindgen_types(c_path, ["probe", "use_probe"])
+    types = bindgen_mod.bindgen_types(c_path, ["probe", "use_probe"])
 
     # A single `FILE *` otherwise drags ~30 unreadable glibc fields into every prompt
     assert "_bindgen_opaque_blob" in str(types)
@@ -954,8 +1114,8 @@ def test_tag_namespace_survives_a_same_named_variable_or_function(
     c_path = tmp_path / "input.c"
     c_path.write_text(source)
 
-    types = wrapper_mod.bindgen_types(c_path, [symbol])
-    binding = wrapper_mod.bindgen_binding(c_path, symbol, types)
+    types = bindgen_mod.bindgen_types(c_path, [symbol])
+    binding = bindgen_mod.bindgen_binding(c_path, symbol, types)
 
     # bindgen keys items by name alone, so a by-name blocklist would take the tag down
     # with the identifier and leave the binding referring to a type nobody defines

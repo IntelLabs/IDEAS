@@ -5,11 +5,11 @@
 #
 
 from .ast import create_translation_unit, extract_info_c, TreeResult
-from .model import ModelConfig, GenerateConfig
+from .model import ModelConfig
 from .translate_recurrent import RecurrentTranslator
 from .translate_snippet import SnippetTranslator
 from .wrapper import WrapperGenerator
-from .codex import CodexConfig, CodexSnippetTranslator, CodexWrapperGenerator
+from .codex import CodexConfig
 from clang.cindex import Config
 
 __all__ = [
@@ -17,14 +17,11 @@ __all__ = [
     "extract_info_c",
     "TreeResult",
     "ModelConfig",
-    "GenerateConfig",
     "RecurrentTranslator",
     "SnippetTranslator",
     "WrapperGenerator",
     "CodexConfig",
-    "CodexSnippetTranslator",
-    "CodexWrapperGenerator",
 ]
 
 # NOTE: .so is *nix specific
-Config.set_library_file("libclang-21.so")
+Config.set_library_file("libclang-23.so")

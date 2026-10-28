@@ -1,6 +1,9 @@
 # IDEAS specific
 examples/
 docker/build.log
+docker/venv/
+docker/cargo/
+src/ideas/model_prices.json*
 
 .DS_Store
 *.*~
@@ -32,16 +35,4 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
-# Environments
-.env
-.venv
-docker/.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Rust tools
 target/

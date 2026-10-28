@@ -169,12 +169,12 @@ def test_fresh_copy_has_a_random_package_and_target_name(tmp_path):
     assert fresh.name != source.name
     assert fresh.lib_name != source.lib_name
     assert fresh.cargo_toml.parent.name == fresh.name
-    assert fresh.workspace_root == fresh.cargo_toml.parent
+    assert fresh.workspace.root == fresh.cargo_toml.parent
 
 
 def test_reproducible_suite_verifies(sys_crate, fresh_crate):
     assert sys_crate.name != fresh_crate.name
-    assert fresh_crate.workspace_root.name != sys_crate.workspace_root.name
+    assert fresh_crate.workspace.root.name != sys_crate.workspace.root.name
     verify_tests_are_portable(sys_crate, fresh_crate, TESTS)
     for test in TESTS:
         source = (fresh_crate.cargo_toml.parent / "tests" / f"{test}.rs").read_text()
@@ -225,7 +225,7 @@ def test_instrumentation_invokes_portability_verification(sys_crate, fresh_crate
 
 
 def test_instrumentation_verification_compares_the_pristine_workspace(sys_crate, fresh_crate):
-    workspace = fresh_crate.workspace_root
+    workspace = fresh_crate.workspace.root
     manifest = fresh_crate.cargo_toml.relative_to(workspace)
     verify_instrumentation(sys_crate.cargo_toml, workspace, manifest, TESTS)
 

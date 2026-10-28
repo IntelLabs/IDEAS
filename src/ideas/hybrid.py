@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import logging
+from pathlib import Path
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from textwrap import dedent
@@ -11,11 +13,15 @@ from textwrap import dedent
 from .ast import Symbol, SymbolName
 from .ast import clang_make_global_, clang_make_extern_
 from .ast import clang_function_arity, clang_function_definitions, clang_rename_
-from .ast_rust import BindgenName, CodeRust, get_root, get_referenced_type_names
-from .tools import Crate, REDUCED_CONTEXT
-from .wrapper import C_INTEROP_TRAIT, TYPES_PREAMBLE, wrap_values
-from .wrapper import bindgen_types, bindgen_bindings, split_items
-from .wrapper import generate_unimplemented_function_wrapper
+from .ast_rust import BindgenName, CodeRust, strip_cfg_test, strip_exports, strip_visibility
+from .tools import Crate
+from .bindgen import C_INTEROP_TRAIT, wrap_values
+from .bindgen import bindgen_types, bindgen_bindings, split_items
+
+logger = logging.getLogger("ideas.hybrid")
+
+# Safe crate alias for other crates
+SAFE_CRATE = "safe_crate"
 
 
 @dataclass(frozen=True)
@@ -24,57 +30,31 @@ class HybridState:
     consts: Mapping[BindgenName, CodeRust] = field(default_factory=dict)
     externs: tuple[CodeRust, ...] = ()
     wrappers: Mapping[SymbolName, CodeRust] = field(default_factory=dict)
-    main_wrapped: bool = False
+    scaffolding: frozenset[SymbolName] = frozenset()
+    main_from: str | None = None
     c_stranded: bool = False
 
     @property
     def types_code(self) -> CodeRust:
         return CodeRust.join(self.types.values())
 
-    def type_slice(
-        self, bindgen_name: BindgenName | None, wrapper: CodeRust
-    ) -> tuple[Iterable[CodeRust], Iterable[CodeRust]]:
-        if not REDUCED_CONTEXT:
-            # Return all types because the wrapper may reference any of them
-            return self.types.values(), self.consts.values()
-
-        # In reduced context mode, keep only the types reachable from this symbol, the externs
-        # and its own wrapper
-        pending = {TYPES_PREAMBLE}
-        if bindgen_name is not None:
-            pending.add(bindgen_name)
-        for code in (*self.externs, wrapper):
-            pending |= get_referenced_type_names(get_root(str(code)))
-
-        keep: set[BindgenName] = set()
-        while pending:
-            name = pending.pop()
-            if name in keep or (item := self.types.get(name)) is None:
-                continue
-            keep.add(name)
-            pending |= get_referenced_type_names(get_root(str(item)))
-        return (
-            [code for name, code in self.types.items() if name in keep],
-            [code for name, code in self.consts.items() if name in keep],
-        )
-
-    def render(
-        self,
-        wrappers: Iterable[CodeRust] | None = None,
-        types: Iterable[CodeRust] | None = None,
-        consts: Iterable[CodeRust] | None = None,
-    ) -> CodeRust:
-        if wrappers is None:
-            wrappers = self.wrappers.values()
-        if types is None:
-            types = self.types.values()
-        if consts is None:
-            consts = self.consts.values()
+    def render(self, *, export_scaffolding: bool = True) -> CodeRust:
+        if export_scaffolding:
+            wrappers = list(self.wrappers.values())
+        else:
+            # Tests already passed against the hybrid; scaffolding may still be installed as a
+            # callback by other wrappers, so it stays but is not exported
+            wrappers = [
+                strip_cfg_test(
+                    strip_visibility(strip_exports(w)) if n in self.scaffolding else w
+                )
+                for n, w in self.wrappers.items()
+            ]
         return CodeRust.join(
             [
                 C_INTEROP_TRAIT,
-                CodeRust.join(types),
-                wrap_values(CodeRust.join(consts), *self.externs),
+                self.types_code,
+                wrap_values(CodeRust.join(self.consts.values()), *self.externs),
                 *wrappers,
             ]
         )
@@ -86,21 +66,28 @@ class HybridSnapshot:
     c_src: bytes
 
 
-class HybridWriter:
-    def __init__(self, sys_crate: Crate, crate: Crate, rust_lib_name: str):
+class Hybrid:
+    def __init__(
+        self,
+        crate: Crate,
+        sys_crate: Crate,
+        ffi_crate: Crate | None = None,
+    ):
         if crate.lib_src_path is None and crate.main_src_path is None:
             raise ValueError(f"Crate {crate.name} has neither lib.rs nor main.rs!")
-        assert sys_crate.lib_src_path is not None
         assert sys_crate.lib_name is not None
+        assert sys_crate.lib_src_path is not None
         self._crate = crate
+        self._ffi_crate = ffi_crate
         self._c_src_path = sys_crate.lib_src_path.with_suffix(".c")
         self._sys_lib_name = sys_crate.lib_name
-        self._rust_lib_name = rust_lib_name
         self._state = HybridState()
         self._bindings: dict[SymbolName, CodeRust] = {}
-        if crate.main_src_path is not None:
-            self._adopt_c_entrypoint()
         self._flush()
+
+    @property
+    def crate(self) -> Crate:
+        return self._crate
 
     @property
     def types(self) -> Mapping[BindgenName, CodeRust]:
@@ -119,10 +106,6 @@ class HybridWriter:
         return self._state.wrappers
 
     @property
-    def main_wrapped(self) -> bool:
-        return self._state.main_wrapped
-
-    @property
     def types_code(self) -> CodeRust:
         return self._state.types_code
 
@@ -130,18 +113,12 @@ class HybridWriter:
     def bindings(self) -> Mapping[SymbolName, CodeRust]:
         return self._bindings
 
-    def type_slice(
-        self, bindgen_name: BindgenName | None, wrapper: CodeRust
-    ) -> tuple[Iterable[CodeRust], Iterable[CodeRust]]:
-        return self._state.type_slice(bindgen_name, wrapper)
+    @property
+    def c_src_path(self) -> Path:
+        return self._c_src_path
 
-    def render(
-        self,
-        wrappers: Iterable[CodeRust] | None = None,
-        types: Iterable[CodeRust] | None = None,
-        consts: Iterable[CodeRust] | None = None,
-    ) -> CodeRust:
-        return self._state.render(wrappers, types, consts)
+    def render(self) -> CodeRust:
+        return self._state.render()
 
     def set_types(
         self, types: Mapping[BindgenName, CodeRust], consts: Mapping[BindgenName, CodeRust]
@@ -153,7 +130,13 @@ class HybridWriter:
         self._state = replace(self._state, externs=(*self._state.externs, *externs))
         self._flush()
 
-    def write_types(self, symbols: Iterable[Symbol]):
+    def import_symbols(self, symbols: Iterable[Symbol]):
+        symbols = list(symbols)
+        # Variables' bindings name the imported types
+        self._import_types(symbols)
+        self._import_variables(symbols)
+
+    def _import_types(self, symbols: list[Symbol]):
         # An anonymous record has no name to allowlist, so bindgen only reaches it through
         # whatever names the field that uses it
         items = bindgen_types(
@@ -162,10 +145,27 @@ class HybridWriter:
         types, consts = split_items(items)
         self.set_types(types, consts)
 
-    def add_bindings(self, symbols: Iterable[Symbol]) -> list[str]:
+        # bindgen renames nested records after their whole ancestor chain, so a wrong
+        # `bindgen_name` silently yields a type slice that never declares the item the
+        # wrapper will `impl CInterop for`
+        missing = sorted(
+            {
+                bindgen_name
+                for s in symbols
+                if s.is_struct and s.is_externally_visible
+                if (bindgen_name := s.bindgen_name) is not None and bindgen_name not in types
+            }
+        )
+        if missing:
+            logger.warning(
+                f"bindgen did not declare wrappable type(s): {', '.join(missing)}. "
+                "Wrapping them will fail to build."
+            )
+
+    def _import_variables(self, symbols: list[Symbol]):
         variables = [s for s in symbols if s.is_variable]
         if not variables:
-            return []
+            return
 
         clang_make_global_(self._c_src_path, [s.spelling for s in variables])
         bindings = bindgen_bindings(
@@ -176,10 +176,28 @@ class HybridWriter:
         self.add_externs([bindings[s.spelling] for s in variables])
 
         self._crate.vcs.add(self._c_src_path)
-        return [s.spelling for s in variables]
 
-    def set_wrapper(self, name: SymbolName, wrapper: CodeRust):
-        self._state = replace(self._state, wrappers={**self._state.wrappers, name: wrapper})
+    def wrap(
+        self,
+        name: SymbolName,
+        wrapper: CodeRust,
+        *,
+        c_symbol: str | None = None,
+        scaffolding: bool = False,
+    ):
+        # Hands `name` to Rust; a wrapper exporting `c_symbol` needs C's definition gone or the
+        # two collide at link time
+        if c_symbol is not None:
+            clang_make_extern_(self._c_src_path, c_symbol)
+            self._crate.vcs.add(self._c_src_path)
+        names = self._state.scaffolding - {name}
+        if scaffolding:
+            names |= {name}
+        self._state = replace(
+            self._state,
+            wrappers={**self._state.wrappers, name: wrapper},
+            scaffolding=names,
+        )
         self._flush()
 
     def take_over_main(self):
@@ -190,12 +208,8 @@ class HybridWriter:
         clang_make_extern_(self._c_src_path, "__ideas_c_main")
         self._crate.vcs.add(self._c_src_path)
 
-        self._state = replace(self._state, main_wrapped=True)
+        self._state = replace(self._state, main_from=SAFE_CRATE)
         self._flush()
-
-    def make_extern(self, spelling: str):
-        clang_make_extern_(self._c_src_path, spelling)
-        self._crate.vcs.add(self._c_src_path)
 
     def strand_c(self):
         # Drop every C body no wrapper replaced so nothing can link the originals. Whatever the
@@ -206,11 +220,6 @@ class HybridWriter:
         self._state = replace(self._state, c_stranded=True)
         self._flush()
 
-    def unimplemented_function_wrapper(self, spelling: str) -> CodeRust | None:
-        return generate_unimplemented_function_wrapper(
-            self._c_src_path, spelling, self._state.types_code
-        )
-
     def snapshot(self) -> HybridSnapshot:
         return HybridSnapshot(state=self._state, c_src=self._c_src_path.read_bytes())
 
@@ -220,7 +229,7 @@ class HybridWriter:
         self._c_src_path.write_bytes(snapshot.c_src)
         self._crate.vcs.add(self._c_src_path)
 
-    def _adopt_c_entrypoint(self):
+    def adopt_c_entrypoint(self):
         # Free the `main` symbol for Rust to define; C's program logic lives on under the new name
         clang_rename_(self._c_src_path, {"main": "__ideas_c_main"})
 
@@ -267,20 +276,34 @@ class HybridWriter:
         self._crate.vcs.add(self._c_src_path)
 
     def _flush(self):
+        # Preserve C APIs while forbidding unsound signatures and undocumented or overly broad
+        # unsafe operations. Clippy warnings are feedback, not a correctness gate.
+        crate_allow = CodeRust(
+            "#![forbid(\n"
+            "    improper_ctypes,\n"
+            "    improper_ctypes_definitions,\n"
+            "    static_mut_refs,\n"
+            "    unsafe_op_in_unsafe_fn,\n"
+            "    clippy::multiple_unsafe_ops_per_block,\n"
+            "    clippy::not_unsafe_ptr_arg_deref,\n"
+            "    clippy::undocumented_unsafe_blocks\n"
+            ")]"
+        )
+
         # Link the -sys crate to resolve the C symbols no wrapper replaced; rustc drops it
         # unless something names it, and wrapping is never exhaustive
-        body = CodeRust(f"use {self._sys_lib_name} as _;")
-        body += self._state.render()
+        link_sys = CodeRust(f"use {self._sys_lib_name} as _;")
+        body = link_sys + self._state.render()
 
         if (lib_src_path := self._crate.lib_src_path) is not None:
             lib_src_path.parent.mkdir(parents=True, exist_ok=True)
-            lib_src_path.write_text(str(body))
+            lib_src_path.write_text(str(crate_allow + body))
             self._crate.vcs.add(lib_src_path)
 
         if (main_src_path := self._crate.main_src_path) is not None:
-            if self._state.main_wrapped:
+            if (main_from := self._state.main_from) is not None:
                 # C's `main` is now extern-only, so the -rs crate supplies the entrypoint
-                root = CodeRust(f"use {self._rust_lib_name}::main;")
+                root = CodeRust(f"use {main_from}::main;")
             elif self._state.c_stranded:
                 # `__ideas_entry` went with the rest of the C, so the binary has to be able to
                 # link without it; failing loudly beats exiting 0 without running anything
@@ -310,9 +333,10 @@ class HybridWriter:
                             })
                             .collect();
                         let argc = args.len() as c_int;
-                        let mut argv: Vec<*mut c_char> =
-                            args.iter_mut().map(|a| a.as_mut_ptr().cast()).collect();
+                        let mut argv: Vec<*mut c_char> = args.iter_mut().map(|a| a.as_mut_ptr().cast()).collect();
                         argv.push(std::ptr::null_mut());
+                        // SAFETY: `args` owns the NUL-terminated strings and remains alive for the call.
+                        //         `argv` points to those strings and ends with a null pointer.
                         let code = unsafe { __ideas_entry(argc, argv.as_mut_ptr()) };
                         std::process::ExitCode::from(code as u8)
                     }
@@ -320,11 +344,19 @@ class HybridWriter:
                 )
 
             if lib_src_path is not None:
-                # Compile lib.rs into the bin rather than depend on it
+                # Compile lib.rs into the bin as a private module instead of depending on the lib
+                # crate. The crate-root warning policy applies to this module too.
                 root += CodeRust(f'#[path = "{lib_src_path.name}"]\nmod hybrid;')
             else:
                 root += body
 
+            root = crate_allow + root
             main_src_path.parent.mkdir(parents=True, exist_ok=True)
             main_src_path.write_text(str(root))
             self._crate.vcs.add(main_src_path)
+
+        if self._ffi_crate is not None and (ffi_src_path := self._ffi_crate.lib_src_path):
+            # After `strand_c`, -sys only holds the C globals' storage the sync helpers need
+            ffi_body = crate_allow + link_sys + self._state.render(export_scaffolding=False)
+            ffi_src_path.write_text(str(ffi_body))
+            self._ffi_crate.vcs.add(ffi_src_path)

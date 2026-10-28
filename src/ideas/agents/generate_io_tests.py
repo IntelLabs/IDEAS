@@ -10,31 +10,31 @@ import shutil
 import tempfile
 import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
 import hydra
-from omegaconf import MISSING
+from omegaconf import MISSING, OmegaConf
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 
-from ideas.agents.printer import ConsoleTee, LoggingConsolePrinter
+from ideas import ModelConfig
+from ideas.agents.codex_backend import CodexAgentError, run_codex_agent
 from ideas.agents.utils import finalize_tests, strip_line_directives, write_test_templates
-from ideas.agents.utils import TESTGEN_BOTTOM_UP, TESTGEN_FINISH_EARLY
+from ideas.agents.utils import TESTGEN_FINISH_EARLY
 from ideas.agents.verifiers import get_fresh_copy, verification_service
 from ideas.tools import Crate
-
-from kiss.agents.sorcar.useful_tools import UsefulTools
-from kiss.core.kiss_agent import KISSAgent
-from kiss.core.kiss_error import KISSError, BudgetExceededError
 
 logger = logging.getLogger("ideas.agents.generate_io_tests")
 
 
 @dataclass
 class TestgenConfig:
-    model: str = MISSING
-    output_path: Path = MISSING
+    # _self_ first so the selected provider preset wins over this schema's own defaults
+    defaults: list[Any] = field(default_factory=lambda: ["_self_", {"model": "openrouter"}])
+
+    model: ModelConfig = MISSING
     manifest: Path = MISSING
 
     coverage: int = 100  # [%] branch coverage
@@ -43,27 +43,6 @@ class TestgenConfig:
     steps: int = 100
 
     vcs: str = "none"
-
-
-class TestgenAgent(KISSAgent):
-    """Give the model its step count without token or budget telemetry."""
-
-    def _get_usage_info_string(self) -> str:
-        return f"Steps: {self.step_count}/{self.max_steps}"
-
-    def _can_finish(self) -> bool:
-        return self.step_count >= self._finish_step_threshold() or TESTGEN_FINISH_EARLY
-
-    def _finish_tool_description(self) -> str:
-        # The base description advertises the step gate that TESTGEN_FINISH_EARLY lifts.
-        if not TESTGEN_FINISH_EARLY:
-            return super()._finish_tool_description()
-        return (
-            "Finish with the final answer. Call this only once the inventory is exhausted: every "
-            "public function or mode is tested and verified, the coverage target is met, and every "
-            "remaining branch has been proven unreachable. Difficulty, slow progress, a long "
-            "trajectory, and the number of passing tests never justify finishing."
-        )
 
 
 @dataclass
@@ -86,39 +65,21 @@ class TestgenInstructions:
         """
     )
 
-    library_top_down: str = textwrap.dedent(
-        """
-        Start generating tests from the highest-level public functions: use implementation call
-        relationships to identify entry points and orchestration APIs that exercise substantial project
-        behavior. Give each one its smallest focused real-work success case, then work downward through
-        lower-level public primitives without skipping any inventory item or combining unrelated APIs.
-        """
-    )
-
-    library_bottom_up: str = textwrap.dedent(
-        """
-        Start generating tests from the lowest-level public functions: use implementation call
-        relationships to identify leaf APIs and foundational primitives used throughout the project.
-        Give each one its smallest focused real-work success case, then work upward through higher-level
-        entry points and orchestration APIs without skipping any inventory item or combining unrelated APIs.
-        """
-    )
-
     library_scope: str = textwrap.dedent(
         """
         Do not change `src/lib.rs` or any build file. Inventory every public function by subsystem,
         including inputs, outputs, mutations, return paths, errors, and file or environment effects. Read
         each implementation and avoid inputs that hang or cause UB.
 
-        {library_breadth_order}
+        Start generating tests from the lowest-level public functions: use implementation call
+        relationships to identify leaf APIs and foundational primitives used throughout the project.
+        Give each one its smallest focused real-work success case, then work upward through higher-level
+        entry points and orchestration APIs without skipping any inventory item or combining unrelated APIs.
 
         Drive the code only through public FFI bindings, environment variables, and input files. Never
         call private functions or edit the program to reach code. Assert outputs, mutations, return values,
         and file-system effects.
         """
-    ).replace(
-        "{library_breadth_order}",
-        (library_bottom_up if TESTGEN_BOTTOM_UP else library_top_down).strip(),
     )
 
     binary_scope: str = textwrap.dedent(
@@ -128,17 +89,17 @@ class TestgenInstructions:
         and file effects. Derive exit conditions and dangerous inputs from implementations, dispatch
         tables, option parsers, and usage strings.
 
-        Drive the program through `main` using arguments, stdin, environment, and files, and reach what
-        `main` cannot by calling public functions directly through the `{lib_name}` FFI bindings already
-        imported by the test files. **Never** edit the program to reach code.
+        Drive the program **only** through `main` using arguments, stdin, environment, and files.
+        **Never** call any other function, even when the FFI bindings expose it, and **never** edit
+        the program to reach code. Code that `main` cannot reach is out of scope.
 
-        When calling `main`, assert stdout, stderr, exit codes, return values, mutations, and file-system effects.
+        When calling `main`, assert stdout, stderr, exit codes, mutations, and file-system effects.
         """
     )
 
     portability: str = textwrap.dedent(
         """
-        # Linux portability and isolation
+        ## Linux portability and isolation
         Generated tests must behave identically in any fresh compatible Linux container; assume only the
         supplied harness and project-declared dependencies.
         Documented Linux kernel and `libc` contracts are allowed.
@@ -160,6 +121,20 @@ class TestgenInstructions:
         """
     )
 
+    library_allocators: str = textwrap.dedent(
+        """
+        ## Memory allocators
+        Sanitizers reject ordering comparisons between pointers into different allocations, which
+        allocators and buffer pools routinely make. When the target publicly lets callers replace its
+        memory allocator or supply its working buffers, every test must first route all of the target's
+        dynamic memory, including any such buffers, through one test-owned contiguous region. Install this
+        through the target's public interface before any other call into it, honoring the hook's contracts
+        for alignment, size queries, reallocation, and allocation failure, with enough capacity for the
+        test's workload. Implement it once as a helper, defined identically in `{collect_path}` and
+        `{test_path}`, that is safe to call at the start of every test; never duplicate the setup in test bodies.
+        """
+    )
+
     workflow: str = textwrap.dedent(
         """
         If `src/lib.c` is too large for your context, never sample it or read it front to back. Locate
@@ -176,9 +151,6 @@ class TestgenInstructions:
         **Never** give up early, test only a convenient subset, or leave a
         large subsystem unexamined. Source size, complexity, slow coverage growth, and repeated failures
         never justify narrowing the scope.
-
-        Call a branch unreachable only after reading its guard, tracing its public input path, and trying
-        the simplest safe input that satisfies it.
 
         # Workflow
         Read `{instrument_path}` once before editing so you understand every check, log, and reported
@@ -213,17 +185,18 @@ class TestgenInstructions:
         Prefer one call over a short chain and a short chain over a long one.
 
         ## Test readability
-        **Always** prefer more shorter and simpler tests over fewer, longer, and more complex ones,
+        **Always** prefer shorter and simpler tests over fewer, longer, and more complex ones,
         and prefer tests that use short, self-contained files over files containing an amalgamation of
         tested behaviors.
+
+        In `{collect_path}` and `{test_path}`, always append new tests below the marker.
         """
     )
 
-    collection: str = textwrap.dedent(
+    library_collection: str = textwrap.dedent(
         """
-        In `{collect_path}`, append below the marker and keep `use {lib_name}::*;` exactly as written. Call
-        public C functions through FFI. Record return values, output parameters, and mutations. Allocate
-        pointed-to data locally by idiomatically populating Rust `struct`s where needed.
+        Keep `use {lib_name}::*;` exactly as written. Call public C functions through FFI.
+        Record return values, output parameters, and mutations. Allocate pointed-to data locally by idiomatically populating Rust `struct`s where needed.
         Use NUL-terminated C strings. Do not hard-code addresses.
 
         Give every file test its own `sandbox("<test-name>")` and keep all paths inside it. Use `snapshot`
@@ -235,13 +208,14 @@ class TestgenInstructions:
 
     binary_collection: str = textwrap.dedent(
         """
-        Give every test that calls `main` its own `sandbox("<test-name>")` and invoke it only with
-        `run(&dir, ...)`. The helper uses that sandbox for both the working directory and `HOME` and
-        records its file effects. Keep every path inside the sandbox and preserve the helper's normalized
-        `<program>` placeholder.
+        Give every test its own `sandbox("<test-name>")` and invoke the program only with
+        `run(&dir, ...)`, which executes `main`; never import the library or call any FFI function. The helper uses
+        that sandbox for both the working directory and `HOME` and records its file effects.
+        Keep every path inside the sandbox and preserve the helper's normalized `<program>` placeholder.
 
         Record every program invocation in order. When file contents matter, read the relevant sandbox
-        files after the call and serialize that observation alongside the calls.
+        files after the call and serialize that observation alongside the calls. Finish each test with
+        one `save_case("<test-name>", &case)` containing every input and observed output.
         """
     )
 
@@ -251,8 +225,12 @@ class TestgenInstructions:
         values as Rust literals; never read `{json_dir}` or `{collect_path}` or use `serde` or `serde_json`.
         Replay calls in order and assert every return value, output, mutation, and file effect after each
         step. Assert unrelated values separately and do not omit or weaken an assertion to make a test pass.
+        """
+    )
 
-        Append below the marker and keep the statement `use {lib_name}::*;` **exactly** as written.
+    library_assertion: str = textwrap.dedent(
+        """
+        Keep the statement `use {lib_name}::*;` **exactly** as written.
         Reach C only through imported library items; never add raw `extern` declarations.
         Compare integers and booleans exactly, floats with a small relative epsilon,
         and pointed-to values rather than addresses.
@@ -265,6 +243,8 @@ class TestgenInstructions:
 
     binary_assertion: str = textwrap.dedent(
         """
+        Replay `main` only through `run(&dir, ...)`; never import the library, call any FFI
+        function directly, or add raw `extern` declarations. Give every test its own sandbox.
         After every `main` call, assert stdout, stderr, exit code, changed and removed paths,
         and no disk change where none was recorded.
         """
@@ -283,8 +263,8 @@ class TestgenInstructions:
     completion_early: str = textwrap.dedent(
         """
         You may call `finish` only once the inventory is exhausted: every item is tested and verified,
-        the coverage target is met, and every branch you left uncovered has been proven unreachable by
-        reading its guard and tracing its public input path. Difficulty, slow progress, a long
+        the coverage target is met, and every branch you left uncovered has been proven unreachable
+        without UB or memory leaks. Difficulty, slow progress, a long
         trajectory, repeated failures, and the number of passing tests never justify finishing; keep
         working item by item while any untested item or untried input remains.
 
@@ -310,9 +290,11 @@ class TestgenInstructions:
         introduction
         + library_scope
         + portability
+        + library_allocators
         + workflow
-        + collection
+        + library_collection
         + assertion
+        + library_assertion
         + completion
     )
     binary: str = (
@@ -320,7 +302,6 @@ class TestgenInstructions:
         + binary_scope
         + portability
         + workflow
-        + collection
         + binary_collection
         + assertion
         + binary_assertion
@@ -330,11 +311,6 @@ class TestgenInstructions:
 
 cs = ConfigStore.instance()
 cs.store(name="generate_io_tests", node=TestgenConfig)
-
-
-def get_tools(work_dir: Path):
-    useful_tools = UsefulTools(work_dir=str(work_dir))
-    return [useful_tools.Bash, useful_tools.Read, useful_tools.Edit, useful_tools.Write]
 
 
 def _wrapup_notice(collect_path: Path, test_path: Path) -> str:
@@ -350,17 +326,7 @@ def _wrapup_notice(collect_path: Path, test_path: Path) -> str:
 def _main(cfg: TestgenConfig) -> None:
     output_dir = Path(HydraConfig.get().runtime.output_dir)
     logger.info(f"Saving results to {output_dir}")
-
-    # Separately log the complete trajectory
-    logger_trajectory = logging.getLogger("ideas.agents.generate_io_tests.trajectory")
-    logger_trajectory.propagate = False
     trajectory_log = output_dir / f"testgen-{int(time.time())}.log"
-    fh = logging.FileHandler(trajectory_log)
-    fh.setFormatter(ConsoleTee.StripANSIFormatter("%(asctime)s %(message)s"))
-    logger_trajectory.addHandler(fh)
-    # Simultaneous print and log to file
-    printer = LoggingConsolePrinter(logger=logger_trajectory)
-    agent = TestgenAgent(name="C code reviewer")
 
     # -sys crate setup
     sys_crate = Crate(cfg.manifest, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
@@ -385,7 +351,8 @@ def _main(cfg: TestgenConfig) -> None:
             if entry.endswith(".log") or (entry.startswith(".") and entry != ".config")
         },
     )
-    work_crate = Crate(work_dir / "Cargo.toml")
+    work_crate = Crate(work_dir / "Cargo.toml", vcs="git")
+    work_crate.vcs.init(force_init=True)
 
     # Copy the crate pre-agent for verification under a random package and target name
     fresh_copy_parent = Path(tempfile.mkdtemp())
@@ -413,39 +380,35 @@ def _main(cfg: TestgenConfig) -> None:
         lib_name=lib_name or "",
     )
 
+    hurry_message = _wrapup_notice(collect_path, test_path)
+    prompt_dir = sys_root / ".prompt"
+
     # Expose the direct pristine verifier only while the agent is running.
-    agent.wrapup_steps = cfg.steps // 10
-    agent.wrapup_notice = _wrapup_notice(collect_path, test_path)
     with verification_service(work_crate, fresh_crate):
         try:
-            agent.run(
-                model_name=cfg.model,
-                prompt_template=task_description,
+            run_codex_agent(
+                task_description,
+                cfg.model,
+                work_dir,
+                trajectory_log,
+                prompt_dir=prompt_dir,
+                hurry_message=hurry_message,
+                allow_early_finish=TESTGEN_FINISH_EARLY,
                 max_steps=cfg.steps,
                 max_budget=cfg.budget,
-                tools=get_tools(work_dir),
-                printer=printer,
-                verbose=True,
             )
-        except BudgetExceededError as error:
-            message = f"Budget of ${cfg.budget} exhausted, keeping tests so far: {error}"
-            logger.warning(message)
-        except KISSError as error:
-            message = (
-                f"Agent {agent.name} completed {cfg.steps} steps without finishing: {error}"
-            )
-            logger.warning(message)
+        except CodexAgentError as error:
+            logger.warning(f"Codex did not finish cleanly, keeping tests so far: {error}")
 
     # Copy the generated tests back
     work_test_dir = work_dir / "tests"
-    sys_test_dir.mkdir(parents=True, exist_ok=True)
     for name in ("collect.rs", "io.rs"):
         src = work_test_dir / name
         if src.exists():
             shutil.copy2(src, sys_test_dir / name)
 
     sys_crate.vcs.init(force_init=True)
-    sys_crate.vcs.add(sys_test_dir / "collect.rs", sys_test_dir / "io.rs")
+    sys_crate.vcs.add(sys_test_dir / "collect.rs", sys_test_dir / "io.rs", prompt_dir)
     sys_crate.vcs.commit("Generated I/O equivalence tests")
 
     # Run post-agent verification on the copied tests
@@ -457,7 +420,7 @@ def _main(cfg: TestgenConfig) -> None:
 
 @hydra.main(version_base=None, config_name="generate_io_tests")
 def main(cfg: TestgenConfig) -> None:
-    _main(cfg)
+    _main(cast(TestgenConfig, OmegaConf.to_object(cfg)))
 
 
 if __name__ == "__main__":

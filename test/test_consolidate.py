@@ -11,15 +11,21 @@ from textwrap import dedent
 from itertools import permutations
 
 import json
+import re
+
+from clang.cindex import TranslationUnitLoadError
 
 from ideas import ast
 from ideas.ast import CodeC, create_symbol_lexical_key_fn
-from ideas.consolidate import create_ast_order, analyze, consolidate
-from ideas.tools import run_subprocess
+from ideas.consolidate import _bindgen, create_ast_order, analyze, consolidate
+from ideas.tools import Crate, run_subprocess
+
+# clang 23 warns when the newest GCC install lacks libstdc++ headers, which -Werror turns fatal
+CLANG = ["clang-23", "-Wno-gcc-install-dir-libstdcxx"]
 
 
 def compile_c(code: CodeC, flags: list[str]) -> tuple[bool, str]:
-    cmd = ["clang-21", *flags, "-march=native", "-c", "-x", "c", "-", "-o", "/dev/null"]
+    cmd = [*CLANG, *flags, "-march=native", "-c", "-x", "c", "-", "-o", "/dev/null"]
     success, output, error, _ = run_subprocess(cmd, input=str(code))
     return success, output + error
 
@@ -36,6 +42,45 @@ def _usr_by_spelling(symbols: dict[str, ast.Symbol], spelling: str) -> str:
         if symbol.spelling == spelling:
             return name
     raise AssertionError(f"Unable to find symbol with spelling: {spelling}")
+
+
+def _clippy_warnings(crate_dir: Path, lib_src: str) -> list[str]:
+    crate = Crate(crate_dir / "Cargo.toml", template="lib")
+    assert crate.lib_src_path is not None
+    crate.lib_src_path.write_text(lib_src)
+    clippy = crate.cargo_clippy()
+    assert clippy.success, clippy.output
+    return [d["rendered"] for d in clippy.diagnostics if d.get("level") == "warning"]
+
+
+def test_bindgen_output_is_clippy_clean(tmp_path: Path):
+    # C naming and bitfields make bindgen emit code that rustc and clippy warn about
+    c_src = tmp_path / "lib.c"
+    c_src.write_text(
+        dedent(
+            """
+            #define max_len 4
+            struct point { int xPos; int yPos; };
+            struct flags { unsigned a : 1; unsigned b : 3; };
+            int pointSum(struct point p, struct flags f) { return p.xPos + p.yPos + f.a; }
+            """
+        )
+    )
+    functions, variables = ["pointSum"], ["max_len"]
+
+    ok, raw, error, _ = run_subprocess(
+        [
+            "bindgen",
+            *(f for fn in functions for f in ("--allowlist-function", fn)),
+            *(f for var in variables for f in ("--allowlist-var", var)),
+            str(c_src),
+        ]
+    )
+    assert ok, error
+    assert _clippy_warnings(tmp_path / "raw", raw), "Expected raw bindgen output to warn"
+
+    bindings = _bindgen(c_src, allowlist_functions=functions, allowlist_vars=variables)
+    assert _clippy_warnings(tmp_path / "sys", bindings) == []
 
 
 def _write_compile_commands(tmp_path: Path, c_files: list[Path], extra_flags: str = "") -> Path:
@@ -75,7 +120,7 @@ def _build_tus(
     for tu in tus:
         ok, out, err, _ = run_subprocess(
             [
-                "clang-21",
+                *CLANG,
                 "-Wall",
                 "-Werror",
                 f"-I{base}",
@@ -289,7 +334,7 @@ def test_consolidation_places_typedef_before_struct_definition(tmp_path: Path):
     # Fully compile the TU to an object file (resolves thing.h/types.h).
     ok, out, err, _ = run_subprocess(
         [
-            "clang-21",
+            *CLANG,
             "-Wall",
             "-Werror",
             f"-I{tmp_path}",
@@ -496,7 +541,7 @@ def test_macro_wrapped_declaration(tmp_path: Path):
     # Fully compile the TU to an object file (resolves api.h).
     ok, out, err, _ = run_subprocess(
         [
-            "clang-21",
+            *CLANG,
             "-Wall",
             "-Werror",
             f"-I{tmp_path}",
@@ -873,7 +918,7 @@ def test_system_macro_double_expansion(tmp_path: Path):
 
     # Fully compile the TU to an object file (resolves <signal.h>).
     ok, out, err, _ = run_subprocess(
-        ["clang-21", "-Wall", "-Werror", "-c", str(main_c), "-o", str(tmp_path / "main.o")]
+        [*CLANG, "-Wall", "-Werror", "-c", str(main_c), "-o", str(tmp_path / "main.o")]
     )
     assert ok, f"main.c failed to compile:\n{out}{err}"
 
@@ -936,7 +981,7 @@ def test_cc_defines_preserved_in_consolidation(tmp_path: Path):
     # Fully compile the TU to an object file (needs the same -D feature macros).
     ok, out, err, _ = run_subprocess(
         [
-            "clang-21",
+            *CLANG,
             "-Wall",
             "-Werror",
             "-D_GNU_SOURCE",
@@ -1000,7 +1045,7 @@ def test_posix_c_source_preserved_in_consolidation(tmp_path: Path):
     # Fully compile the TU to an object file (needs the same -std/-D feature macros).
     ok, out, err, _ = run_subprocess(
         [
-            "clang-21",
+            *CLANG,
             "-Wall",
             "-Werror",
             "-std=c11",
@@ -1082,7 +1127,7 @@ def test_system_macro_undefs_preserve_benign_macros(tmp_path: Path):
 
     # Fully compile the TU to an object file (resolves the C stdlib headers).
     ok, out, err, _ = run_subprocess(
-        ["clang-21", "-Wall", "-Werror", "-c", str(main_c), "-o", str(tmp_path / "main.o")]
+        [*CLANG, "-Wall", "-Werror", "-c", str(main_c), "-o", str(tmp_path / "main.o")]
     )
     assert ok, f"main.c failed to compile:\n{out}{err}"
 
@@ -1132,7 +1177,7 @@ def test_source_level_defines_required_by_system_headers_preserved(tmp_path: Pat
 
     # Fully compile the TU to an object file (in-source #defines gate <pcre2.h>).
     ok, out, err, _ = run_subprocess(
-        ["clang-21", "-Wall", "-Werror", "-c", str(main_c), "-o", str(tmp_path / "main.o")]
+        [*CLANG, "-Wall", "-Werror", "-c", str(main_c), "-o", str(tmp_path / "main.o")]
     )
     assert ok, f"main.c failed to compile:\n{out}{err}"
 
@@ -1310,6 +1355,33 @@ def test_va_list_callback_keeps_typedef_spelling(tmp_path: Path):
 
     success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
     assert success, f"va_list callback types became incompatible:\n{error}"
+
+
+def test_builtin_library_functions_keep_spellable_size_t(tmp_path: Path):
+    # clang >= 22 prints builtin-merged declarations with `__size_t`, which is not a C type
+    [main_c] = _build_tus(
+        tmp_path,
+        {
+            "main.c": """\
+                #include <stdlib.h>
+                #include <string.h>
+                #include <stdio.h>
+                int entry(const char *s, char *buf) {
+                    char *p = malloc(strlen(s) + 1);
+                    memcpy(p, s, strlen(s) + 1);
+                    int n = strncmp(p, s, 4) + snprintf(buf, 8, "%s", p);
+                    free(p);
+                    return n;
+                }
+                """,
+        },
+    )
+
+    consolidated = consolidate_init(_write_compile_commands(tmp_path, [main_c]))
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, f"Consolidated builtin declarations do not compile:\n{error}"
+    assert "__size_t" not in str(consolidated), consolidated
 
 
 @pytest.fixture(scope="module")
@@ -2121,4 +2193,212 @@ def test_rename_does_not_take_a_spelling_a_tag_already_holds(
     assert success, (
         f"Consolidated code does not compile (rename collided with an existing tag):\n"
         f"{error}\n\nConsolidated output:\n{consolidated}"
+    )
+
+
+@pytest.fixture(scope="module")
+def builtin_typedef_tus(tmp_path_factory: pytest.TempPathFactory) -> list[Path]:
+    # Each TU writes its own copies, so they have distinct presumed paths and reach the
+    # rename check
+    return _build_tus(
+        tmp_path_factory.mktemp("builtin_typedef"),
+        {
+            "common.h": """\
+                typedef long long first;
+                typedef first second;
+                typedef double real;
+                """,
+            "a.c": """\
+                #include <stdint.h>
+                #include "common.h"
+
+                typedef uint8_t u8;
+                typedef short i16;
+                typedef first i64;
+                typedef double f64;
+                struct pair { u8 tag; i16 small; i64 value; f64 ratio; };
+
+                int use_a(struct pair *p) { return p->tag + p->small + (int)p->value; }
+                """,
+            "b.c": """\
+                #include "common.h"
+
+                typedef unsigned char u8;
+                typedef short int i16;
+                typedef second i64;
+                typedef real f64;
+                struct pair { u8 tag; i16 small; i64 value; f64 ratio; };
+
+                int use_b(struct pair *p) { return p->tag - p->small - (int)p->value; }
+                """,
+        },
+    )
+
+
+@pytest.mark.parametrize("order", permutations(["a.c", "b.c"]), ids="-".join)
+def test_builtin_typedefs_of_one_builtin_are_one_type(
+    builtin_typedef_tus: list[Path], order: tuple[str, ...]
+):
+    base = builtin_typedef_tus[0].parent
+    by_name = {tu.name: tu for tu in builtin_typedef_tus}
+
+    compile_commands = _write_compile_commands(
+        base, [by_name[n] for n in order], extra_flags=f"-I{base}"
+    )
+    consolidated = consolidate_init(compile_commands, source_priority=[])
+
+    text = str(consolidated)
+    for spelling in ("u8", "i16", "i64", "f64", "pair"):
+        assert f"a_{spelling}" not in text and f"b_{spelling}" not in text, consolidated
+    assert text.count(" u8;") == 1, consolidated
+    assert text.count(" i16;") == 1, consolidated
+    assert text.count(" i64;") == 1, consolidated
+    assert text.count(" f64;") == 1, consolidated
+    assert text.count("struct pair {") == 1, consolidated
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, (
+        f"Consolidated code does not compile:\n{error}\n\nConsolidated output:\n{consolidated}"
+    )
+
+
+@pytest.mark.parametrize(
+    "a_type, b_type",
+    [
+        # Same size and signedness, but distinct types whose pointers do not convert
+        ("long", "long long"),
+        ("char", "signed char"),
+        ("unsigned int", "int"),
+        ("double", "long double"),
+        # Same unqualified type, but the qualifier makes it a distinct type
+        ("const int", "int"),
+        # Same canonical type, but the attribute changes its alignment
+        ("int __attribute__((aligned(8)))", "int"),
+    ],
+    ids=[
+        "long-vs-long-long",
+        "char-vs-signed-char",
+        "unsigned-vs-signed",
+        "double-vs-long-double",
+        "const-vs-plain",
+        "aligned-attribute",
+    ],
+)
+def test_builtin_typedefs_of_different_types_are_renamed(
+    tmp_path: Path, a_type: str, b_type: str
+):
+    tus = _build_tus(
+        tmp_path,
+        {
+            "a.c": f"""\
+                typedef {a_type} word;
+
+                int use_a(word *w) {{ return (int)*w; }}
+                """,
+            "b.c": f"""\
+                typedef {a_type} word;
+
+                int use_b(word *w) {{ return (int)*w + 1; }}
+                """,
+            "c.c": f"""\
+                typedef {b_type} word;
+
+                int use_c(word *w) {{ return (int)*w + 2; }}
+                """,
+        },
+    )
+    compile_commands = _write_compile_commands(tmp_path, tus)
+    consolidated = consolidate_init(compile_commands, source_priority=[])
+
+    text = str(consolidated)
+    [a_word] = re.findall(r"int use_a\((\w+) \*w\)", text)
+    [b_word] = re.findall(r"int use_b\((\w+) \*w\)", text)
+    [c_word] = re.findall(r"int use_c\((\w+) \*w\)", text)
+    # Whether a.c and b.c share one name is pinned by the outlier xfail test
+    assert c_word not in (a_word, b_word), consolidated
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, (
+        f"Consolidated code does not compile:\n{error}\n\nConsolidated output:\n{consolidated}"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True, reason="Every copy of a disputed spelling is renamed, even ones that agree"
+)
+def test_agreeing_typedefs_share_one_rename_apart_from_the_outlier(tmp_path: Path):
+    tus = _build_tus(
+        tmp_path,
+        {
+            "a.c": """\
+                typedef long word;
+
+                int use_a(word *w) { return (int)*w; }
+                """,
+            "b.c": """\
+                typedef long word;
+
+                int use_b(word *w) { return (int)*w + 1; }
+                """,
+            "c.c": """\
+                typedef long long word;
+
+                int use_c(word *w) { return (int)*w + 2; }
+                """,
+        },
+    )
+    compile_commands = _write_compile_commands(tmp_path, tus)
+    consolidated = consolidate_init(compile_commands, source_priority=[])
+
+    text = str(consolidated)
+    [a_word] = re.findall(r"int use_a\((\w+) \*w\)", text)
+    [b_word] = re.findall(r"int use_b\((\w+) \*w\)", text)
+    [c_word] = re.findall(r"int use_c\((\w+) \*w\)", text)
+    assert a_word == b_word != c_word, consolidated
+    assert len(re.findall(r"typedef long (?:long )?\w+;", text)) == 2, consolidated
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, (
+        f"Consolidated code does not compile:\n{error}\n\nConsolidated output:\n{consolidated}"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=TranslationUnitLoadError,
+    reason="Renaming the anonymous struct's typedef yields sources that no longer parse",
+)
+@pytest.mark.parametrize("order", permutations(["a.c", "b.c"]), ids="-".join)
+def test_struct_with_builtin_equivalent_fields_is_not_renamed(
+    tmp_path: Path, order: tuple[str, ...]
+):
+    tus = _build_tus(
+        tmp_path,
+        {
+            "a.c": """\
+                #include <stdint.h>
+
+                typedef struct { int32_t i; } s;
+
+                int use_a(s *p) { return p->i; }
+                """,
+            "b.c": """\
+                typedef struct { int i; } s;
+
+                int use_b(s *p) { return p->i + 1; }
+                """,
+        },
+    )
+    by_name = {tu.name: tu for tu in tus}
+    compile_commands = _write_compile_commands(tmp_path, [by_name[name] for name in order])
+    consolidated = consolidate_init(compile_commands, source_priority=[])
+
+    text = str(consolidated)
+    assert "int use_a(s *p)" in text, consolidated
+    assert "int use_b(s *p)" in text, consolidated
+    assert text.count("} s;") == 1, consolidated
+
+    success, error = compile_c(consolidated, flags=["-Wall", "-Werror"])
+    assert success, (
+        f"Consolidated code does not compile:\n{error}\n\nConsolidated output:\n{consolidated}"
     )

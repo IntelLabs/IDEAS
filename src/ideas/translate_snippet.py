@@ -8,193 +8,117 @@ import logging
 import sqlite3
 from pathlib import Path
 from dataclasses import dataclass
-
-import dspy
+from collections.abc import Mapping
 
 from .ast import CodeC
 from .ast_rust import CodeRust
-from .refine import CodeAttempt, Feedback, PredictSession
-from .model import predict
+from .codex import CodexConfig, build_prompt, run_codex
+from .refine import GeneratedAttempt, Feedback, PredictSession
+from .model import Generation, ModelConfig
 
 
 logger = logging.getLogger("ideas.translate_snippet")
 
 
-class SnippetTranslatorSignature(dspy.Signature):
-    r"""
-    Generate an idiomatic, memory-safe Rust translation of a single C definition.
+SNIPPET_INSTRUCTIONS = """\
+# Task
 
-    # Inputs
+Translate exactly `snippet` into idiomatic, memory-safe Rust with the same observable
+behavior as the original C. Return only this symbol group and still-missing types it
+requires; do not translate unrelated functions. Treat `feedback`, `build_feedback`, and
+`scope_feedback` as evidence about the prior attempt and fix their root causes.
 
-    - `reference_code`: Existing Rust code the translation must build on. Use it as-is; do not refactor it.
-    - `snippet`: The single C definition to translate.
-    - `dependent_code`: C code that uses the snippet. Use it to determine concrete types for opaque and void pointers, ownership, lifetimes, and memory-management requirements; do not translate it.
-    - `prior_translation`: a previous translation to fix, if any.
-    - `feedback`: a critique of `prior_translation` from running the program it was part of. Address it in the new translation.
-    - `build_feedback`: errors from `cargo build`. Address them.
-    - `scope_feedback`: violations of the hard constraints below. Address them.
+# Crate constraints
 
-    # Hard constraints
+This crate is a standalone safe Rust implementation of the C program, with no raw
+pointers, foreign ABIs, or `libc`. A separate hybrid crate later exposes it to C under
+the original interface. That crate only converts values at each call and cannot supply
+behavior, so every effect C code can observe must happen here and be reachable through
+these types and functions, never through a `thread_local!` or other side table keyed by an
+object's identity, which the hybrid's per-call conversion cannot follow. Declare every
+item and field you emit `pub`, whatever its C linkage: the hybrid calls each function and
+names each type. Use only the existing dependencies and, when required, these additional
+crates:
+{crates}
 
-    - The translation must contain no `unsafe` constructs.
-    - Do not include `#![forbid(unsafe_code)]` in the translation since it is included by default.
-    - Do not define any `impl` blocks.
-    - Define all top-level items (functions, structs, enums, type aliases, constants, statics, unions, traits, and modules) as fully public using plain `pub` (e.g., `pub fn ...`, `pub struct ...`). Also define every field of a top-level struct as `pub`, including unnamed fields in tuple structs (e.g., `pub struct Pair(pub i32, pub i32)`). Do not use restricted visibility such as `pub(crate)` or `pub(super)` anywhere; use only `pub`.
-    - Do not weaken behavior with stubs, fallback defaults, relaxed assertions, or intentionally partial implementations.
-    - Do not annotate any type with `#[repr(C)]`; the translation does not need C ABI compatibility.
-    - Do not add `#[derive(...)]` attributes; they generate `impl` blocks and may impose behavior (e.g., `Default`, `Clone`) that does not match C semantics.
-    - If the snippet references a C type not yet present in `reference_code`, include a correct translation of that type in the output so the translation compiles. Derive the referenced type's translation from `dependent_code` and any context visible in the snippet itself. Its translation will be reused as-is when the type's own snippet is processed later.
+The existing prefix of the Rust crate translated so far is immutable and was already
+accepted for earlier symbols. It is the only translation: a C-layout definition anywhere
+else, such as raw-pointer bindings in a `-sys` crate, is a C declaration, so a type found
+only there still needs its translation here.
 
-    # Faithfulness to C semantics
+# Representing C
 
-    The overarching rule: reproduce the C code's runtime behavior exactly. Do not "fix", simplify, or second-guess the C code's intent. For type definitions, use idiomatic Rust types that are semantically equivalent rather than structurally identical. A Rust `std` method whose name resembles a C library function is rarely a drop-in for it; derive the behavior from the C function's definition rather than from the `std` method that matches its name.
+The first translation of a type is final, so first search the C for every place that
+allocates, embeds, casts, or frees it, and choose one the hybrid can map to and from every
+C state:
+- **Pointers and buffers.** A pointer becomes an `Option` where C allows NULL; memory C
+  treats as raw bytes (`memset`, `memcpy`, byte offsets) is held here as bytes, and a
+  pointer into it becomes an index or offset, but a struct C casts onto those bytes is a
+  typed value, and a pointer it holds to another block is a handle; an array of pointers
+  or typed values is a `Vec` of their translations, even where C moves it with `memmove`;
+  an object that several pointers share, or that C hands out and later takes back, becomes
+  a shared handle (`Rc`, `Weak` for back-pointers, or an arena index) so its identity
+  survives.
+- **Embedded structs.** A struct embedded in others and recovered from its address
+  (`offsetof`, `container_of`) links those containers: each link must keep its container
+  alive while linked (a strong handle to it, or an index into an arena that owns them,
+  never a `Weak`), so every container field stays reachable from a link, even when the
+  containing struct is not in this group: declare it now as a still-missing type the link
+  requires.
+- **`void *`.** A `void *` this code only stores and passes on stays an opaque shared
+  handle; give it a concrete type only where this C casts it to one, the same type every
+  producer stores: a `T *` to one object becomes a handle to that `T`, not a collection.
+  Downcast to exactly the type that was erased: an `Rc<RefCell<T>>` stored as
+  `Rc<dyn Any>` downcasts to `RefCell<T>`.
+- **Callbacks and allocators.** A function pointer stays a callable value, stored where C
+  stores it and called exactly where C calls it, with arguments that identify the C values
+  it was given (a pointer to a key, value, or other object the C code stores passes that
+  object's handle, never a copy of its bytes), and with no `RefCell` borrow or lock held
+  across the call, since it may reach any object C can. A configured allocator is such a
+  callback: each block it returns is an opaque token, kept in a field of the object that
+  occupies the block (including an object's own block), beside that object's data, never
+  holding it, and passed to the configured free where C frees it, and a failed allocation
+  takes C's failure path.
+- **Fields.** Keep every field C code can read or write, with its C meaning: a length is
+  not a capacity, and a size C returns or allocates is the C type's size, not a Rust
+  `size_of`.
+- **Globals.** A mutable C global becomes a `static` holding an atomic or a `Mutex`, so
+  safe code can read and write it; never `static mut`, which safe code cannot touch.
+- **Strings.** Represent a C string the way the crate already does, with or without its
+  NUL, and write a literal passed as a C string the same way.
+- **Variadics.** A variadic function or one taking a `va_list` is translated like any
+  other. Give its variable arguments a safe parameter type of your choosing; the wrapper
+  reads them from C and passes them in.
+- **`main`.** C `main` becomes `pub fn main()`, the program's entry point: it reads its
+  arguments from `std::env::args_os()` and, after flushing standard output, exits with C's
+  status.
 
-    ## Arithmetic and expressions
+# Prior attempt
 
-    - Treat all C integer arithmetic as wrapping. Use Rust's wrapping methods (`wrapping_add`, `wrapping_sub`, `wrapping_shr`, etc.).
-    - Rust postfix operators (method calls, field access, indexing) bind tighter than unary operators (`-`, `!`), infix operators (`+`, `-`, `&`, `|`, `^`), and casts (`as`).
-    - General receiver rule for postfix chaining: whenever the receiver is anything other than a simple identifier/path, parenthesize the full receiver first, then chain as `(EXPR).method(...)`, `(EXPR).field`, `(EXPR)[idx]`. Apply this uniformly to literals, unary expressions (including unary `-`), casts, and compound expressions; never rely on implicit precedence for the receiver.
-    - Preserve C operator precedence and associativity exactly.
-    - Preserve C's implicit signed/unsigned conversion behavior in mixed expressions and comparisons.
-    - Implement bitwise operations (especially rotations and byte/bit shuffles) literally as written. Do not infer "intent" such as byte-swapping.
-    - Reproduce inequality direction in bounds and length guards exactly (`>` vs `<`, `>=` vs `<=`). An inverted guard reverses the safety behavior.
+`prior_translation`, when nonempty, is the complete rejected candidate for this symbol
+group: replace it as a whole. Do not treat it as another immutable prefix, append a
+second implementation after it, or return a patch. The new output must contain exactly
+one complete definition of each requested symbol. `feedback` was produced with
+`prior_translation` appended to the crate, so a line it cites past the immutable prefix
+points into `prior_translation`.
 
-    ## Integer text parsing
+# Before returning
 
-    - Accept the full range of C-valid inputs, including negatives that wrap into unsigned types (`-1i32 as u8 == 255`).
-    - Always parse into a wide intermediate type that can represent the full C-valid input range before the final wrapping cast (at minimum `i64` for both narrow signed and narrow unsigned targets; `u64` is also acceptable where appropriate for unsigned-only flows), then apply a wrapping cast to the destination. Never parse digits directly as a narrow or unsigned destination type, because that path rejects negatives and can overflow before the wrapping cast can run.
-    - When the C code uses `scanf`/`sscanf`-style conversion, accept a leading numeric prefix and ignore trailing non-digit characters. Do not use bare `str::parse::<T>()` on the full trimmed string.
+Compare the result statement by statement with C, and trace each allocation, mutation,
+and callback through construction, use, failure, and destruction.
+"""
 
-    ## scanf / sscanf behavior
 
-    - Distinguish conversion failure (no match) from EOF; do not collapse them.
-    - On conversion failure, leave destination variables holding their prior values. Declare such variables as `mut` bindings *outside* any retry loop so they retain their last successful value.
-    - On conversion failure, do not advance the input position; the unmatched bytes must remain available for the next read.
-    - Respect field widths and scansets exactly.
-
-    ## Strings and NUL termination
-
-    - Treat any length-sensitive operation on a C string buffer (`strlen`, `%s`-style usage, comparisons, hashing, etc.) as ending at the first NUL byte.
-    - For pointer+length inputs, classify semantics before decoding: if the C code treats the data as a string (`strcmp`, `strlen`, `%s`, token parsing, command dispatch, pattern matching), normalize at ingress by truncating at the first `\0`; if the C path is fixed-length or binary, preserve embedded `\0` bytes and honor the explicit length.
-    - When converting a NUL-terminated C string buffer into a Rust `String` for storage or downstream text processing, truncate at the first `\0` *at the point of conversion*, not at the point of use. Stored string values that model C strings must never contain bytes at or after the NUL.
-    - Before any comparison, pattern match, token parse, or command dispatch on C-origin string data, normalize at ingress by truncating at the first NUL byte.
-    - Apply the same normalization policy to all operands in the same logical operation. Do not compare a length-decoded value that still includes trailing `\0` bytes against a C-string-decoded value already truncated at `\0`.
-    - When both pointer and length are present for string-style data, use length only as a safety bound for reads; derive semantic content from C string termination and stop at the first `\0`.
-    - Truncate once at the ingestion boundary and pass only normalized string values to downstream logic. Do not defer truncation to arbitrary leaf helpers when values are stored or reused across operations.
-    - Do not compare raw decoded Rust `String` values that may include trailing NUL bytes when those values represent C strings.
-    - This rule applies only when the original C code is treating the data as a NUL-terminated string (for example `strlen`, `%s`, string comparison, or string parsing). Do not truncate fixed-length, length-delimited, or binary buffers merely because they may contain `\0`; preserve embedded NUL bytes unless the C code's semantics require string termination.
-
-    ## Fixed-buffer line input (`fgets`)
-
-    - Do not replace `fgets(buf, N, stdin)` with `read_line` or a bulk `io::stdin().read()`. Both consume too much input.
-    - Replicate `fgets`: read at most N-1 bytes, stop after the first `'\n'`, and leave all remaining input in stdin. Read byte-by-byte or use `BufRead::fill_buf` + `consume`.
-    - When storing or comparing `fgets` output as a Rust `String`, truncate at the first `'\n'` or `'\0'`, whichever comes first. `fgets` retains the newline before the NUL, and keeping it breaks C-style trimmed comparisons.
-
-    ## Return values and pointer arithmetic
-
-    - Return exactly what the C function returns. If C returns a success/failure code, do not substitute a byte count or length.
-    - C `main`'s return value becomes the process exit status, and a Rust `main` that returns `()` always exits 0. Translate a C `main` that can return non-zero as `pub fn main() -> std::process::ExitCode`, or call `std::process::exit` on those paths. Writing the error message to stderr without also setting the status is not a faithful translation.
-    - C pointer subtraction (`end - start`) yields a count of elements, not bytes. Preserve the exact value.
-
-    ## Pointer identity
-
-    - When C compares pointers for identity, compare identity-equivalent Rust references. Cloning or copying changes identity and breaks the comparison.
-    - Translate a C function that returns a pointer into a global/static container (e.g., `return &table[i]`) as a function returning `&T` into that container, not an owned clone.
-    - If the container is locked: acquire the lock in the caller and borrow `&T` from the held guard. If the existing accessor locks internally and returns an owned value, the caller must bypass it: lock the container directly, borrow references from the guard, and finish all identity comparisons before releasing.
-
-    ## Void pointers (`void *`)
-
-    - A `void *` field or parameter is not inherently polymorphic. Inspect `dependent_code` to find every cast applied to the value. If all casts resolve to the same concrete type, translate the field using that concrete type (e.g., `Option<Box<ConcreteType>>`). Do not use `Box<dyn Any>`, `Box<dyn Trait>`, or any other type-erasure mechanism unless the pointer is genuinely polymorphic, i.e., cast to multiple structurally unrelated types in different code paths.
-    - A `void *` used solely to break a forward-declaration cycle is not polymorphic. Resolve the concrete type from the casts and use it directly.
-    - When the `void *` is nullable in C (compared to `NULL`, initialized to `0`, or conditionally assigned) and null is how C marks the field absent (see "What `Option` means"), translate it as `Option<Box<T>>` if the containing struct owns the allocation (evidenced by `free` being called through this field), or as `Option<&T>` / `Option<&mut T>` if it is a non-owning reference.
-
-    ## Pointer fields in structs (`T *`, `T **`)
-
-    Determine ownership from `dependent_code` before choosing a Rust type:
-
-    - If `free(field)` or equivalent is called through the struct, the struct owns the pointee. Use `Box<T>` for a single value or `Vec<T>` for a heap-allocated array. Wrap in `Option<...>` only if null is how C marks this field absent (see "What `Option` means").
-    - If the pointer is never freed through the struct (it aliases data owned elsewhere): use `&T` or `&mut T` with an appropriate lifetime.
-    - If the field stores a heap array whose length is tracked separately (a C dynamic array): use `Vec<T>`, not `Box<[T]>`.
-    - If the field is a fixed-length C array (`T arr[N]`): use `[T; N]`.
-    - Do not use raw pointers (`*mut T`, `*const T`) as a shortcut when a safe owned or borrowed type is available.
-
-    ## What `Option` means
-
-    - When a field becomes `Option<...>`, `None` must correspond to exactly the condition the C code tests for absence. Find that test in `dependent_code` before choosing the type. It is often a null pointer, but it may equally be a sentinel index, a zero length or count, a tag selecting a union member, or a bit in a sibling flags word. An `Option` whose `None` means "the pointer was null" when C means "the bitmap says this slot is empty" is a different type, and every consumer of it will be wrong.
-    - Do not encode the same fact twice. If a sibling field already carries the validity, occupancy, or length information, keep that field authoritative and leave the governed field non-optional. A struct holding two encodings of one fact that can disagree has no correct interpretation.
-
-    ## Mutable global state and locking
-
-    - Never lock the same mutex/`RwLock` more than once in a single expression.
-    - Acquire one guard, read/compute/write through it, then release.
-    - Do not call helpers that acquire a lock (including stdin's implicit lock) from a scope that already holds that lock. Pick one locking model per code path.
-
-    ## Binary parsers and slice contracts
-
-    - Validate every length-derived slice with an explicit bounds check before slicing or copying.
-    - Never reinterpret payload bytes as headers, and never re-derive a chunk's length by re-parsing its payload; instead use `slice.len()` on the bytes the helper was given.
-    - When consuming bytes from a state-machine bitreader/bytestream, read directly from the reader. Do not reconstruct a backing slice and index into it; reconstructed slices may be short.
-    - When the C source reads sequentially from a composite buffer (e.g., a primary `&[u32]` plus a trailing partial word), iterate through every component in order. Do not read only the primary array and silently drop the tail.
-
-    ## Auxiliary state introduced by the translation
-
-    If the translation introduces an auxiliary data structure (thread-local, `HashMap`, `RefCell<Vec<_>>`, etc.) to represent metadata that C tracked via struct fields or raw pointers, every function that conceptually reads or writes that metadata in C must read or write the auxiliary structure in Rust. A stub claiming the data is "not accessible in safe Rust" is never acceptable once such a mechanism exists.
-
-    ## C primitive type mappings
-
-    Use the following canonical mappings:
-
-    - `char` (used as integer) → `i8`; `unsigned char` → `u8`
-    - `short` → `i16`; `unsigned short` → `u16`
-    - `int` → `i32`; `unsigned int` → `u32`
-    - `long` → `i64`; `unsigned long` → `u64`
-    - `long long` → `i64`; `unsigned long long` → `u64`
-    - `float` → `f32`; `double` → `f64`
-    - `size_t` → `usize`; `ptrdiff_t` → `isize`
-    - `intptr_t` → `isize`; `uintptr_t` → `usize`
-    - `int8_t`/`uint8_t` → `i8`/`u8`; `int16_t`/`uint16_t` → `i16`/`u16`; `int32_t`/`uint32_t` → `i32`/`u32`; `int64_t`/`uint64_t` → `i64`/`u64`
-    - `char *` used as a string: see "Strings and NUL termination".
-
-    ## C typedefs and forward declarations
-
-    - A typedef that merely names an existing struct (`typedef struct Foo Foo;`) carries no information and should be omitted.
-    - An anonymous struct typedef (`typedef struct { ... } Foo;`) translates to `pub struct Foo { ... }`.
-    - A scalar typedef (`typedef unsigned int foo_t;`) translates to `pub type FooT = u32;`.
-    - A function-pointer typedef (`typedef int (*cmp_fn)(int, int);`) translates to `pub type CmpFn = fn(i32, i32) -> i32;`.
-    - Forward struct declarations (`struct Foo;`) are not translated; they become concrete when the full definition's snippet is processed.
-
-    ## C enums
-
-    - A C enum whose values are used as integers (assigned to integer variables, used in arithmetic, or used as array indices) translates to a group of `pub const` items with the appropriate integer type (default `i32`). Do not translate such enums as Rust `enum` variants; Rust enums are not freely interchangeable with integers.
-    - A C enum whose values are used exclusively in switch/pattern-match contexts and never mixed with integers may be translated as a Rust `enum`.
-    - Anonymous C enums (`enum { A = 0, B, C };`) follow the same rules; omit the type name.
-
-    ## Observable output
-
-    - Reproduce stdout/stderr text, spacing, punctuation, and line breaks exactly.
-    - When the C source contains multi-byte UTF-8 literals (e.g., box-drawing characters), count Unicode scalar values, not bytes. Reproduce the same number of code points.
-
-    # Allowed External Crates
-
-    - `openssl`: OpenSSL bindings
-    - `flate2`: DEFLATE compression and decompression exposed as Read/BufRead/Write streams. Supports miniz_oxide and multiple zlib implementations. Supports zlib, gzip, and raw deflate streams.
-    - `regex`: An implementation of regular expressions for Rust. This implementation uses finite automata and guarantees linear time matching on all inputs.
-
-    Use functions from these crates, as needed, to translate the C code to equivalent, memory-safe Rust.
-    """
-
-    reference_code: CodeRust = dspy.InputField()
-    snippet: CodeC = dspy.InputField()
-    dependent_code: CodeC = dspy.InputField()
-    prior_translation: CodeRust = dspy.InputField()
-    feedback: str = dspy.InputField()
-    build_feedback: str = dspy.InputField()
-    scope_feedback: str = dspy.InputField()
-    translation: CodeRust = dspy.OutputField()
+def snippet_instructions(deps: Mapping[str, str]) -> str:
+    crates = "\n".join(
+        f"- `{name}`: {' '.join(desc.split())}" if desc else f"- `{name}`"
+        for name, desc in deps.items()
+    )
+    return SNIPPET_INSTRUCTIONS.format(crates=crates or "- none")
 
 
 @dataclass(kw_only=True)
-class TranslationAttempt(CodeAttempt):
+class TranslationAttempt(GeneratedAttempt):
     translation: CodeRust
     name: str
     snippet: CodeC
@@ -210,11 +134,10 @@ class TranslationSession(PredictSession[TranslationAttempt, CodeRust]):
     translator: "SnippetTranslator"
     name: str
     crate_code: CodeRust
-    reference_code: CodeRust
     snippet: CodeC
-    dependent_code: CodeC
     prior_translation: CodeRust | None = None
     feedback: Feedback = Feedback()
+    deterministic_translation: CodeRust | None = None
 
     @property
     def _max_iters(self) -> int:
@@ -228,101 +151,143 @@ class TranslationSession(PredictSession[TranslationAttempt, CodeRust]):
         # Special case for empty snippets: fall back to a static comment
         if not str(self.snippet):
             return CodeRust(f"// Empty snippet `{self.name}`")
-        translation = _read_cache(self.translator.cache, self.name, self.snippet)
-        return _make_public(translation) if translation is not None else None
+        if self.deterministic_translation is not None:
+            logger.info(f"Deterministic translation for snippet `{self.name}`")
+            return self.deterministic_translation
+        return _read_cache(self.translator.cache, self.name, self.snippet)
 
     def _attempt(
         self, prior: TranslationAttempt | None, replay: CodeRust | None
     ) -> TranslationAttempt:
-        if prior is None:
+        # A failed deterministic translation is not a prior attempt for the model to fix
+        if prior is None or prior.translation == self.deterministic_translation:
             feedback, prior_translation = self.feedback, self.prior_translation
         else:
             feedback, prior_translation = prior.next_feedback, prior.translation
-        pred = self.translator.translate(
-            reference_code=self.reference_code,
+        gen = self.translator.translate(
             snippet=self.snippet,
-            dependent_code=self.dependent_code,
             prior_translation=prior_translation,
             feedback=feedback.review,
             build_feedback=feedback.build,
+            lint_feedback=feedback.lint,
             scope_feedback=feedback.scope,
             translation=replay,
         )
 
-        translation = pred.translation
-        assert isinstance(translation, CodeRust)
-        if translation in self.crate_code:
+        # A turn that came back without a translation leaves the caller nothing to build
+        translation = gen.code or CodeRust()
+        # Every crate contains the empty translation, so only a real one can be a duplicate
+        if translation and translation in self.crate_code:
             translation = CodeRust(f"// duplicate snippet `{self.name}` detected")
         if translation == prior_translation:
             logger.warning("Snippet translation loop detected!")
         return TranslationAttempt(
             translation=translation,
-            pred=pred,
+            gen=gen,
             prior_feedback=feedback,
             name=self.name,
             snippet=self.snippet,
         )
 
 
-class SnippetTranslator(dspy.Module):
+class SnippetTranslator:
     def __init__(
         self,
-        translator: type[dspy.Module],
-        max_iters: int = 5,
         cache: Path | None = None,
+        *,
+        codex: CodexConfig,
+        model: ModelConfig,
+        workdir: Path,
+        rust_src: Path,
+        c_src: Path,
+        max_iters: int = 5,
+        deps: Mapping[str, str] | None = None,
     ):
-        super().__init__()
-        signature = SnippetTranslatorSignature
-        self._translate = translator(signature)
         self.max_iters = max_iters
         self.cache = _init_cache(cache)
+        self._codex = codex
+        self._model = model
+        self._workdir = workdir
+        self._rust_src = rust_src
+        self._c_src = c_src
+        self._instructions = snippet_instructions(deps or {})
+
+    def translate(
+        self,
+        *,
+        snippet: CodeC,
+        prior_translation: CodeRust | None,
+        feedback: str,
+        build_feedback: str,
+        lint_feedback: str,
+        scope_feedback: str,
+        translation: CodeRust | None,
+    ) -> Generation:
+        if translation is not None:
+            return Generation(code=translation)
+
+        inputs = {
+            "snippet": snippet,
+            "prior_translation": prior_translation or CodeRust(),
+            "feedback": feedback,
+            "build_feedback": build_feedback,
+            "lint_feedback": lint_feedback,
+            "scope_feedback": scope_feedback,
+        }
+        # Codex runs with `--cd workdir`, so the prompt names files relative to it
+        rust_src = str(self._rust_src.relative_to(self._workdir))
+        c_src = str(self._c_src.relative_to(self._workdir))
+        files = {
+            rust_src: (
+                "the Rust crate translated so far, and the only place a symbol counts as "
+                "translated. Search it for the items your translation references; your "
+                "output is appended to this file and must compile against it."
+            ),
+            c_src: (
+                "the original C. Search it for the callers of the snippet and for any "
+                "definition the snippet references. A definition already translated "
+                "appears here as an extern declaration; read that one from the Rust crate."
+            ),
+        }
+        # A binary's `-sys` executable cannot link once symbols are wrapped
+        package = self._rust_src.parent.parent.name
+        prompt = build_prompt(
+            self._instructions,
+            inputs,
+            files,
+            rust_src,
+            build_cmd=f"cargo build -p {package}",
+            lint_cmd=f"cargo clippy --lib -p {package}",
+            task="translate",
+        )
+        restore = [self._rust_src, self._c_src]
+        result = run_codex(
+            prompt, self._codex, self._model, self._workdir, restore, self._rust_src
+        )
+        return result.as_generation(prompt, self._model.name)
 
     def session(
         self,
         name: str,
         crate_code: CodeRust,
-        reference_code: CodeRust,
         snippet: CodeC,
-        dependent_code: CodeC,
         prior_translation: CodeRust | None = None,
         feedback: Feedback = Feedback(),
+        deterministic_translation: CodeRust | None = None,
     ) -> TranslationSession:
         return TranslationSession(
             translator=self,
             name=name,
             crate_code=crate_code,
-            reference_code=reference_code,
             snippet=snippet,
-            dependent_code=dependent_code,
             prior_translation=prior_translation,
             feedback=feedback,
+            deterministic_translation=deterministic_translation,
         )
-
-    def translate(
-        self,
-        reference_code: CodeRust,
-        snippet: CodeC,
-        dependent_code: CodeC,
-        prior_translation: CodeRust | None,
-        feedback: str,
-        build_feedback: str,
-        scope_feedback: str,
-        translation: CodeRust | None,
-    ) -> dspy.Prediction:
-        inputs = {
-            "reference_code": reference_code,
-            "snippet": snippet,
-            "dependent_code": dependent_code,
-            "prior_translation": prior_translation or CodeRust(),
-            "feedback": feedback,
-            "build_feedback": build_feedback,
-            "scope_feedback": scope_feedback,
-        }
-        return predict(self._translate, inputs, "translation", translation)
 
     def write_cache(self, attempt: TranslationAttempt) -> None:
         # Re-caching a cache hit would just duplicate the entry it came from
-        if attempt.success and attempt.pred.get("was_generated", False):
+        if attempt.success and attempt.gen.was_generated:
             _write_cache(self.cache, attempt.name, attempt.snippet, attempt.translation)
 
 
@@ -370,212 +335,6 @@ def _read_cache(cache: Path | None, name: str, snippet: CodeC) -> CodeRust | Non
     else:
         logger.info(f"Cache miss for snippet `{name}`")
         return None
-
-
-def _make_public(translation: CodeRust) -> CodeRust:
-    source = str(translation)
-    from typing import Any
-    from tree_sitter import Language, Parser, Query, QueryCursor
-    from tree_sitter_rust_orchard import language as rust_language
-
-    language = Language(rust_language())
-    parser = Parser(language)
-    tree = parser.parse(source.encode("utf-8"))
-    query = Query(
-        language,
-        """
-        (function_item
-          (visibility_modifier)? @vis
-          "fn" @fn_kw
-        ) @item
-
-        (struct_item
-          (visibility_modifier)? @vis
-          "struct" @kw
-        ) @item
-
-        (type_item
-          (visibility_modifier)? @vis
-          "type" @kw
-        ) @item
-
-        (enum_item
-          (visibility_modifier)? @vis
-          "enum" @kw
-        ) @item
-
-        (static_item
-          (visibility_modifier)? @vis
-          "static" @kw
-        ) @item
-
-        (union_item
-          (visibility_modifier)? @vis
-          "union" @kw
-        ) @item
-
-        (const_item
-          (visibility_modifier)? @vis
-          "const" @kw
-        ) @item
-
-        (trait_item
-          (visibility_modifier)? @vis
-          "trait" @kw
-        ) @item
-
-        (mod_item
-          (visibility_modifier)? @vis
-          "mod" @kw
-        ) @item
-
-        (struct_item
-          body: (field_declaration_list
-            (field_declaration
-              (visibility_modifier)? @field_vis
-              (field_identifier) @field_name
-            ) @field
-          )
-        ) @struct
-
-        """,
-    )
-
-    by_item: dict[tuple[int, int], dict[str, Any]] = {}
-    by_field: dict[tuple[int, int], dict[str, Any]] = {}
-    item_types = {
-        "function_item",
-        "struct_item",
-        "type_item",
-        "enum_item",
-        "static_item",
-        "union_item",
-        "const_item",
-        "trait_item",
-        "mod_item",
-    }
-
-    cursor = QueryCursor(query)
-    captures = cursor.captures(tree.root_node)
-    for capture_name, nodes in captures.items():
-        for node in nodes:
-            if capture_name == "item":
-                key = (node.start_byte, node.end_byte)
-                by_item.setdefault(key, {"item": node, "vis": None, "kw": None})
-                continue
-
-            if capture_name == "field":
-                key = (node.start_byte, node.end_byte)
-                by_field.setdefault(key, {"field": node, "vis": None, "name": None})
-                continue
-
-            parent = node.parent
-            while parent is not None and parent.type not in item_types | {
-                "field_declaration",
-            }:
-                parent = parent.parent
-            if parent is None:
-                continue
-
-            if parent.type == "field_declaration":
-                key = (parent.start_byte, parent.end_byte)
-                entry = by_field.setdefault(key, {"field": parent, "vis": None, "name": None})
-                if capture_name == "field_vis":
-                    entry["vis"] = node
-                elif capture_name == "field_name":
-                    entry["name"] = node
-                continue
-
-            key = (parent.start_byte, parent.end_byte)
-            entry = by_item.setdefault(key, {"item": parent, "vis": None, "kw": None})
-            if capture_name == "vis":
-                entry["vis"] = node
-            elif capture_name in {"fn_kw", "kw"}:
-                entry["kw"] = node
-
-    edits: list[tuple[int, int, bytes]] = []
-    source_bytes = source.encode("utf-8")
-
-    for entry in by_item.values():
-        item_node = entry["item"]
-        vis_node = entry["vis"]
-        kw_node = entry["kw"]
-
-        # Only rewrite module-level items.
-        if item_node.parent is None or item_node.parent.type != "source_file":
-            continue
-
-        if vis_node is None:
-            if kw_node is None:
-                continue
-            edits.append((kw_node.start_byte, kw_node.start_byte, b"pub "))
-            continue
-
-        vis_text = source_bytes[vis_node.start_byte : vis_node.end_byte].strip()
-        if vis_text != b"pub":
-            edits.append((vis_node.start_byte, vis_node.end_byte, b"pub"))
-
-    for entry in by_field.values():
-        field_node = entry["field"]
-        vis_node = entry["vis"]
-        name_node = entry["name"]
-
-        # Only rewrite fields of top-level structs.
-        struct_node = field_node.parent
-        while struct_node is not None and struct_node.type != "struct_item":
-            struct_node = struct_node.parent
-        if struct_node is None or struct_node.parent is None:
-            continue
-        if struct_node.parent.type != "source_file":
-            continue
-
-        if vis_node is None:
-            if name_node is None:
-                continue
-            edits.append((name_node.start_byte, name_node.start_byte, b"pub "))
-            continue
-
-        vis_text = source_bytes[vis_node.start_byte : vis_node.end_byte].strip()
-        if vis_text != b"pub":
-            edits.append((vis_node.start_byte, vis_node.end_byte, b"pub"))
-
-    # Handle tuple struct fields programmatically: tree-sitter-rust has no
-    # "ordered_field_declaration" wrapper node; fields are direct children of
-    # "ordered_field_declaration_list".
-    for struct_node in tree.root_node.children:
-        if struct_node.type != "struct_item":
-            continue
-        for child in struct_node.children:
-            if child.type != "ordered_field_declaration_list":
-                continue
-            pending_vis = None
-            for fc in child.children:
-                if fc.type in ("(", ")", ","):
-                    pending_vis = None
-                elif fc.type == "visibility_modifier":
-                    pending_vis = fc
-                elif fc.type == "attribute_item":
-                    pass
-                else:
-                    # fc is a type node — this is a tuple field
-                    if pending_vis is None:
-                        edits.append((fc.start_byte, fc.start_byte, b"pub "))
-                    else:
-                        vis_text = source_bytes[
-                            pending_vis.start_byte : pending_vis.end_byte
-                        ].strip()
-                        if vis_text != b"pub":
-                            edits.append((pending_vis.start_byte, pending_vis.end_byte, b"pub"))
-                    pending_vis = None
-            break
-
-    if not edits:
-        return translation
-
-    out = bytearray(source_bytes)
-    for start, end, replacement in sorted(edits, key=lambda item: item[0], reverse=True):
-        out[start:end] = replacement
-    return CodeRust(out.decode("utf-8"))
 
 
 def _write_cache(

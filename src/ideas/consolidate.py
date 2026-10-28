@@ -10,13 +10,14 @@ import json
 import logging
 import textwrap
 from pathlib import Path
+from typing import cast
 from dataclasses import dataclass
 from graphlib import TopologicalSorter, CycleError
 from concurrent.futures import ProcessPoolExecutor
 
 import hydra
 import networkx as nx
-from omegaconf import MISSING
+from omegaconf import MISSING, OmegaConf
 from hydra.core.config_store import ConfigStore
 from clang.cindex import CompilationDatabase, CompileCommand, TranslationUnit, CursorKind
 from clang.cindex import TranslationUnitLoadError, Diagnostic, StorageClass
@@ -25,7 +26,7 @@ from ideas.tools import run_subprocess, Crate
 from ideas.ast_rust import mangle as mangle_rs
 from ideas.ast import extract_info_c, TreeResult, Symbol, clang_rename, mangle, CodeC
 from ideas.ast import SymbolName, SymbolGroup, create_symbol_lexical_key_fn
-from ideas.ast import create_symbol_ordering_key_fn, clang_make_weak_
+from ideas.ast import create_symbol_ordering_key_fn, clang_make_weak_, PARSE_ARGS
 from ideas.agents.utils import write_instrumentation_script
 
 logger = logging.getLogger("ideas.consolidate")
@@ -259,7 +260,7 @@ def _get_tu(
 ) -> TranslationUnit:
     try:
         uf = [(str(p), content) for p, content in (unsaved_files or {}).items()] or None
-        tu = TranslationUnit.from_source(None, args=arguments, unsaved_files=uf)
+        tu = TranslationUnit.from_source(None, args=[*arguments, *PARSE_ARGS], unsaved_files=uf)
         if any(d.severity >= Diagnostic.Error for d in tu.diagnostics):
             raise TranslationUnitLoadError("\n".join(d.format() for d in tu.diagnostics))
     except TranslationUnitLoadError as e:
@@ -289,6 +290,12 @@ def _get_ast(
     return tree
 
 
+def _shared_builtin_type(symbols: list[Symbol]) -> str | None:
+    # The builtin type every symbol is a typedef of, or None if any of them is not
+    builtin_types = {sym.builtin_type for sym in symbols}
+    return builtin_types.pop() if len(builtin_types) == 1 else None
+
+
 def _agreeing_types(
     symbols_with_spelling: dict[SymbolSpelling, list[Symbol]],
     type_references: dict[SymbolSpelling, set[SymbolSpelling]],
@@ -313,7 +320,15 @@ def _agreeing_types(
     }
     # A spelling the corpus completes at most once has a single reading whatever it is
     # written in terms of, so there is no second reading for disagreement to travel to.
-    settled = {
+    # Neither has a typedef of one builtin type: whatever links it is written
+    # through, the builtin it reaches is already the same in every TU.
+    builtin_typedefs = {
+        spelling
+        for spelling, symbols in types_with_spelling.items()
+        if _shared_builtin_type(symbols) is not None
+    }
+    agreeing |= builtin_typedefs
+    settled = builtin_typedefs | {
         spelling
         for spelling, symbols in types_with_spelling.items()
         if sum(sym.is_definition for sym in symbols) <= 1
@@ -326,6 +341,10 @@ def _agreeing_types(
 
 
 def _denotes_one_entity(definitions: list[Symbol], agreeing_types: set[SymbolSpelling]) -> bool:
+    # Typedefs of one builtin type are one type
+    if _shared_builtin_type(definitions) is not None:
+        return True
+
     # Identical text is never proof on its own, because text carries no context: what it
     # means depends on what the names in it resolve to, and that is decided per TU.
     if len({str(sym.code) for sym in definitions}) > 1:
@@ -494,6 +513,7 @@ def consolidate(
 ) -> CodeC:
     # Consolidate C sources keyed by raw snippet with optional line directive.
     sources: dict[CodeC, str | None] = {}
+    emitted_builtin_typedefs: set[tuple[str, str]] = set()
     for group in symbol_order:
         # Add forward declarations if more than one symbol in group
         if len(group) > 1:
@@ -510,6 +530,12 @@ def consolidate(
         # Add symbol code
         for name in group:
             symbol = symbols[name]
+            if symbol.builtin_type is not None:
+                builtin_typedef = (symbol.spelling, symbol.builtin_type)
+                # Differently written typedefs of one built-in type are collapsed to one type
+                if builtin_typedef in emitted_builtin_typedefs:
+                    continue
+                emitted_builtin_typedefs.add(builtin_typedef)
             code = symbol.code
             if code in sources:
                 continue
@@ -556,11 +582,11 @@ def _generate_build_rs(link_inputs: list[tuple[str, str]], link_search_dirs: lis
         'build.compile("library");',
         "",
         "if ubsan {",
-        '    println!("cargo:rustc-link-search=/usr/lib/llvm-21/lib/clang/21/lib/linux/");',
+        '    println!("cargo:rustc-link-search=/usr/lib/llvm-23/lib/clang/23/lib/linux/");',
         '    println!("cargo:rustc-link-lib=static=clang_rt.ubsan_standalone-x86_64");',
         "}",
         "if asan {",
-        '    println!("cargo:rustc-link-search=/usr/lib/llvm-21/lib/clang/21/lib/linux/");',
+        '    println!("cargo:rustc-link-search=/usr/lib/llvm-23/lib/clang/23/lib/linux/");',
         '    println!("cargo:rustc-link-lib=static=clang_rt.asan-x86_64");',
         "}",
     ]
@@ -618,7 +644,8 @@ def _bindgen(
     ok, bindings, error, _ = run_subprocess(cmd)
     if not ok:
         raise ValueError(f"`{' '.join(cmd)}` failed!\n{bindings + error}")
-    return bindings
+    # bindgen mirrors C names and idioms verbatim, so lints on its output are not actionable
+    return "#![allow(warnings, clippy::all)]\n\n" + bindings
 
 
 def _main(cfg: ConsolidateConfig):
@@ -661,6 +688,8 @@ def _main(cfg: ConsolidateConfig):
     if not ok:
         raise ValueError(f"Consolidated C in {c_src_path} does not compile!\n{error}")
 
+    # -sys crates need to be standalone
+    workspace_toml = crate.workspace.cargo_toml
     if cfg.template == "bin":
         # The -sys bin target is `#![no_main]`, so C must own the entrypoint, and until `main`
         # is wrapped it has to stay weak to avoid colliding with the libtest harness `main`
@@ -670,21 +699,18 @@ def _main(cfg: ConsolidateConfig):
         clang_make_weak_(c_src_path, "main")
 
         # Add dev dependencies for driving the binary through its entrypoint
-        crate.cargo_add(dep="assert_cmd@2.0.17", section="dev")
-        crate.cargo_add(dep="predicates@3.1.3", section="dev")
+        crate.cargo_add(dep="assert_cmd", section="dev", copy_from=workspace_toml)
+        crate.cargo_add(dep="predicates", section="dev", copy_from=workspace_toml)
 
     # Add dev dependencies common to every -sys crate
-    crate.cargo_add(dep="libc@0.2", section="dev")
-    crate.cargo_add(dep="insta@1.48.0", section="dev", features=["json"])
-    crate.cargo_add(dep="serde@1", section="dev", features=["derive"])
-    crate.cargo_add(dep="serde_json@1", section="dev")
-    crate.cargo_add(dep="walkdir@2", section="dev")
+    for dep in ("libc", "insta", "serde", "serde_json", "walkdir"):
+        crate.cargo_add(dep=dep, section="dev", copy_from=workspace_toml)
 
     # Write build.rs to disk with dependencies and the sanitizer/coverage config
     (crate.cargo_toml.parent / "build.rs").write_text(
         _generate_build_rs(link_inputs, link_search_dirs)
     )
-    crate.cargo_add("cc@1.2.53", section="build")
+    crate.cargo_add("cc", section="build", copy_from=workspace_toml)
     crate.cargo_feature(cc_ubsan=[], cc_asan=[], cc_coverage=[])
 
     # Write bindings to disk
@@ -699,8 +725,8 @@ def _main(cfg: ConsolidateConfig):
     # Write cargo configurations to disk
     # NOTE: We configure nextest for both the crate and the workspace such that the -sys crate is standalone
     crate.cargo_nextest_config(crate.cargo_toml.parent / ".config" / "nextest.toml")
-    crate.cargo_nextest_config(crate.workspace_root / ".config" / "nextest.toml")
-    crate.vcs.add(crate.workspace_root / ".config")
+    crate.cargo_nextest_config(crate.workspace.root / ".config" / "nextest.toml")
+    crate.vcs.add(crate.workspace.root / ".config")
 
     # Write instrumentation script
     write_instrumentation_script(
@@ -709,19 +735,14 @@ def _main(cfg: ConsolidateConfig):
 
     # Commit the crate
     crate.vcs.add(crate.cargo_toml.parent)
-    workspace_cargo_toml = crate.workspace_root / "Cargo.toml"
-    if workspace_cargo_toml != crate.cargo_toml and workspace_cargo_toml.exists():
-        crate.vcs.add(workspace_cargo_toml)
-    workspace_cargo_lock = crate.workspace_root / "Cargo.lock"
-    if workspace_cargo_lock.exists():
-        crate.vcs.add(workspace_cargo_lock)
+    crate.workspace.stage()
     crate.vcs.commit(f"Created C bindings crate '{crate.name}'")
 
 
 @hydra.main(version_base=None, config_name="consolidate")
 def main(cfg: ConsolidateConfig):
     try:
-        _main(cfg)
+        _main(cast(ConsolidateConfig, OmegaConf.to_object(cfg)))
     except Exception as e:
         logger.exception(e)
         sys.exit(1)
