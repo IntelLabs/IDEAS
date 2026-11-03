@@ -7,7 +7,7 @@
 import sys
 import logging
 import traceback
-from typing import Any, cast
+from typing import Any, Self, cast
 from pathlib import Path
 from contextlib import contextmanager
 from collections.abc import Iterator
@@ -25,7 +25,7 @@ from ideas.consolidate import get_symbols_and_dependencies
 from .codex import CodexConfig
 from .oracle import NullOracle, SymbolOracle, TestOracle
 from .hybrid import SAFE_CRATE, Hybrid
-from .tools import Crate, Workspace
+from .tools import BaseWorkspace, Crate
 from .translate_recurrent import SymbolTranslator, SymbolWrapper, TranslationReport
 
 logger = logging.getLogger("ideas.translate")
@@ -58,17 +58,35 @@ cs = ConfigStore.instance()
 cs.store(name="translate", node=TranslateConfig)
 
 
-class TranslationWorkspace(Workspace):
-    def __init__(self, cfg: TranslateConfig):
-        self.sys_crate = Crate(cfg.bindings_cargo_toml, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
-        self.rs_crate = self._init_rs_crate(cfg)
-        super().__init__(self.rs_crate.workspace.root, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
-        self.ffi_crate = self._init_ffi_crate(cfg) if cfg.template == "lib" else None
-        self.hybrid_crate = self._init_hybrid_crate(cfg)
-        self._tests = cfg.tests
+class TranslationWorkspace(BaseWorkspace):
+    def __init__(
+        self,
+        sys_crate: Crate,
+        rs_crate: Crate,
+        ffi_crate: Crate | None = None,
+        tests: Path | None = None,
+    ):
+        super().__init__(sys_crate, rs_crate, ffi_crate)
+        self._tests = tests
+        self.hybrid_crate: Crate | None = None
+
+    # Initializes -rs, -ffi, and the internal -hybrid that translation runs in
+    @classmethod
+    def create(cls, cfg: TranslateConfig) -> Self:
+        sys_crate = Crate(cfg.bindings_cargo_toml, vcs=cfg.vcs)  # type: ignore[reportArgumentType]
+        workspace = cls(sys_crate, cls._init_rs_crate(cfg), tests=cfg.tests)
+        if cfg.template == "lib":
+            workspace.ffi_crate = workspace._init_ffi_crate(cfg)
+        workspace.hybrid_crate = workspace._init_hybrid_crate(cfg)
 
         # A bare `cargo build` must skip the -sys bin, which cannot link once its C is stranded
-        self.add_default_member(self.shipped_crate)
+        workspace.add_default_member(workspace.shipped_crate)
+        return workspace
+
+    def remove_hybrid(self) -> None:
+        assert self.hybrid_crate is not None
+        self.remove_member(self.hybrid_crate)
+        self.hybrid_crate = None
 
     @property
     def shipped_crate(self) -> Crate:
@@ -86,22 +104,12 @@ class TranslationWorkspace(Workspace):
             yield
             return
         crate = self.shipped_crate
-        manifests = {
-            path: path.read_bytes()
-            for path in (crate.cargo_toml, self.cargo_toml, self.cargo_lock)
-            if path.exists()
-        }
-        test_path = None
         try:
-            # The tests name -sys, which -rs ships without
+            # Keep the tests and their dev-dependency available for later testing.
             crate.add_workspace_dependencies([self.sys_crate.name], dev=True)
-            test_path = self._port_tests(crate, self._tests)
+            self._port_tests(crate, self._tests)
             yield
         finally:
-            if test_path is not None:
-                test_path.unlink()
-            for path, content in manifests.items():
-                path.write_bytes(content)
             crate.invalidate_metadata()
 
     @staticmethod
@@ -110,11 +118,12 @@ class TranslationWorkspace(Workspace):
             "-ffi" if cfg.template == "lib" else "-rs"
         )
 
-    def _init_rs_crate(self, cfg: TranslateConfig) -> Crate:
-        target = self._target(cfg)
+    @classmethod
+    def _init_rs_crate(cls, cfg: TranslateConfig) -> Crate:
+        target = cls._target(cfg)
         # Reinit so cargo init always registers it in workspace.members
         rs_crate = Crate(
-            cfg.cargo_toml.parent.with_name(f"{target}-rs") / "Cargo.toml",
+            cls.manifest(cfg.cargo_toml.parent.parent, target, "rs"),
             vcs=cfg.vcs,  # type: ignore[reportArgumentType]
             template=cfg.template,  # type: ignore[reportArgumentType]
             reinit=True,
@@ -135,11 +144,18 @@ class TranslationWorkspace(Workspace):
                 "#![allow(non_snake_case)]\n\n"
                 'fn main() {\n    unimplemented!("`main` was never translated to Rust");\n}\n'
             )
-        # Generated crate names preserve C casing, and later translations may follow test modules.
+        # C-name parity requires non-Rust casing, while recurrent output is linted
+        # before wrapper generation and may follow test modules
         assert rs_crate.lib_src_path is not None, "Expected lib.rs to exist in -rs crate!"
         rs_crate.lib_src_path.write_text(
             "#![forbid(unsafe_code)]\n"
-            "#![allow(clippy::items_after_test_module, non_snake_case)]\n\n"
+            "#![allow(\n"
+            "    clippy::items_after_test_module,\n"
+            "    dead_code,\n"
+            "    non_camel_case_types,\n"
+            "    non_snake_case,\n"
+            "    non_upper_case_globals\n"
+            ")]\n\n"
         )
 
         for dep in cfg.deps:
@@ -163,24 +179,20 @@ class TranslationWorkspace(Workspace):
         ffi_crate.vcs.add(ffi_crate.lib_src_path)
         # The same tests as the hybrid, so what ships is tested as the hybrid was
         if cfg.tests is not None:
-            test_path = self._port_tests(ffi_crate, cfg.tests)
-            ffi_crate.vcs.add(ffi_crate.cargo_toml, test_path)
-            self.stage()
+            self._port_tests(ffi_crate, cfg.tests)
         return ffi_crate
 
     def _init_hybrid_crate(self, cfg: TranslateConfig) -> Crate:
         # Reinit so cargo init always registers it in workspace.members
         hybrid_crate = Crate(
-            cfg.cargo_toml.parent.with_name(f"{self._target(cfg)}-hybrid") / "Cargo.toml",
+            self.manifest(self.root, self._target(cfg), "hybrid"),
             vcs=cfg.vcs,  # type: ignore[reportArgumentType]
             template=cfg.template,  # type: ignore[reportArgumentType]
             reinit=True,
         )
         self._link_crate(hybrid_crate, cfg)
         if cfg.tests is not None:
-            test_path = self._port_tests(hybrid_crate, cfg.tests)
-            hybrid_crate.vcs.add(hybrid_crate.cargo_toml, test_path)
-            self.stage()
+            self._port_tests(hybrid_crate, cfg.tests)
         return hybrid_crate
 
     def _link_crate(
@@ -230,6 +242,8 @@ class TranslationWorkspace(Workspace):
         test_path = crate.cargo_toml.parent / "tests" / f"{tests.stem}.rs"
         test_path.parent.mkdir(parents=True, exist_ok=True)
         test_path.write_text(source)
+        crate.vcs.add(crate.cargo_toml, test_path)
+        self.stage()
         return test_path
 
 
@@ -252,8 +266,9 @@ def _main(cfg: TranslateConfig) -> None:
     logger.info(f"Saving results to {output_dir}")
     _log_visible(cfg)
 
-    workspace = TranslationWorkspace(cfg)
+    workspace = TranslationWorkspace.create(cfg)
     rs_crate = workspace.rs_crate
+    assert workspace.hybrid_crate is not None
     hybrid = Hybrid(workspace.hybrid_crate, workspace.sys_crate, workspace.ffi_crate)
 
     # Get global symbol table
@@ -323,7 +338,7 @@ def _main(cfg: TranslateConfig) -> None:
     # replace is the guarantee: whatever still links is Rust, and whatever needed C now fails.
     hybrid.strand_c()
     if not cfg.keep_hybrid and cfg.vcs == "git":
-        workspace.remove_member(hybrid.crate)
+        workspace.remove_hybrid()
 
     # Every per-symbol verdict was reached while the surviving C could still carry the suite,
     # so this is the only run that measures the Rust alone, in exactly what ships

@@ -514,7 +514,7 @@ def test_lint_logs_what_is_outside_the_attempt(
     respond = MagicMock(side_effect=lambda **_: Generation(code=next(responses)))
 
     translator = SymbolTranslator(rs_crate, _StubSnippetTranslator(respond, max_iters=2))
-    with caplog.at_level("WARNING", logger="ideas.translate_recurrent"):
+    with caplog.at_level("DEBUG", logger="ideas.translate_recurrent"):
         result = translator.translate("c:@F@bar", CodeRust(PREFIX), MagicMock())
 
     assert result.success

@@ -1154,6 +1154,40 @@ def test_clang_rename_updates_declarations_and_call_sites(tmp_path):
     assert transformed.count("ideas_c_main") == 3
 
 
+def test_renamed_main_preserves_implicit_zero_return(tmp_path):
+    c_path = tmp_path / "input.c"
+    c_path.write_text(
+        dedent(
+            """\
+            int main(int argc, char **argv) {
+                if (argc > 1 && argv[1][0] == 'x') return 7;
+            }
+            """
+        )
+    )
+
+    ast.clang_preserve_main_fallthrough_return_(c_path)
+    ast.clang_rename_(c_path, {"main": "__ideas_c_main"})
+    with c_path.open("a") as source:
+        source.write(
+            "\nint main(int argc, char **argv) {\n    return __ideas_c_main(argc, argv);\n}\n"
+        )
+
+    executable = tmp_path / "main"
+    success, stdout, stderr, _ = run_subprocess(
+        ["clang-23", "-Wall", "-Werror", str(c_path), "-o", str(executable)]
+    )
+    assert success, stdout + stderr
+
+    success, stdout, stderr, exit_code = run_subprocess([str(executable)])
+    assert success, stdout + stderr
+    assert exit_code == 0
+
+    success, stdout, stderr, exit_code = run_subprocess([str(executable), "x"])
+    assert not success, stdout + stderr
+    assert exit_code == 7
+
+
 def test_clang_rename_typedef_leaves_same_spelled_tag_alone(tmp_path):
     # Tags and ordinary identifiers are separate namespaces, so `typedef struct s s;`
     # names two entities with one spelling; renaming the typedef must not touch the tag,
@@ -1222,22 +1256,22 @@ def test_clang_rename_missing_symbol(tmp_path):
 @pytest.mark.parametrize(
     "source,expected",
     [
-        ("int main(void) { return 0; }\n", 0),
+        ("int main(void) { return 0; }\n", ("int", 0)),
         # Pre-C23 unspecified parameters read the same as `(void)` here
-        ("int main() { return 0; }\n", 0),
-        ("int main(int argc, char **argv) { return argv ? argc : 0; }\n", 2),
-        ("int main(int c, char **v, char **e) { return v && e ? c : 0; }\n", 3),
+        ("int main() { return 0; }\n", ("int", 0)),
+        ("int main(int argc, char **argv) { return argv ? argc : 0; }\n", ("int", 2)),
+        ("int main(int c, char **v, char **e) { return v && e ? c : 0; }\n", ("int", 3)),
     ],
 )
-def test_clang_function_arity(tmp_path, source, expected):
+def test_clang_function_signature(tmp_path, source, expected):
     c_path = tmp_path / "input.c"
     c_path.write_text(source)
 
-    assert ast.clang_function_arity(c_path, "main") == expected
+    assert ast.clang_function_signature(c_path, "main") == expected
 
 
-def test_clang_function_arity_ignores_declarations(tmp_path):
+def test_clang_function_signature_ignores_declarations(tmp_path):
     c_path = tmp_path / "input.c"
     c_path.write_text("int main();\nint main(int argc, char **argv) { return argc + !argv; }\n")
 
-    assert ast.clang_function_arity(c_path, "main") == 2
+    assert ast.clang_function_signature(c_path, "main") == ("int", 2)

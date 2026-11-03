@@ -87,9 +87,7 @@ def test_enums_translate_to_integer_constants() -> None:
         ("N", "NA", "NB"): "pub const NA: i32 = 0;\npub const NB: i32 = -2;\n",
         ("Q", "QA", "QB"): "pub const QA: u32 = 0;\npub const QB: u32 = 4294967295;\n",
         ("AN", "type"): (
-            "pub const AN: u64 = 4294967296;\n"
-            "#[allow(non_upper_case_globals)]\n"
-            "pub const type_: u64 = 4294967297;\n"
+            "pub const AN: u64 = 4294967296;\npub const type_: u64 = 4294967297;\n"
         ),
         ("U_t", "UA"): "pub const UA: u32 = 0;\n",
         ("U2_t",): "// `U2_t` declares no enum constants\n",
@@ -119,7 +117,6 @@ def test_translated_enums_build_together() -> None:
         "pub const NA: i32 = 0;",
         "pub const NB: i32 = -2;",
         "pub const AN: u64 = 4294967296;",
-        "#[allow(non_upper_case_globals)]",
         "pub const type_: u64 = 4294967297;",
         "pub const UA: u32 = 0;",
     ]
@@ -137,15 +134,14 @@ def test_translated_enums_keep_names_that_differ_only_in_case() -> None:
     """).values()
     rust = CodeRust.join(t for s in symbols if (t := s.deterministic_translation) is not None)
 
-    # C is case-sensitive, so upper-casing `red` would define `RED` twice; it keeps C's
-    # spelling and allows the lint instead
+    # C is case-sensitive, so upper-casing `red` would define `RED` twice
     assert [line for line in str(rust).splitlines() if line] == [
-        "#[allow(non_upper_case_globals)]",
         "pub const red: u32 = 0;",
         "pub const RED: u32 = 1;",
     ]
     success, output = check_rust(
-        str(rust), flags=["--crate-type=lib", "--emit=metadata", "-Dnon_upper_case_globals"]
+        "#![allow(non_upper_case_globals)]\n" + str(rust),
+        flags=["--crate-type=lib", "--emit=metadata", "-Dnon_upper_case_globals"],
     )
     assert success, output
 

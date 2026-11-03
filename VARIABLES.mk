@@ -20,6 +20,7 @@ NEXTEST_EXPERIMENTAL_LIBTEST_JSON ?= 1
 CC = clang
 CFLAGS = -w## Ignore C compiler warnings
 TRANSLATION_TEST = null## Translation test directory/name to run (empty/null: wrap globals only, no tests)
+COVERAGE_TEST ?= ${TRANSLATION_TEST}## Test directory/name for translation coverage (defaults to TRANSLATION_TEST)
 EVALUATION_TEST = test_cases## Evaluation test directory/name to run
 IDIOMATICITY_SUFFIX = -rs## Judge workspace member <target><suffix> (empty: <target> itself)
 VCS = git## Whether to use version control during translation. Options: ['git', 'none']

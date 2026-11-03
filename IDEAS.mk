@@ -10,6 +10,8 @@ include ${MAKEFILE_DIR}/VARIABLES.mk
 include ${MAKEFILE_DIR}/INSTALL.mk
 include ${MAKEFILE_DIR}/docker/DOCKER.mk
 
+RUN_ARGS += --log "${CURDIR}/${TRANSLATION_DIR}/sandbox.log"
+
 GIT := @git -C ${TRANSLATION_DIR}
 CMAKE := cmake
 CARGO := cargo -q
@@ -166,6 +168,24 @@ ${TRANSLATION_DIR}/%-rs/src/main.rs ${TRANSLATION_DIR}/%-rs/Cargo.toml &: ${TRAN
 	@echo ""
 
 
+# minify
+.PHONY: minify FORCE
+FORCE:
+.PRECIOUS: ${TRANSLATION_DIR}/%-ffi/minify.log
+minify: $(patsubst %/Cargo.toml,%/minify.log,$(wildcard $(patsubst %,${TRANSLATION_DIR}/%-ffi/Cargo.toml,${TARGETS_LIB})))
+	@:  # empty rule to suppress "Nothing to be done for"
+${TRANSLATION_DIR}/%-ffi/minify.log: private RUN_ARGS += --writable "${CURDIR}/${TRANSLATION_DIR}"
+${TRANSLATION_DIR}/%-ffi/minify.log: FORCE
+	@rm -f $@
+	-${DOCKER_RUN} ${PYTHON} -m ideas.minify cargo_toml=${TRANSLATION_DIR}/$*-ffi/Cargo.toml \
+                                             tests=${TRANSLATION_TEST} \
+                                             vcs=${VCS} \
+                                             hydra.output_subdir=.minify \
+                                             hydra.job.name=minify \
+                                             hydra.run.dir=${TRANSLATION_DIR}/$*-ffi
+	@echo ""
+
+
 # cost
 .PHONY: cost
 cost: ${TRANSLATION_DIR}/cost.tsv
@@ -216,6 +236,28 @@ endif
                              --status-level=none --final-status-level=all \
                              > ${TRANSLATION_DIR}/$*/cargo_${EVALUATION_TEST}.jsonl \
                              2> ${TRANSLATION_DIR}/$*/cargo_${EVALUATION_TEST}.log
+
+
+# translation coverage
+.PHONY: coverage
+ifeq ($(filter-out null,$(strip ${COVERAGE_TEST})),)
+coverage:
+	@echo "COVERAGE_TEST is null; set COVERAGE_TEST or TRANSLATION_TEST" >&2
+	@false
+else
+.PRECIOUS: ${TRANSLATION_DIR}/%/coverage_${COVERAGE_TEST}.json
+coverage: $(patsubst %,${TRANSLATION_DIR}/%/coverage_${COVERAGE_TEST}.json,${SHIPPED_CRATES})
+	@:  # empty rule to suppress "Nothing to be done for"
+${TRANSLATION_DIR}/%/coverage_${COVERAGE_TEST}.json: private RUN_ARGS += --writable "${CURDIR}"
+${TRANSLATION_DIR}/%/coverage_${COVERAGE_TEST}.json: ${TRANSLATION_DIR}/%/Cargo.toml ${TRANSLATION_DIR}/%/tests/${COVERAGE_TEST}.rs
+	@rm -f "$@.tmp" "$@.test.log"
+	${DOCKER_RUN} env CARGO_BUILD_JOBS=1 ${CARGO} llvm-cov clean --manifest-path "$(@D)/Cargo.toml" --profraw-only >> "$@.test.log" 2>&1
+	${DOCKER_RUN} env CARGO_BUILD_JOBS=1 ${CARGO} llvm-cov nextest --manifest-path "$(@D)/Cargo.toml" -p "$*" --test "${COVERAGE_TEST}" --no-report --no-fail-fast --test-threads 1 >> "$@.test.log" 2>&1
+	${DOCKER_RUN} env CARGO_BUILD_JOBS=1 ${CARGO} llvm-cov report --manifest-path "$(@D)/Cargo.toml" -p "$*" --json --summary-only > "$@.tmp" 2>> "$@.test.log"
+	@mv "$@.tmp" "$@"
+${TRANSLATION_DIR}/%/tests/${COVERAGE_TEST}.rs: ${TRANSLATION_DIR}/%/Cargo.toml
+	@test -f "$@" || { echo "Translation is missing tests/${COVERAGE_TEST}.rs; translate with TRANSLATION_TEST=${COVERAGE_TEST}" >&2; exit 1; }
+endif
 
 
 # idiomaticity

@@ -12,12 +12,15 @@ import signal
 
 import tomlkit
 import logging
+import time
+import queue
+import threading
 import subprocess
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import cache, cached_property
-from typing import Any, Literal
+from typing import Any, Literal, Self
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
@@ -525,6 +528,34 @@ class Crate:
             for match in RAPX_BUG.finditer(ANSI.sub("", error))
         ]
 
+    def cargo_minify(self) -> tuple[bool, str]:
+        sources = self.cargo_toml.parent.relative_to(self.workspace.root) / "src" / "**"
+        cmd = [
+            "cargo",
+            "minify",
+            "--apply",
+            "--allow-dirty",
+            "--allow-staged",
+            "--allow-no-vcs",
+            "--color=never",
+            f"--manifest-path={self.cargo_toml}",
+            "--package",
+            self.name,
+            "--file",
+            str(sources),
+            "--kinds",
+            "FUNCTION",
+        ]
+
+        env = self._cargo_env()
+        # cargo-minify deletes what rustc warns is unused, so nothing may silence the warnings
+        rustflags = env.get("RUSTFLAGS", "").split()
+        env["RUSTFLAGS"] = " ".join(flag for flag in rustflags if flag != "-Awarnings")
+
+        # Its `cargo check` ignores --manifest-path and checks wherever it is started
+        success, output, error, _ = run_subprocess(cmd, cwd=self.workspace.root, env=env)
+        return success, output + error
+
     def cargo_test_list(self, name: str, features: list[str] | None = None) -> list[str]:
         cmd = [
             "cargo",
@@ -754,9 +785,36 @@ def _span_locations(root: Path, span: dict[str, Any]) -> Iterator[tuple[Path, in
         span = expansion["span"]
 
 
-def _kill_group(
-    proc: "subprocess.Popen[str]", grace: float = 2.0, drain: float = 5.0
-) -> tuple[str, str]:
+class BaseWorkspace(Workspace):
+    def __init__(self, sys_crate: Crate, rs_crate: Crate, ffi_crate: Crate | None = None):
+        super().__init__(rs_crate.cargo_toml.parent.parent, vcs=rs_crate.vcs.vcs)  # type: ignore[reportArgumentType]
+        self.sys_crate = sys_crate
+        self.rs_crate = rs_crate
+        self.ffi_crate = ffi_crate
+
+    @staticmethod
+    def manifest(root: Path, target: str, suffix: str) -> Path:
+        return root / f"{target}-{suffix}" / "Cargo.toml"
+
+    @classmethod
+    def open(cls, cargo_toml: Path) -> Self:
+        crate_dir = cargo_toml.resolve().parent
+        if not crate_dir.name.endswith("-rs"):
+            raise ValueError(f"{cargo_toml} is not the manifest of an -rs crate!")
+        root, target = crate_dir.parent, crate_dir.name.removesuffix("-rs")
+        ffi_toml = cls.manifest(root, target, "ffi")
+        return cls(
+            Crate(cls.manifest(root, target, "sys")),
+            Crate(cls.manifest(root, target, "rs")),
+            Crate(ffi_toml) if ffi_toml.exists() else None,
+        )
+
+    @property
+    def target(self) -> str:
+        return self.rs_crate.cargo_toml.parent.name.removesuffix("-rs")
+
+
+def _signal_group(proc: "subprocess.Popen[str]", grace: float = 2.0) -> None:
     # SIGTERM first so the process group can clean up after itself, SIGKILL if it lingers
     with suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGTERM)
@@ -764,6 +822,12 @@ def _kill_group(
             proc.wait(timeout=grace)
         # FIXME: Give grace to the process group, not just leader, to exit cleanly
         os.killpg(proc.pid, signal.SIGKILL)
+
+
+def _kill_group(
+    proc: "subprocess.Popen[str]", grace: float = 2.0, drain: float = 5.0
+) -> tuple[str, str]:
+    _signal_group(proc, grace)
 
     # A descendant that left the process group survives the kill and holds the pipes open
     try:
@@ -800,6 +864,92 @@ def run_subprocess(
             _kill_group(proc)
             raise
     return proc.returncode == 0, stdout, stderr, proc.returncode
+
+
+def stream_subprocess(
+    cmd: list[str],
+    input: str | None = None,
+    timeout: float | None = None,
+    drain: float = 5.0,
+    **kwargs,
+) -> Iterator[str]:
+    """Yields the stdout lines of `cmd` as it writes them.
+
+    Raises `subprocess.TimeoutExpired` once `timeout` seconds have passed and
+    `subprocess.CalledProcessError` on a non-zero exit, both carrying all of stdout and stderr.
+    Stopping the iteration early kills the process group.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE if input is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        **kwargs,
+    )
+    lines: queue.Queue[str | None] = queue.Queue()
+    stdout: list[str] = []
+    stderr: list[str] = []
+
+    def read_stdout() -> None:
+        assert proc.stdout is not None
+        with proc.stdout:
+            for line in proc.stdout:
+                lines.put(line)
+        lines.put(None)
+
+    def read_stderr() -> None:
+        assert proc.stderr is not None
+        with proc.stderr:
+            stderr.extend(proc.stderr)
+
+    def write_stdin() -> None:
+        assert proc.stdin is not None
+        # The child may exit without reading all of its input
+        with suppress(BrokenPipeError), proc.stdin:
+            proc.stdin.write(input or "")
+
+    threads = [
+        threading.Thread(target=target, daemon=True)
+        for target in (read_stdout, read_stderr, write_stdin)
+        if target is not write_stdin or input is not None
+    ]
+    for thread in threads:
+        thread.start()
+
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    def remaining() -> float | None:
+        return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+    def collect() -> tuple[str, str]:
+        # A descendant that left the process group survives the kill and holds the pipes open
+        for thread in threads:
+            thread.join(timeout=drain)
+        while not lines.empty():
+            if (line := lines.get_nowait()) is not None:
+                stdout.append(line)
+        return "".join(stdout), "".join(stderr)
+
+    try:
+        while (line := lines.get(timeout=remaining())) is not None:
+            stdout.append(line)
+            yield line
+        proc.wait(timeout=remaining())
+    except (queue.Empty, subprocess.TimeoutExpired):
+        _signal_group(proc)
+        raise subprocess.TimeoutExpired(cmd, timeout or 0, *collect()) from None
+    except BaseException:
+        # Also reached through GeneratorExit when the caller stops iterating
+        _signal_group(proc)
+        raise
+
+    output, errors = collect()
+    if proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output, errors)
+    if errors.strip():
+        logger.warning(f"`{cmd[0]}` wrote to stderr: {errors.strip()}")
 
 
 def check_rust(

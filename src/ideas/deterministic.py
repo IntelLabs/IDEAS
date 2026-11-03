@@ -63,9 +63,6 @@ def _translate_enum(cursor: Cursor) -> CodeRust | None:
             signed = "i" if integer.kind in _SIGNED_KINDS else "u"
             bits = integer.get_size() * 8
             name = mangle(c.spelling)
-            if name != name.upper():
-                # A strict linting policy in the generated crate may reject preserved C names
-                items.append("#[allow(non_upper_case_globals)]")
             items.append(f"pub const {name}: {signed}{bits} = {c.enum_value};")
     if not items:
         return CodeRust(f"// `{cursor.spelling}` declares no enum constants")

@@ -9,6 +9,7 @@ import json
 import shutil
 import logging
 import tempfile
+import subprocess
 from typing import Any, Literal
 from pathlib import Path
 from functools import cache
@@ -21,7 +22,7 @@ from .ast_rust import CodeRust
 from .adapters import Code
 from .model import Generation, GenerationParseError, LMUsage, ModelConfig, current_tracker
 from .model import model_info
-from .tools import run_subprocess
+from .tools import run_subprocess, stream_subprocess
 
 logger = logging.getLogger("ideas.codex")
 
@@ -30,6 +31,7 @@ logger = logging.getLogger("ideas.codex")
 class CodexConfig:
     sandbox: str = os.environ.get("IDEAS_CODEX_SANDBOX", "workspace-write")
     timeout: int = 900
+    stream_max_retries: int = 10
     subagents: bool = False
     extra_config: list[str] = field(default_factory=list)
     extra_env: list[str] = field(default_factory=list)
@@ -296,19 +298,26 @@ def run_codex_turn(
         logger.debug(f"Running {' '.join(codex_cmd)}")
         env = _env(cfg, model, workdir, scratch)
         _codex_login(env)
+        lines: list[str] = []
         try:
-            ok, stdout, stderr, code = run_subprocess(
-                codex_cmd,
-                input=prompt,
-                timeout=cfg.timeout,
-                env=env,
+            for line in stream_subprocess(
+                codex_cmd, input=prompt, timeout=cfg.timeout, env=env
+            ):
+                lines.append(line)
+                # Retries and failures are logged as they happen, not once `codex exec` exits
+                _log_event(line)
+        except subprocess.TimeoutExpired as e:
+            logger.error(
+                f"`codex exec` timed out after {cfg.timeout}s: {(e.stderr or '').strip()}"
             )
+        except subprocess.CalledProcessError as e:
+            logger.error(f"`codex exec` exited with {e.returncode}: {(e.stderr or '').strip()}")
         except OSError as e:
             raise RuntimeError(f"Failed to run `{' '.join(codex_cmd)}`: {e}") from e
 
-    if not ok:
-        logger.error(f"`codex exec` exited with {code}: {stderr.strip()}")
-    return _parse_events(stdout, model.name, _answer_key(output_schema))
+    return _parse_events(
+        "".join(lines), model.name, _answer_key(output_schema), log_errors=False
+    )
 
 
 def _answer_key(schema: dict[str, Any]) -> str:
@@ -353,9 +362,17 @@ def _codex_cmd(
         cmd += ("-c", f'model_provider="{model.provider}"')
         cmd += ("-c", f'{p}.name="{model.provider}"')
         cmd += ("-c", f'{p}.base_url="{model.base_url}"')
-        # Unlike `env_key`, command auth makes Codex fetch the provider's model catalog
-        cmd += ("-c", f'{p}.auth.command="sh"')
-        cmd += ("-c", f'{p}.auth.args=["-c", "echo ${model.env_key}"]')
+        # 0.2s * 2 ** k delay for providers that don't output "retry again in X"
+        cmd += ("-c", f"{p}.stream_max_retries={cfg.stream_max_retries}")
+
+        if model.provider == "azure":
+            # Azure doesn't serve a model catalog
+            cmd += ("-c", f'{p}.env_key="{model.env_key}"')
+        else:
+            # Fetch the provider's model catalog
+            cmd += ("-c", f'{p}.auth.command="sh"')
+            cmd += ("-c", f'{p}.auth.args=["-c", "echo ${model.env_key}"]')
+
     if schema is not None and model.enable_output_schema:
         cmd += ("--output-schema", str(schema))
     for override in cfg.extra_config:
@@ -425,7 +442,25 @@ def _env(
     return env
 
 
-def _parse_events(stdout: str, model_name: str, answer_key: str = "output") -> CodexResult:
+def _log_event(line: str) -> None:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(event, dict):
+        return
+
+    match event.get("type"):
+        case "turn.failed":
+            error = (event.get("error") or {}).get("message", "")
+            logger.error(f"Codex turn failed: {error}")
+        case "error":
+            logger.error(f"Codex error: {event.get('message', '')}")
+
+
+def _parse_events(
+    stdout: str, model_name: str, answer_key: str = "output", *, log_errors: bool = True
+) -> CodexResult:
     messages: list[str] = []
     reasoning: list[str] = []
     tokens: dict[str, int] = dict.fromkeys(
@@ -462,11 +497,8 @@ def _parse_events(stdout: str, model_name: str, answer_key: str = "output") -> C
                 turn_usage = event.get("usage") or {}
                 for key in tokens:
                     tokens[key] += turn_usage.get(key) or 0
-            case "turn.failed":
-                error = (event.get("error") or {}).get("message", "")
-                logger.error(f"Codex turn failed: {error}")
-            case "error":
-                logger.error(f"Codex error: {event.get('message', '')}")
+            case "turn.failed" | "error" if log_errors:
+                _log_event(line)
 
     usage: dict[str, Any] = {
         "prompt_tokens": tokens["input_tokens"],

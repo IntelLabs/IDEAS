@@ -13,11 +13,9 @@ import logging
 import os
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-import threading
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
@@ -35,6 +33,7 @@ from ideas.agents import codex_hooks
 from ideas.agents.verifiers import VERIFIER_COMMAND_ENV, VERIFIER_SOCKET_ENV
 from ideas.codex import CodexConfig, _codex_cmd, _codex_login, _env, _parse_events, _rates
 from ideas.model import ModelConfig
+from ideas.tools import stream_subprocess
 
 logger = logging.getLogger("ideas.agents.codex_backend")
 
@@ -128,9 +127,15 @@ def run_codex_agent(
             # Hooks read cumulative usage from the persisted rollout and are trusted as ours
             command[command.index("--ephemeral")] = "--dangerously-bypass-hook-trust"
             logger.debug(f"Running {' '.join(command)}")
-            stdout, stderr, exit_code = _run_streaming(
-                command, input=prompt, cwd=workdir, env=env, on_line=events.print_line
-            )
+            lines: list[str] = []
+            stderr, exit_code = "", 0
+            try:
+                for line in stream_subprocess(command, input=prompt, cwd=workdir, env=env):
+                    lines.append(line)
+                    events.print_line(line)
+            except subprocess.CalledProcessError as e:
+                stderr, exit_code = e.stderr or "", e.returncode
+        stdout = "".join(lines)
         (prompt_dir / "_codex.jsonl").write_text(
             stdout.replace("\x00", "\\0"), encoding="utf-8"
         )
@@ -172,58 +177,6 @@ def _install_hooks(workdir: Path, hook_trajectory: Path, state: dict[str, Any]) 
     hooks = {"hooks": {event: [handler] for event in codex_hooks.HOOK_EVENTS}}
     (hooks_directory / "hooks.json").write_text(json.dumps(hooks))
     return state_path
-
-
-def _run_streaming(
-    command: list[str],
-    *,
-    input: str,
-    cwd: Path,
-    env: dict[str, str],
-    on_line: Callable[[str], None],
-) -> tuple[str, str, int]:
-    """Run `command`, passing each stdout line to `on_line`; return stdout, stderr, and status."""
-    stdout: list[str] = []
-    stderr: list[str] = []
-    with subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-        cwd=cwd,
-        env=env,
-    ) as proc:
-        assert proc.stdin and proc.stdout and proc.stderr
-        drain = threading.Thread(target=stderr.extend, args=(proc.stderr,), daemon=True)
-        drain.start()
-        try:
-            proc.stdin.write(input)
-            proc.stdin.close()
-            for line in proc.stdout:
-                stdout.append(line)
-                on_line(line)
-            exit_code = proc.wait()
-        except BaseException:
-            _kill_group(proc)
-            raise
-        finally:
-            drain.join()
-    return "".join(stdout), "".join(stderr), exit_code
-
-
-def _kill_group(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is not None:
-        return
-    with suppress(ProcessLookupError):
-        os.killpg(proc.pid, signal.SIGTERM)
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        with suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait()
 
 
 # Live console

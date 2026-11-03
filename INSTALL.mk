@@ -13,6 +13,7 @@ CANDO2_GIT = https://github.com/mariusarvinte/PUBLIC-Test-Corpus## cando2 fork (
 CANDO2_REV = bf3f39e49e5eca8409934f1a874ab6c099a4ecda## cando2 commit (keep in sync with runner manifests)
 RAPX_TOOLCHAIN = nightly-2026-09-18## Rust toolchain rapx links its rustc internals against
 RAPX_VERSION = 0.7.50## rapx version to install
+CARGO_MINIFY_PATH = tools/cargo-minify## cargo-minify fork that parses Rust 2024 and removes functions precisely
 CODEX_RELEASE = 0.156.1## Codex version to install
 UV_VERSION = 0.13.5## uv version to install
 export RUNNER_TOOLCHAIN # Generated tests read it from the environment
@@ -64,13 +65,14 @@ install-rust:## Install Rust toolchains and CLI tools
 	cargo install cargo-insta --version 1.48.0 --locked
 	cargo install ast-grep --version 0.45.0 --locked
 	cargo install cargo-geiger --version 0.13.0 --locked
+	cargo install --path ${CARGO_MINIFY_PATH} --locked
 	cargo +${RAPX_TOOLCHAIN} install rapx --version ${RAPX_VERSION} --locked
 	cargo +${RUNNER_TOOLCHAIN} install cando2 --git ${CANDO2_GIT} --rev ${CANDO2_REV} --bin cando_binrunner --locked
 
 .PHONY: install-sys-deps
 install-sys-deps:## Install miscellaneous dependencies
 	apt-get install -y libssl-dev zlib1g-dev libpcre3-dev libpcre2-dev tcl-dev
-	apt-get install -y datamash jq ripgrep
+	apt-get install -y bsdextrautils datamash jq ripgrep
 
 .PHONY: install-bear
 install-bear:## Install bear ${BEAR_VERSION} from source (requires Rust)

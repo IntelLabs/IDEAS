@@ -5,5 +5,7 @@
 !pyproject.toml
 !uv.lock
 !INSTALL.mk
+!tools/cargo-minify
+tools/cargo-minify/target
 !docker/ideas.Dockerfile
 !docker/ideas.bashrc

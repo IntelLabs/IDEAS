@@ -179,7 +179,7 @@ class TestOracle:
             # because the workspace .gitignore excludes *.log
             self._crate.vcs.add(run_events, run_log, force=True)
         # Feedback is empty when the tests pass, so callers can treat it as the failure signal
-        events = _extract_test_events(output)
+        events = extract_test_events(output)
         if passes:
             return "", events
 
@@ -412,7 +412,7 @@ def _evidence_feedback(evidence: str) -> str:
     )
 
 
-def _extract_test_events(output: str) -> dict[str, str]:
+def extract_test_events(output: str) -> dict[str, str]:
     events: dict[str, str] = {}
     for line in output.splitlines():
         try:

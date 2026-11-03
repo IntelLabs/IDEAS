@@ -73,7 +73,7 @@ def test_ported_test_builds_when_binding_matches_crate_name(instrumented_workspa
         "}\n"
     )
 
-    TranslationWorkspace(cfg)
+    TranslationWorkspace.create(cfg)
     # -ffi keeps the tests it was given, as the hybrid does
     assert (ws / "libdriver-ffi" / "tests" / "smoke.rs").exists()
     assert build_ok(ws, "libdriver-ffi", "--test", "smoke")

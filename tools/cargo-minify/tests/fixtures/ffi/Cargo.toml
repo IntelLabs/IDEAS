@@ -1,0 +1,3 @@
+[workspace]
+members = ["libx-rs", "libx-ffi"]
+resolver = "3"

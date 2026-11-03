@@ -61,6 +61,12 @@ test:## Run the IDEAS test suite with the translation toolchain
 test: src/ideas/model_prices.json
 	uv run pytest ${PYTEST_ARGS}
 
+.PHONY: docker/test
+docker/test:## Run the IDEAS test suite in Docker + native
+docker/test: private ENV_ARGS += IDEAS_RUNNER=native
+docker/test: ${DOCKER_READY} src/ideas/model_prices.json
+	${DOCKER_RUN} uv run pytest -o cache_dir=/tmp/pytest_cache ${PYTEST_ARGS}
+
 .PHONY: vllm/serve
 vllm/serve:## Start vLLM server
 	${VLLM_LAUNCH} ${VLLM_IMAGE} ${VLLM_RECIPE} --port ${VLLM_PORT}
@@ -118,8 +124,7 @@ ifneq (${VERBOSE},0)
 endif
 	@echo ""
 	@echo "--- Aggregated Test Count for ${TESTGEN_CACHE}/testgen_io.jsonl ---"
-	@find ${EXAMPLES} -maxdepth 2 -path '*/${TESTGEN_CACHE}/testgen_io.jsonl' -exec cat {} + \
-      | jq -r 'select(.type=="test" and (.event=="ok" or .event=="failed")) | if .event == "ok" then "ok" elif .reason == "time limit exceeded" then "TIMEOUT" else "FAILED" end' \
+	@find ${EXAMPLES} -maxdepth 2 -path '*/${TESTGEN_CACHE}/testgen_io.jsonl' -exec jq -r -f scripts/test_event_counts.jq {} + \
       | LC_ALL=C sort -r | uniq -c
 	@echo ""
 	@echo "--- Branch Coverage for ${TESTGEN_CACHE}/testgen_io.tsv ---"
@@ -151,34 +156,8 @@ ifneq (${VERBOSE},0)
 	@echo ""
 	@echo "--- Translation Attempts Exhausted for ${TRANSLATION_DIR} ---"
 	@find ${EXAMPLES} -maxdepth 3 -path "*/${TRANSLATION_DIR}/*/translate.log" -exec grep -H -E '\(([0-9]+)/\1\)' {} + | \
-      awk -v dir="${TRANSLATION_DIR}" '\
-        {\
-          colon = index($$0, ":");\
-          path = substr($$0, 1, colon - 1);\
-          message = substr($$0, colon + 1);\
-          needle = "/" dir "/";\
-          position = index(path, needle);\
-          if (!position) next;\
-          path = substr(path, 1, position - 1) "/" substr(path, position + length(needle));\
-          count = split(path, parts, "/");\
-          project = parts[1];\
-          for (i = 2; i <= count - 2; i++) project = project "/" parts[i];\
-          target = parts[count - 1];\
-          while (match(message, /`[^`]+`/)) {\
-            symbol = substr(message, RSTART + 1, RLENGTH - 2);\
-            message = substr(message, RSTART + RLENGTH);\
-            if (symbol ~ /^c:/) print project "\t" target "\t" symbol;\
-          }\
-        }' | sort -s -k1,1 -k2,2 | \
-      awk -F '\t' '\
-        BEGIN { OFS = " " }\
-        {\
-          key = $$1 OFS $$2;\
-          if (key != previous && previous != "") print output;\
-          if (key != previous) { output = "EXHAUSTED " $$1 " " $$2; previous = key }\
-          if (!seen[key SUBSEP $$3]++) output = output " `" $$3 "`";\
-        }\
-        END { if (previous != "") print output }'
+      awk -v dir="${TRANSLATION_DIR}" -f scripts/translation_exhausted.awk | \
+      sort -s -k1,1 -k2,2 | awk -F '\t' -f scripts/translation_exhausted_summary.awk
 endif
 examples/%/.translate: examples/%/.bear FORCE
 	-@$(MAKE) ${IDEAS_MAKE_ARGS} translate
@@ -186,6 +165,27 @@ examples/%/translate:## Translate specific example
 examples/%/translate: FORCE
 	-@$(MAKE) --no-print-directory examples/translate EXAMPLES="$(@D)"
 
+.PHONY: examples/minify
+examples/minify:## Minify the -ffi crates of all translated examples
+examples/minify: $(addsuffix /.minify,${EXAMPLES})
+ifneq (${VERBOSE},0)
+	@echo ""
+endif
+	@echo "--- Minify Outcomes for ${TRANSLATION_DIR}/*-ffi/minify.log ---"
+	@find ${EXAMPLES} -maxdepth 3 -path "*/${TRANSLATION_DIR}/*-ffi/minify.log" -exec grep -ohE '\[ideas\.minify\]\[[A-Z]+\] - (Minified|Undid|Skipped|Nothing)' {} + | sed 's/.* - //' | sort | uniq -c
+	@echo ""
+	@echo "--- Lines Deleted for ${TRANSLATION_DIR}/*-ffi/minify.json ---"
+	@find ${EXAMPLES} -maxdepth 3 -path "*/${TRANSLATION_DIR}/*-ffi/minify.json" -exec jq -r --arg report lines -f scripts/minify_report.jq {} + \
+      | awk -F'\t' '{n++; d+=$$1; b+=$$2} END {printf "  %d crate(s): %d/%d line(s) (%.1f%%)\n",n,d,b,b?100*d/b:0}'
+ifneq (${VERBOSE},0)
+	@find ${EXAMPLES} -maxdepth 3 -path "*/${TRANSLATION_DIR}/*-ffi/minify.json" -exec jq -r --arg report detail -f scripts/minify_report.jq {} + \
+      | sed 's|/${TRANSLATION_DIR}/[^/ ]*/minify.json||' | sort
+endif
+examples/%/.minify: examples/%/.bear FORCE
+	-@$(MAKE) ${IDEAS_MAKE_ARGS} minify
+examples/%/minify:## Minify the -ffi crate of a specific translated example
+examples/%/minify: FORCE
+	-@$(MAKE) --no-print-directory examples/minify EXAMPLES="$(@D)"
 
 .PHONY: examples/build
 examples/build:## Build all translated examples
@@ -219,8 +219,7 @@ ifneq (${VERBOSE},0)
 endif
 	@echo ""
 	@echo "--- Aggregated Test Count for build-ninja/baseline.json ---"
-	@find ${EXAMPLES} -maxdepth 2 -path '*/build-ninja/baseline.json' -exec cat {} + \
-      | jq -r '.[].result' | sort | uniq -c
+	@find ${EXAMPLES} -maxdepth 2 -path '*/build-ninja/baseline.json' -exec jq -r '.[].result' {} + | sort | uniq -c
 ifneq (${VERBOSE},0)
 	@echo ""
 	@find ${EXAMPLES} -maxdepth 2 -path '*/build-ninja/baseline.json' -size +0 -print0 \
@@ -247,14 +246,31 @@ ifneq (${VERBOSE},0)
 endif
 	@echo ""
 	@echo "--- Aggregated Test Count for ${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.jsonl ---"
-	@find ${EXAMPLES} -maxdepth 2 -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.jsonl' -exec cat {} + \
-      | jq -r 'select(.type=="test" and (.event=="ok" or .event=="failed")) | if .event == "ok" then "ok" elif .reason == "time limit exceeded" then "TIMEOUT" else "FAILED" end' \
+	@find ${EXAMPLES} -maxdepth 2 -path '*/${TRANSLATION_DIR}/cargo_${EVALUATION_TEST}.jsonl' -exec jq -r -f scripts/test_event_counts.jq {} + \
       | LC_ALL=C sort -r | uniq -c
 examples/%/.test: examples/%/.bear FORCE
 	-@$(MAKE) ${IDEAS_MAKE_ARGS} test
 examples/%/test:## Test specific translated example
 examples/%/test: FORCE
 	-@$(MAKE) --no-print-directory examples/test EXAMPLES="$(@D)"
+
+.PHONY: examples/coverage
+examples/coverage:## Measure coverage of a test in translated crates
+examples/coverage: $(addsuffix /.coverage,${EXAMPLES})
+	@echo "--- Translation Coverage for ${TRANSLATION_DIR} (${COVERAGE_TEST}) ---"
+	@set -eu; \
+	records=$$(find ${EXAMPLES} -maxdepth 3 -type f -path '*/${TRANSLATION_DIR}/*/coverage_${COVERAGE_TEST}.json' -exec jq -c --arg root "${CURDIR}" -f scripts/coverage_record.jq {} +) && \
+	summary=$$(printf '%s' "$$records" | jq -sr -f scripts/coverage_summary.jq) && \
+	printf '%s\n' "$$summary" | column -t -s "$$(printf '\t')" && \
+	if [ "${VERBOSE}" = "1" ]; then \
+	  printf '\nPer-crate totals:\n'; \
+	  printf '%s' "$$records" | jq -sr -f scripts/coverage_crates.jq; \
+	fi
+examples/%/.coverage: examples/%/.bear FORCE
+	@$(MAKE) ${IDEAS_MAKE_ARGS} coverage
+examples/%/coverage:## Measure coverage for a specific translated example
+examples/%/coverage: FORCE
+	@$(MAKE) --no-print-directory examples/coverage EXAMPLES="$(@D)"
 
 .PHONY: examples/cost
 examples/cost:## Print cost of all translated examples
@@ -281,40 +297,36 @@ ifneq (${VERBOSE},0)
 endif
 	@echo ""
 	@echo "--- Mean Level per Dimension for ${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json ---"
-	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -exec cat {} + \
-      | jq -r '.dimensions | to_entries[] | "\(.key)\t\(.value.level)"' \
+	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -exec jq -r --arg report mean -f scripts/idiomaticity_report.jq {} + \
       | LC_ALL=C sort | datamash -g1 count 2 mean 2 \
       | awk '{printf "  %-40s %6d crates %6.2f\n",$$1,$$2,$$3}'
 ifneq (${VERBOSE},0)
 	@echo ""
 	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -size +0 -print0 \
-      | xargs -0 -r jq -r '"\(input_filename) \(.crate) \([.dimensions | keys_unsorted[] as $$k | "\($$k[0:2] | ascii_upcase)=\(.[$$k].level)"] | join(" ")) mean=\(.mean_level * 100 | round / 100)"' \
+      | xargs -0 -r jq -r --arg report detail -f scripts/idiomaticity_report.jq \
       | sed 's|/${TRANSLATION_DIR}/[^/ ]*/idiomaticity.json||' | sort
 endif
 	@echo ""
 	@echo "--- D3 Gate for ${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json ---"
-	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -exec cat {} + \
-      | jq -r 'if ([.gate_findings[].tool] | any(. == "rapx")) then "UB-GATED" elif (.gate_findings | length) > 0 then "GATED" else "ungated" end' | LC_ALL=C sort | uniq -c
+	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -exec jq -r --arg report gate-status -f scripts/idiomaticity_report.jq {} + | LC_ALL=C sort | uniq -c
 ifneq (${VERBOSE},0)
 	@echo ""
 	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -size +0 -print0 \
-      | xargs -0 -r jq -r 'select((.gate_findings | length) > 0) | "GATED \(input_filename) \(.crate) \(.gate_findings | length) finding(s): \([.gate_findings[].lint] | unique | join(", "))"' \
+      | xargs -0 -r jq -r --arg report gate-findings -f scripts/idiomaticity_report.jq \
       | sed 's|/${TRANSLATION_DIR}/[^/ ]*/idiomaticity.json||' | sort
 endif
 	@echo ""
 	@echo "--- UB Scan for ${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json ---"
-	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -exec cat {} + \
-      | jq -r '.ub_scan | if . == "clean" or . == "skipped" then . else ascii_upcase end' | LC_ALL=C sort | uniq -c
+	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -exec jq -r --arg report ub-status -f scripts/idiomaticity_report.jq {} + | LC_ALL=C sort | uniq -c
 ifneq (${VERBOSE},0)
 	@echo ""
 	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -size +0 -print0 \
-      | xargs -0 -r jq -r 'select(.ub_scan != "clean" and .ub_scan != "skipped") | "\(.ub_scan | ascii_upcase) \(input_filename) \(.crate)"' \
+      | xargs -0 -r jq -r --arg report ub-findings -f scripts/idiomaticity_report.jq \
       | sed 's|/${TRANSLATION_DIR}/[^/ ]*/idiomaticity.json||' | sort
 endif
 	@echo ""
 	@echo "--- Judge Cost for ${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json ---"
-	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -exec cat {} + \
-      | jq -r '.usage // {} | [.cost // 0, .total_tokens // 0, .prompt_tokens // 0, .completion_tokens // 0, .cost_missing // 0] | @tsv' \
+	@find ${EXAMPLES} -mindepth 3 -maxdepth 3 -path '*/${TRANSLATION_DIR}/*${IDIOMATICITY_SUFFIX}/idiomaticity.json' -exec jq -r --arg report usage -f scripts/idiomaticity_report.jq {} + \
       | datamash sum 1 sum 2 sum 3 sum 4 sum 5 \
       | awk '{printf "  $$%10.4f %12\047d tok ( %12\047d in / %12\047d out)%s\n",$$1,$$2,$$3,$$4,($$5 ? sprintf(" (%d unpriced)",$$5) : "")}'
 examples/%/.idiomaticity: examples/%/.bear FORCE
@@ -331,6 +343,8 @@ examples/stats:
 	@$(MAKE) --no-print-directory examples/build
 	@echo ""
 	@$(MAKE) --no-print-directory examples/test
+	@echo ""
+	@$(MAKE) --no-print-directory examples/minify
 	@echo ""
 	@$(MAKE) --no-print-directory examples/cost VERBOSE=0
 examples/%/stats:##Print translation stats for specific example

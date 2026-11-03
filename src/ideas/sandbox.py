@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = "~=3.13.0"
 # dependencies = []
 # ///
 #
@@ -12,7 +12,8 @@
 
 usage: sandbox.py [--runner docker:IMAGE|landlock|native] [--root DIR] [--workdir DIR]
                   [--hide DIR]... [--readable PATH | --writable PATH]...
-                  [--env NAME=value | NAME=value]... [--tty] [--inspect] -- [@]command...
+                  [--env NAME=value | NAME=value]... [--log FILE] [--tty] [--inspect]
+                  -- [@]command...
 
 The command sees the root directory read-only, except for the directories hidden with --hide
 and the working directory, which are empty unless the paths mounted with --readable or
@@ -44,6 +45,7 @@ if __name__ == "__main__" and not sys.flags.safe_path:
 import ctypes
 import errno
 import fcntl
+import logging
 import os
 import re
 import shlex
@@ -63,6 +65,8 @@ USAGE = (
 )
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 UNSAFE_RELATIVE = re.compile(r"(^|/)\.\.?(/|$)")
+
+logger = logging.getLogger("ideas.sandbox")
 
 
 def trace_fd() -> int:
@@ -95,6 +99,22 @@ def usage() -> NoReturn:
     sys.exit(2)
 
 
+def configure_logging(path: str, command: list[str]) -> None:
+    """Appends DEBUG logs to the file, keeping them out of the step's stderr."""
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        handler = logging.FileHandler(path)
+    except OSError as e:
+        die(f"cannot open log file {path}: {e.strerror}")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(process)d] %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    logger.debug("step: %s", shlex.join(command))
+
+
 @dataclass
 class Mount:
     path: str
@@ -110,6 +130,7 @@ class Options:
     hides: list[str] = field(default_factory=list)
     mounts: list[Mount] = field(default_factory=list)
     env: list[str] = field(default_factory=list)
+    log: str = ""
     inspect: bool = False
     tty: bool = False
     echo: bool = True
@@ -140,6 +161,7 @@ def parse_args(argv: list[str]) -> Options:
             "--readable",
             "--writable",
             "--env",
+            "--log",
         ):
             value = next(args, None)
             if value is None:
@@ -159,6 +181,8 @@ def parse_args(argv: list[str]) -> Options:
                 opts.hides.append(value)
             elif arg == "--env":
                 add_env(opts, value)
+            elif arg == "--log":
+                opts.log = value
             else:
                 opts.mounts.append(Mount(value, arg == "--writable"))
         elif arg == "--inspect":
@@ -259,6 +283,7 @@ def with_env(specs: list[str]) -> dict[str, str]:
 def run_native(opts: Options) -> NoReturn:
     if opts.workdir:
         os.chdir(resolve_dir(opts.workdir, "working directory"))
+    logger.debug("native: no sandbox, the whole filesystem is readable and writable")
     echo(opts, "NATIVE", opts.command, ["env", *opts.env])
     exec_command(opts.command, with_env(opts.env))
 
@@ -282,6 +307,7 @@ class RulesetAttr(ctypes.Structure):
 
 
 class PathBeneathAttr(ctypes.Structure):
+    _layout_ = "ms"
     _pack_ = 1
     _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32)]
 
@@ -426,6 +452,7 @@ class Landlock:
             )
         # ABI 3 has 15 filesystem rights (up to TRUNCATE) and ABI 5 adds IOCTL_DEV
         self.access = (1 << (15 if abi < 5 else 16)) - 1
+        logger.debug("landlock: ABI %d, handled access %#x", abi, self.access)
 
     def ruleset(self, rules: dict[str, bool]) -> int:
         """Creates a ruleset fd (close-on-exec) that grants exactly the rules."""
@@ -439,6 +466,7 @@ class Landlock:
             try:
                 fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
             except FileNotFoundError:
+                logger.debug("landlock: skip missing %s", path)
                 continue
             allowed = self.access if writable else READ
             if not os.path.isdir(path):
@@ -449,6 +477,12 @@ class Landlock:
             ):
                 die(f"landlock_add_rule {path}: {os.strerror(ctypes.get_errno())}")
             os.close(fd)
+            logger.debug(
+                "landlock: %s %s (access %#x)",
+                "read-write" if writable else "read-only ",
+                path,
+                rule.allowed_access,
+            )
         return ruleset
 
     def restrict_self(self, ruleset: int, parent: int) -> None:
@@ -539,6 +573,8 @@ def run_landlock(
         policy, sandbox_env = landlock_policy(
             root, workdir, hides, mounts, scratch, dict(os.environ)
         )
+        for path in sorted(policy.hides):
+            logger.debug("landlock: hidden     %s", path)
         ruleset = landlock.ruleset(policy.rules())
         env_specs = [*opts.env, *(f"{k}={v}" for k, v in sandbox_env.items())]
         echo(opts, "LANDLOCK", opts.command, ["env", *env_specs])
@@ -631,6 +667,9 @@ def run_docker(
     os.makedirs(f"{root}/.venv", exist_ok=True)
 
     args = docker_args(opts, root, workdir, hides, mounts, dict(os.environ))
+    for flag, spec in zip(args, args[1:]):
+        if flag == "--mount":
+            logger.debug("docker: mount %s", spec)
     details = ["docker", "run", *args] if os.environ.get("VERBOSE") == "1" else []
     echo(opts, f"DOCKER {opts.image}", opts.command, details)
     if opts.inspect:
@@ -643,6 +682,7 @@ def run_docker(
 
 def main(argv: list[str]) -> int:
     opts = parse_args(argv)
+    configure_logging(opts.log, opts.command)
     if opts.runner == "native":
         run_native(opts)
     if not opts.root:
@@ -651,6 +691,7 @@ def main(argv: list[str]) -> int:
     workdir = resolve_dir(opts.workdir, "working directory") if opts.workdir else root
     hides = resolve_hides(root, opts.hides)
     mounts = resolve_mounts(root, opts.mounts)
+    logger.debug("%s: root %s, workdir %s", opts.runner, root, workdir)
     if opts.runner == "landlock":
         return run_landlock(opts, root, workdir, hides, mounts)
     run_docker(opts, root, workdir, hides, mounts)

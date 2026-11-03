@@ -25,8 +25,9 @@ ENV CODEX_INSTALL_DIR=/usr/local/bin
 
 # Install all dependencies
 COPY INSTALL.mk ./
+COPY tools/cargo-minify tools/cargo-minify
 RUN make -f INSTALL.mk install
-RUN rm INSTALL.mk
+RUN rm -r INSTALL.mk tools
 
 # Ensure cargo is in the PATH for all users, including non-interactive shells
 RUN printf '. "%s/env"\n' "${CARGO_HOME:-/usr/local/cargo}" \

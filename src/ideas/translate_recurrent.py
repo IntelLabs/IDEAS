@@ -220,7 +220,7 @@ class SymbolTranslator:
         def lint(code: CodeRust) -> str:
             clippy = rs_crate.cargo_clippy()
             if ignored := clippy.not_in(code).render(failure=not clippy.has_errors):
-                logger.warning(f"Ignored Clippy findings:\n{ignored}")
+                logger.debug(f"Ignored Clippy findings:\n{ignored}")
             clippy = clippy.only_in(code)
             findings = clippy.render()
             return f"Clippy feedback:\n{findings}" if findings else ""
@@ -551,7 +551,7 @@ class SymbolWrapper:
         def lint(wrapper: CodeRust) -> tuple[str, str]:
             clippy = hybrid.crate.cargo_clippy()
             if ignored := clippy.not_in(wrapper).render(failure=not clippy.has_errors):
-                logger.warning(f"Ignored Clippy findings:\n{ignored}")
+                logger.debug(f"Ignored Clippy findings:\n{ignored}")
             clippy = clippy.only_in(wrapper)
             fatal = clippy.render(("error",))
             warnings = clippy.render(("warning",), failure=False)

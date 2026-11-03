@@ -7,13 +7,12 @@
 import shutil
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import tomlkit
 
 from ideas.hybrid import SAFE_CRATE
-from ideas.tools import Crate
+from ideas.tools import BaseWorkspace, Crate
 from ideas.translate import TranslationWorkspace
 
 # Dependency-free crates that are already in the cargo cache
@@ -36,6 +35,33 @@ def workspace(tmp_path, monkeypatch) -> Path:
 
 def _section(crate: Crate, section: str) -> dict:
     return tomlkit.loads(crate.cargo_toml.read_text()).unwrap().get(section, {})
+
+
+@pytest.mark.parametrize("target", ["driver", "parser-rs", "parser-ffi"])
+@pytest.mark.parametrize("has_ffi", [False, True])
+def test_open_workspace_strips_exactly_one_suffix(workspace, target, has_ffi):
+    sys_crate = Crate(workspace / f"{target}-sys" / "Cargo.toml", template="lib")
+    rs_crate = Crate(workspace / f"{target}-rs" / "Cargo.toml", template="lib")
+    ffi_toml = workspace / f"{target}-ffi" / "Cargo.toml"
+    if has_ffi:
+        Crate(ffi_toml, template="lib")
+
+    opened = BaseWorkspace.open(rs_crate.cargo_toml)
+
+    assert opened.target == target
+    assert opened.sys_crate.cargo_toml == sys_crate.cargo_toml
+    assert opened.rs_crate.cargo_toml == rs_crate.cargo_toml
+    if has_ffi:
+        assert opened.ffi_crate is not None
+        assert opened.ffi_crate.cargo_toml == ffi_toml
+    else:
+        assert opened.ffi_crate is None
+
+
+@pytest.mark.parametrize("crate", ["driver-ffi", "driver-sys", "driver-oxide", "driver"])
+def test_open_workspace_rejects_non_rs_manifests(workspace, crate):
+    with pytest.raises(ValueError, match="not the manifest of an -rs crate"):
+        BaseWorkspace.open(workspace / crate / "Cargo.toml")
 
 
 def test_plain_add_inherits_from_the_workspace(workspace):
@@ -82,7 +108,7 @@ def _port_tests(sys_crate: Crate, rs_crate: Crate) -> None:
     tests = sys_crate.cargo_toml.parent / "tests" / "io.rs"
     tests.parent.mkdir()
     tests.write_text(f"use {sys_crate.lib_name}::*;\n")
-    TranslationWorkspace._port_tests(SimpleNamespace(sys_crate=sys_crate), rs_crate, tests)  # type: ignore[arg-type]
+    TranslationWorkspace(sys_crate, rs_crate)._port_tests(rs_crate, tests)
 
 
 def test_ported_tests_inherit_workspace_dependencies(workspace):
@@ -95,6 +121,22 @@ def test_ported_tests_inherit_workspace_dependencies(workspace):
     assert _section(rs_crate, "dev-dependencies") == {
         "libc": {"workspace": True, "features": ["extra_traits"]}
     }
+
+
+def test_binary_shipped_tests_remain_available_for_refactoring(workspace):
+    sys_crate = Crate(workspace / "foo-sys" / "Cargo.toml", template="lib", vcs="none")
+    rs_crate = Crate(workspace / "foo-rs" / "Cargo.toml", template="lib", vcs="none")
+    tests = sys_crate.cargo_toml.parent / "tests" / "io.rs"
+    tests.parent.mkdir()
+    tests.write_text(f"use {sys_crate.lib_name}::*;\n")
+    translation = TranslationWorkspace(sys_crate, rs_crate, tests=tests)
+    harness = rs_crate.cargo_toml.parent / "tests" / "io.rs"
+
+    with translation.shipped_tests():
+        assert harness.exists()
+
+    assert harness.exists()
+    assert _section(rs_crate, "dev-dependencies") == {"foo-sys": {"workspace": True}}
 
 
 def test_porting_a_dependency_missing_from_the_workspace_is_rejected(workspace):

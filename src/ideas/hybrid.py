@@ -12,7 +12,8 @@ from textwrap import dedent
 
 from .ast import Symbol, SymbolName
 from .ast import clang_make_global_, clang_make_extern_
-from .ast import clang_function_arity, clang_function_definitions, clang_rename_
+from .ast import clang_function_definitions, clang_function_signature, clang_rename_
+from .ast import clang_preserve_main_fallthrough_return_
 from .ast_rust import BindgenName, CodeRust, strip_cfg_test, strip_exports, strip_visibility
 from .tools import Crate
 from .bindgen import C_INTEROP_TRAIT, wrap_values
@@ -230,37 +231,46 @@ class Hybrid:
         self._crate.vcs.add(self._c_src_path)
 
     def adopt_c_entrypoint(self):
-        # Free the `main` symbol for Rust to define; C's program logic lives on under the new name
+        result_type, arity = clang_function_signature(self._c_src_path, "main")
+        if result_type not in {"int", "void"}:
+            raise NotImplementedError(f"Unhandled `main` return type `{result_type}`!")
+        if arity not in {0, 2, 3}:
+            raise NotImplementedError(f"Unhandled `main` parameter count {arity}!")
+
+        clang_preserve_main_fallthrough_return_(self._c_src_path)
         clang_rename_(self._c_src_path, {"main": "__ideas_c_main"})
 
         # Emitting the call in C lets the C compiler check it against the real prototype, so a
         # misread `main` signature is a build error instead of silent UB
-        match clang_function_arity(self._c_src_path, "__ideas_c_main"):
+        match arity:
             case 0:
-                entry = """
-                    int __ideas_entry(int argc, char **argv) {
-                        return __ideas_c_main();
-                    }
-                    """
+                call = "__ideas_c_main()"
+                environ = ""
             case 2:
-                entry = """
-                    int __ideas_entry(int argc, char **argv) {
-                        return __ideas_c_main(argc, argv);
-                    }
-                    """
+                call = "__ideas_c_main(argc, argv)"
+                environ = ""
             case 3:
-                entry = """
-                    extern char **environ;
-
-                    int __ideas_entry(int argc, char **argv) {
-                        return __ideas_c_main(argc, argv, environ);
-                    }
-                    """
+                call = "__ideas_c_main(argc, argv, environ)"
+                environ = "extern char **environ;"
             case nparams:
                 raise NotImplementedError(f"Unhandled `main` parameter count {nparams}!")
 
+        if result_type == "int":
+            call_statement = f"return {call};"
+        else:
+            call_statement = f"{call};\n        return 0;"
+
+        entry = dedent(
+            f"""
+            {environ}
+            int __ideas_entry(int argc, char **argv) {{
+                {call_statement}
+            }}
+            """
+        )
+
         with self._c_src_path.open("a") as c_src:
-            c_src.write(dedent(entry))
+            c_src.write(entry)
 
             # Keep the -sys crate's bin linkable on its own; in the hybrid the linker prefers
             # Rust's strong `main` and this trampoline goes unused

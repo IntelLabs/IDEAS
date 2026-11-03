@@ -67,7 +67,9 @@ docker/build:## Build the Docker image
 docker/build: docker/venv/.ready docker/cargo/.ready
 
 .PRECIOUS: docker/build.log
-docker/build.log: docker/ideas.Dockerfile uv.lock pyproject.toml INSTALL.mk
+DOCKER_TOOLS := tools/cargo-minify
+TOOL_SOURCES := $(shell find ${DOCKER_TOOLS} -name target -prune -o -type f -print)
+docker/build.log: docker/ideas.Dockerfile uv.lock pyproject.toml INSTALL.mk ${TOOL_SOURCES}
 	docker build --build-arg USER_UID=$(shell id -u) \
              --build-arg USER_GID=$(shell id -g) \
              -f docker/ideas.Dockerfile -t ${DOCKER_IMAGE} .

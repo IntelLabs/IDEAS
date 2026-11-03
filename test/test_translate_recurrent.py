@@ -26,7 +26,7 @@ from ideas.translate_recurrent import SymbolTranslator
 from ideas import oracle as oracle_mod
 from ideas.translate_recurrent import SymbolGroup, SymbolName
 from ideas.translate_snippet import SnippetTranslator
-from ideas.tools import ClippyResult, Crate, check_rust
+from ideas.tools import ClippyResult, Crate, check_rust, run_subprocess
 from ideas.bindgen import C_INTEROP_TRAIT, bindgen_types, split_items, wrap_values
 from ideas.wrapper import WrapperGenerator
 
@@ -232,7 +232,13 @@ def _make_translator(
     # What _init_rs_crate leaves in the -rs crate
     (rs_src_dir / "lib.rs").write_text(
         "#![forbid(unsafe_code)]\n"
-        "#![allow(clippy::items_after_test_module, non_snake_case)]\n\n"
+        "#![allow(\n"
+        "    clippy::items_after_test_module,\n"
+        "    dead_code,\n"
+        "    non_camel_case_types,\n"
+        "    non_snake_case,\n"
+        "    non_upper_case_globals\n"
+        ")]\n\n"
     )
     if is_bin:
         (rs_src_dir / "main.rs").write_text(
@@ -1906,6 +1912,75 @@ typedef struct { int x; } my_struct_t;
 int helper(my_struct_t s) { return s.x; }
 int main(void) { my_struct_t s = {1}; return helper(s); }
 """)
+
+
+def test_adopt_c_entrypoint_preserves_main_fallthrough_return(tmp_path: Path) -> None:
+    c_src = """
+    int main(int argc, char **argv) {
+        if (argc > 1 && argv[1][0] == 'x') return 7;
+    }
+    """
+    harness, _, _, sys_c = _make_translator(
+        tmp_path, is_bin=True, c_src=c_src, symbol_translator=MagicMock()
+    )
+    harness.hybrid.adopt_c_entrypoint()
+
+    executable = tmp_path / "driver"
+    success, stdout, stderr, _ = run_subprocess(
+        ["clang-23", "-Wall", "-Werror", str(sys_c), "-o", str(executable)]
+    )
+    assert success, stdout + stderr
+
+    success, stdout, stderr, exit_code = run_subprocess([str(executable)])
+    assert success, stdout + stderr
+    assert exit_code == 0
+
+    success, stdout, stderr, exit_code = run_subprocess([str(executable), "x"])
+    assert not success, stdout + stderr
+    assert exit_code == 7
+
+
+@pytest.mark.parametrize(
+    "c_src",
+    [
+        "void main(void) {}",
+        "void main(int argc, char **argv) { (void)argc; (void)argv; }",
+        (
+            "void main(int argc, char **argv, char **envp) { "
+            "(void)argc; (void)argv; (void)envp; }"
+        ),
+    ],
+    ids=["no-args", "argc-argv", "envp"],
+)
+def test_adopt_c_entrypoint_supports_void_main(tmp_path: Path, c_src: str) -> None:
+    harness, _, _, sys_c = _make_translator(
+        tmp_path, is_bin=True, c_src=c_src, symbol_translator=MagicMock()
+    )
+    harness.hybrid.adopt_c_entrypoint()
+
+    executable = tmp_path / "driver"
+    success, stdout, stderr, _ = run_subprocess(
+        ["clang-23", "-Wall", "-Werror", str(sys_c), "-o", str(executable)]
+    )
+    assert success, stdout + stderr
+
+    success, stdout, stderr, exit_code = run_subprocess([str(executable)])
+    assert success, stdout + stderr
+    assert exit_code == 0
+
+
+def test_adopt_c_entrypoint_rejects_unsupported_main_return_type(tmp_path: Path) -> None:
+    c_src = "long main(void) { return 7; }\n"
+    harness, _, _, sys_c = _make_translator(
+        tmp_path, is_bin=True, c_src=c_src, symbol_translator=MagicMock()
+    )
+    original = sys_c.read_bytes()
+
+    with pytest.raises(NotImplementedError, match="Unhandled `main` return type `long`"):
+        harness.hybrid.adopt_c_entrypoint()
+
+    assert sys_c.read_bytes() == original
+
 
 _BINARY_TYPE_WRAPPER = CodeRust(
     dedent("""

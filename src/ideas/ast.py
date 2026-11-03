@@ -779,15 +779,57 @@ def clang_rename_(path: Path, renames: dict[str, str]):
         _apply_edits(path, edits)
 
 
-def clang_function_arity(path: Path, spelling: str) -> int:
+def clang_function_signature(path: Path, spelling: str) -> tuple[str, int]:
     tu = create_translation_unit(path)
 
     for cursor in _find_cursors(tu, spelling):
         if cursor.kind != CursorKind.FUNCTION_DECL or not cursor.is_definition():
             continue
-        return len(list(cursor.get_arguments()))
+        return (
+            cursor.result_type.get_canonical().spelling,
+            len(list(cursor.get_arguments())),
+        )
 
     raise ValueError(f"Unable to find a definition of function `{spelling}`")
+
+
+def clang_preserve_main_fallthrough_return_(path: Path):
+    tu = create_translation_unit(path)
+    tu_path = Path(tu.spelling).resolve()
+    definitions = [
+        cursor
+        for cursor in _find_cursors(tu, "main")
+        if cursor.kind == CursorKind.FUNCTION_DECL and cursor.is_definition()
+    ]
+    if len(definitions) != 1:
+        raise ValueError(
+            f"Expected one definition of `main` in {tu_path}, found {len(definitions)}"
+        )
+
+    main = definitions[0]
+    if main.result_type.get_canonical().kind != TypeKind.INT:
+        return
+
+    body = next(
+        (child for child in main.get_children() if child.kind == CursorKind.COMPOUND_STMT),
+        None,
+    )
+    if body is None:
+        raise ValueError(f"Unable to find the body of `main` in {tu_path}")
+
+    tokens = list(_get_tokens(body))
+    if not tokens or tokens[-1].spelling != "}":
+        raise ValueError(f"Unable to find the closing brace of `main` in {tu_path}")
+
+    closing_brace = tokens[-1]
+    if (
+        closing_brace.location.file is None
+        or Path(closing_brace.location.file.name).resolve() != tu_path
+    ):
+        raise NotImplementedError(f"Unable to edit the body of `main` in {tu_path}")
+
+    offset = closing_brace.extent.start.offset
+    _apply_edits(path, {(offset, offset): b"return 0;"})
 
 
 DEFINITION_START_TOKEN = {CursorKind.FUNCTION_DECL: "{", CursorKind.VAR_DECL: "="}
