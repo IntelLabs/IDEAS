@@ -42,7 +42,7 @@ Where Docker is unavailable, e.g. inside an unprivileged container that cannot s
 - `examples/` and the working directory are hidden except for the project under-translation,
 - system and toolchain directories are read-only, and
 - `HOME` and `TMPDIR` are fresh for each step.
-This requires Linux 6.2+ with Landlock enabled and, inside Docker, a seccomp profile that allows it (Docker 23+).
+This requires Linux 5.19+ with Landlock enabled and, inside Docker, a seccomp profile that allows it (Docker 23+).
 
 Unlike Docker it does not restrict network access, and the names, permissions, timestamps and extended attributes of paths outside the mounts can still be read or changed (e.g. with `stat`, `chmod` or `touch`).
 

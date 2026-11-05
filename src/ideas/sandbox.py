@@ -26,7 +26,9 @@ and the working directory, which are empty unless the paths mounted with --reada
   The rest of the filesystem is limited to system and toolchain
   directories, HOME and TMPDIR are fresh per step, and network access is not restricted.
   Landlock does not cover metadata, so the names, permissions, timestamps and extended
-  attributes of paths outside the mounts can still be read or changed.
+  attributes of paths outside the mounts can still be read or changed. Below Landlock ABI 3
+  (Linux 6.2), which cannot deny truncation, a seccomp filter denies truncate(2) everywhere,
+  O_TRUNC without write access, and openat2(2) and io_uring, which could get around it.
 - native runs the step unconfined.
 
 The command is echoed to fd 3 (or stderr) unless its name is prefixed with @.
@@ -312,6 +314,84 @@ class PathBeneathAttr(ctypes.Structure):
     _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32)]
 
 
+# Seccomp, standing in for Landlock's TRUNCATE right below ABI 3. Without it, a file is
+# truncated by path, by opening it with O_TRUNC but no write access (which Landlock does not
+# check), or by openat2(2) and io_uring, whose open flags seccomp cannot inspect. ftruncate(2)
+# and O_TRUNC with write access need a writable file, which Landlock does check.
+
+PR_SET_SECCOMP, SECCOMP_MODE_FILTER = 22, 2
+SECCOMP_ALLOW, SECCOMP_KILL, SECCOMP_ERRNO = 0x7FFF0000, 0x80000000, 0x00050000
+BPF_LD_ABS, BPF_JEQ, BPF_JGE, BPF_JSET, BPF_AND, BPF_RET = 0x20, 0x15, 0x35, 0x45, 0x54, 0x06
+X32_SYSCALL_BIT = 0x40000000
+SYS_IO_URING_SETUP, SYS_OPENAT2 = 425, 437
+# machine: (AUDIT_ARCH, truncate, open, openat); all are little-endian
+SECCOMP_ARCHES = {
+    "x86_64": (0xC000003E, 76, 2, 257),
+    "aarch64": (0xC00000B7, 45, None, 56),
+}
+
+
+class SockFilter(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_uint16),
+        ("jt", ctypes.c_uint8),
+        ("jf", ctypes.c_uint8),
+        ("k", ctypes.c_uint32),
+    ]
+
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(SockFilter))]
+
+
+def truncate_filter(machine: str) -> list[SockFilter]:
+    """A seccomp program denying the truncation that Landlock below ABI 3 cannot."""
+    if machine not in SECCOMP_ARCHES:
+        die(
+            f"Landlock below ABI 3 cannot stop truncate() from erasing files outside the"
+            f" sandbox, and the seccomp fallback does not support {machine}; Linux 6.2+ is"
+            " required (or use a docker:IMAGE or native runner)"
+        )
+    audit_arch, sys_truncate, sys_open, sys_openat = SECCOMP_ARCHES[machine]
+    # (label, code, jump-if-true label, jump-if-false label, k); None falls through
+    program: list[tuple[str | None, int, str | None, str | None, int]] = [
+        (None, BPF_LD_ABS, None, None, 4),  # seccomp_data.arch
+        (None, BPF_JEQ, None, "kill", audit_arch),  # e.g. int 0x80 from x86_64
+        (None, BPF_LD_ABS, None, None, 0),  # seccomp_data.nr
+        (None, BPF_JGE, "kill", None, X32_SYSCALL_BIT),
+        (None, BPF_JEQ, "eacces", None, sys_truncate),
+        (None, BPF_JEQ, "enosys", None, SYS_OPENAT2),
+        (None, BPF_JEQ, "enosys", None, SYS_IO_URING_SETUP),
+        (None, BPF_JEQ, "flags2", None, sys_openat),
+    ]
+    if sys_open is not None:
+        program.append((None, BPF_JEQ, "flags1", None, sys_open))
+    program += [
+        (None, BPF_RET, None, None, SECCOMP_ALLOW),
+        # The low half of a 64-bit argument (seccomp_data.args[i]) is first when little-endian
+        ("flags1", BPF_LD_ABS, None, None, 16 + 8 * 1),
+        (None, BPF_JSET, "trunc", "allow", os.O_TRUNC),
+        ("flags2", BPF_LD_ABS, None, None, 16 + 8 * 2),
+        (None, BPF_JSET, "trunc", "allow", os.O_TRUNC),
+        ("trunc", BPF_AND, None, None, os.O_ACCMODE),
+        (None, BPF_JEQ, "allow", None, os.O_WRONLY),
+        (None, BPF_JEQ, "allow", None, os.O_RDWR),
+        ("eacces", BPF_RET, None, None, SECCOMP_ERRNO | errno.EACCES),
+        ("enosys", BPF_RET, None, None, SECCOMP_ERRNO | errno.ENOSYS),
+        ("allow", BPF_RET, None, None, SECCOMP_ALLOW),
+        ("kill", BPF_RET, None, None, SECCOMP_KILL),
+    ]
+    labels = {label: i for i, (label, *_) in enumerate(program) if label}
+
+    def offset(i: int, label: str | None) -> int:
+        return 0 if label is None else labels[label] - i - 1
+
+    return [
+        SockFilter(code, offset(i, jt), offset(i, jf), k)
+        for i, (_, code, jt, jf, k) in enumerate(program)
+    ]
+
+
 @dataclass
 class LandlockPolicy:
     """Paths granted read-only (False) or writable (True), and paths hidden within them."""
@@ -436,6 +516,28 @@ def landlock_policy(
 class Landlock:
     def __init__(self) -> None:
         self.libc = ctypes.CDLL(None, use_errno=True)
+        abi = self.query_abi()
+        if abi < 2:
+            die(
+                f"Landlock ABI {abi} denies every rename or link across directories;"
+                " Linux 5.19+ is required (or use a docker:IMAGE or native runner)"
+            )
+        # ABI 2 has 14 filesystem rights (up to REFER), ABI 3 adds TRUNCATE and ABI 5 IOCTL_DEV
+        self.access = (1 << (14 if abi < 3 else 15 if abi < 5 else 16)) - 1
+        self.seccomp: SockFprog | None = None
+        if abi < 3:
+            program = truncate_filter(os.uname().machine)
+            # Kept on self, so the program outlives the pointer to it
+            self.program = (SockFilter * len(program))(*program)
+            self.seccomp = SockFprog(len(program), self.program)
+        logger.debug(
+            "landlock: ABI %d, handled access %#x%s",
+            abi,
+            self.access,
+            ", seccomp denies truncation" if self.seccomp else "",
+        )
+
+    def query_abi(self) -> int:
         abi = self.libc.syscall(SYS_CREATE_RULESET, None, 0, CREATE_RULESET_VERSION)
         if abi < 0:
             err = ctypes.get_errno()
@@ -445,14 +547,7 @@ class Landlock:
                 errno.EPERM: "a seccomp filter (e.g. an old Docker profile) blocks it",
             }.get(err, os.strerror(err))
             die(f"Landlock is unavailable: {reason}")
-        if abi < 3:
-            die(
-                f"Landlock ABI {abi} cannot stop truncate() from erasing files outside the"
-                " sandbox; Linux 6.2+ is required (or use a docker:IMAGE or native runner)"
-            )
-        # ABI 3 has 15 filesystem rights (up to TRUNCATE) and ABI 5 adds IOCTL_DEV
-        self.access = (1 << (15 if abi < 5 else 16)) - 1
-        logger.debug("landlock: ABI %d, handled access %#x", abi, self.access)
+        return abi
 
     def ruleset(self, rules: dict[str, bool]) -> int:
         """Creates a ruleset fd (close-on-exec) that grants exactly the rules."""
@@ -494,6 +589,12 @@ class Landlock:
             or os.getppid() != parent
             or self.libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
             or self.libc.syscall(SYS_RESTRICT_SELF, ruleset, 0)
+            or (
+                self.seccomp is not None
+                and self.libc.prctl(
+                    PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(self.seccomp), 0, 0
+                )
+            )
         ):
             message = f"{PROG}: cannot confine the step: {os.strerror(ctypes.get_errno())}\n"
             os.write(2, message.encode())

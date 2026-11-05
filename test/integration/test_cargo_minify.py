@@ -283,10 +283,12 @@ def test_make_minify_strips_only_dead_scaffolding_from_a_translated_ffi_crate(
     assert {"add", "sub", "default_op"} <= exports
     before = _files(ws)
 
-    def make_minify() -> None:
-        proc = subprocess.run(
+    def make_minify(*, force: bool = False) -> None:
+        command = ["make"]
+        if force:
+            command.append("-B")
+        command.extend(
             [
-                "make",
                 "-C",
                 str(ws.parent),
                 "-f",
@@ -295,7 +297,10 @@ def test_make_minify_strips_only_dead_scaffolding_from_a_translated_ffi_crate(
                 f"TRANSLATION_TEST={TRANSLATION_TEST}",
                 "VCS=none",
                 "minify",
-            ],
+            ]
+        )
+        proc = subprocess.run(
+            command,
             env={**os.environ, "IDEAS_RUNNER": "native", "UV_PROJECT": str(REPO_ROOT)},
             capture_output=True,
             text=True,
@@ -341,7 +346,10 @@ def test_make_minify_strips_only_dead_scaffolding_from_a_translated_ffi_crate(
         }
 
     minified = sources()
+    stats_before = (ws / shipped / "minify.json").read_bytes()
     make_minify()
+    assert (ws / shipped / "minify.json").read_bytes() == stats_before
+    make_minify(force=True)
     assert sources() == minified
     # The stats describe the last run, which deleted nothing
     assert json.loads((ws / shipped / "minify.json").read_text()) == {

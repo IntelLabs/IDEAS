@@ -5,6 +5,7 @@
 #
 
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -156,21 +157,30 @@ def test_docker_shows_a_mounted_workdir(ideas: Path):
 # Landlock policy
 
 
-@pytest.mark.parametrize("abi, allowed", [(1, False), (2, False), (3, True), (6, True)])
-def test_landlock_needs_abi_3_to_block_truncate(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], abi: int, allowed: bool
+@pytest.mark.parametrize("abi", [1, 2, 3, 6])
+def test_landlock_needs_abi_2_and_seccomp_below_abi_3(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], abi: int
 ):
     class FakeLibc:
         def syscall(self, *_args: object) -> int:
             return abi
 
     monkeypatch.setattr(sandbox.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
-    if allowed:
-        assert sandbox.Landlock().access & sandbox.TRUNCATE
-    else:
+    if abi < 2:
         with pytest.raises(SystemExit):
             sandbox.Landlock()
-        assert "Linux 6.2+ is required" in capsys.readouterr().err
+        assert "Linux 5.19+ is required" in capsys.readouterr().err
+        return
+    landlock = sandbox.Landlock()
+    assert bool(landlock.access & sandbox.TRUNCATE) is (abi >= 3)
+    assert (landlock.seccomp is None) is (abi >= 3)
+
+
+def test_seccomp_fallback_needs_a_known_architecture(capsys: pytest.CaptureFixture[str]):
+    assert sandbox.truncate_filter("x86_64")
+    with pytest.raises(SystemExit):
+        sandbox.truncate_filter("riscv64")
+    assert "Linux 6.2+ is" in capsys.readouterr().err
 
 
 def test_hidden_paths_are_carved_out_of_grants(tmp_path: Path):
@@ -270,6 +280,78 @@ def test_hidden_files_cannot_be_linked_or_moved_into_a_writable_dir(ideas: Path)
     assert not _allowed(ideas, "ln ../b/test_case/b.c out/b.c", *EXPOSE_A)
     assert not _allowed(ideas, "mv ../b/test_case/b.c out/b.c", *EXPOSE_A)
     assert (ideas / "examples" / "b" / "test_case" / "b.c").exists()
+
+
+# Runs sandbox.py as if the kernel had Landlock ABI 2, so the seccomp fallback is tested on
+# newer kernels too
+AS_ABI_2 = """
+import sys
+from ideas import sandbox
+query_abi = sandbox.Landlock.query_abi
+sandbox.Landlock.query_abi = lambda self: min(query_abi(self), 2)
+sys.exit(sandbox.main(sys.argv[1:]))
+"""
+
+
+def _python_step(
+    ideas: Path, code: str, abi: str = "kernel"
+) -> subprocess.CompletedProcess[str]:
+    """Runs Python code as a step exposing example a; it prints "started" before the code."""
+    # The venv is outside the root, so the step runs its base interpreter in isolated mode
+    python = shlex.join(
+        [os.path.realpath(sys.executable), "-I", "-c", f"print('started')\n{code}"]
+    )
+    launcher = [sandbox.__file__] if abi == "kernel" else ["-c", AS_ABI_2]
+    return subprocess.run(
+        [sys.executable, *launcher, "--runner", "landlock", "--root", str(ideas)]
+        + ["--workdir", str(ideas / "examples/a"), "--hide", "examples", *EXPOSE_A]
+        + ["--", "sh", "-c", python],
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.usefixtures("landlock")
+@pytest.mark.parametrize("abi", ["kernel", "2"])
+@pytest.mark.parametrize(
+    "code, allowed",
+    [
+        ("import os; os.truncate('test_case/a.c', 0)", False),
+        ("import os; os.truncate('../../src/m.py', 0)", False),
+        ("import os; os.open('test_case/a.c', os.O_RDONLY | os.O_TRUNC)", False),
+        ("import os; os.open('../../src/m.py', os.O_RDONLY | os.O_TRUNC)", False),
+        ("open('test_case/a.c', 'r+').truncate(0)", False),
+        ("open('out/r.rs', 'w').write('x'); open('out/r.rs', 'w')", True),
+        ("open('out/r.rs', 'w').write('x'); open('out/r.rs', 'r+').truncate(0)", True),
+    ],
+)
+def test_files_outside_writable_mounts_cannot_be_truncated(
+    ideas: Path, abi: str, code: str, allowed: bool
+):
+    result = _python_step(ideas, code, abi)
+    assert result.stdout == "started\n", result.stderr
+    assert (result.returncode == 0) is allowed, result.stderr
+    assert (ideas / "examples/a/test_case/a.c").read_text() == "a\n"
+    assert (ideas / "src/m.py").read_text() == "src\n"
+
+
+@pytest.mark.usefixtures("landlock")
+def test_seccomp_fallback_denies_what_it_cannot_inspect(ideas: Path):
+    # openat2 and io_uring fail with ENOSYS, so callers fall back to openat; a truncate by
+    # path is denied even where writable, since seccomp cannot see the path
+    code = """
+import ctypes, errno, os
+libc = ctypes.CDLL(None, use_errno=True)
+for nr in (437, 425):  # openat2, io_uring_setup
+    assert libc.syscall(nr, 0, 0, 0, 0) == -1 and ctypes.get_errno() == errno.ENOSYS, nr
+open('out/r.rs', 'w').write('x')
+try:
+    os.truncate('out/r.rs', 0)
+except PermissionError:
+    print('denied')
+"""
+    result = _python_step(ideas, code, abi="2")
+    assert (result.returncode, result.stdout) == (0, "started\ndenied\n"), result.stderr
 
 
 @pytest.mark.usefixtures("landlock")

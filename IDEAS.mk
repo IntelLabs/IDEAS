@@ -169,14 +169,12 @@ ${TRANSLATION_DIR}/%-rs/src/main.rs ${TRANSLATION_DIR}/%-rs/Cargo.toml &: ${TRAN
 
 
 # minify
-.PHONY: minify FORCE
-FORCE:
+.PHONY: minify
 .PRECIOUS: ${TRANSLATION_DIR}/%-ffi/minify.log
 minify: $(patsubst %/Cargo.toml,%/minify.log,$(wildcard $(patsubst %,${TRANSLATION_DIR}/%-ffi/Cargo.toml,${TARGETS_LIB})))
 	@:  # empty rule to suppress "Nothing to be done for"
 ${TRANSLATION_DIR}/%-ffi/minify.log: private RUN_ARGS += --writable "${CURDIR}/${TRANSLATION_DIR}"
-${TRANSLATION_DIR}/%-ffi/minify.log: FORCE
-	@rm -f $@
+${TRANSLATION_DIR}/%-ffi/minify.log:
 	-${DOCKER_RUN} ${PYTHON} -m ideas.minify cargo_toml=${TRANSLATION_DIR}/$*-ffi/Cargo.toml \
                                              tests=${TRANSLATION_TEST} \
                                              vcs=${VCS} \
